@@ -95,6 +95,12 @@ calls with the same id, and a re-executed `write_file` or `run_command` is
 not harmless. Frames above 10MB and frames with unknown `type` values are
 answered with `error` and *do not* terminate the connection.
 
+The extension's terminal widget shows a **Stop** button while a
+`run_command` is in flight; it sends the `cancel` frame for that request
+id, and a cancelled request is never retried on timeout. Cancelling a
+command that is still awaiting desktop approval kills nothing — the
+approval queue has no cancellation path yet.
+
 ---
 
 ## 5. Tool Call Request
