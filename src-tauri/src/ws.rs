@@ -12,6 +12,11 @@
 //!   app → ext: {"type":"tool_result","id":"<uuid>","status":"success","result":{...}}
 //!   ext → app: {"type":"ping"} → {"type":"pong"}
 //!   app → ext: {"type":"handoff","payload":{...}}  (pushed)
+//!   ext → app: {"type":"cancel","id":"<uuid>"} → {"type":"cancel-ok","id":"...","killed":n}
+//!              — kills the processes that request's run_command spawned
+//!   app → ext: {"type":"error","error":"..."}  (malformed / unknown frame;
+//!              the connection survives; a tool_call id that already
+//!              executed is refused with code DUPLICATE_REQUEST)
 //!
 //! Gated tools return a "pending" tool_result only in the sense that the
 //! tool_call blocks until the desktop UI resolves the approval — the
@@ -27,6 +32,7 @@
 
 use crate::AppState;
 use serde_json::json;
+use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -50,6 +56,33 @@ static PAIR_LOCKED_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 const MAX_PAIR_FAILURES: u32 = 5;
 const PAIR_LOCKOUT: Duration = Duration::from_secs(60);
 const PAIR_FAIL_DELAY: Duration = Duration::from_millis(500);
+
+/// Hard frame cap: a multi-GB paste must not OOM the app before the JSON
+/// parser even runs. 10 MB is far above any legitimate tool call.
+const MAX_FRAME_BYTES: usize = 10 * 1024 * 1024;
+
+/// Request ids already handed to execution, for idempotency. The extension
+/// retries a timed-out call with the *same* id — without this check that
+/// retry re-runs the tool, and for `write_file` or `run_command` a double
+/// execution is not harmless. Bounded: the retry it guards against happens
+/// within seconds, so remembering the last N ids is enough (a DB-backed
+/// set would only matter across restarts, where no retry can arrive).
+static EXECUTED_IDS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+const EXECUTED_IDS_CAP: usize = 1024;
+
+/// Returns false (and leaves the set untouched) if `id` was already
+/// executed — the caller must refuse the duplicate.
+fn mark_executed(id: &str) -> bool {
+    let mut ids = EXECUTED_IDS.lock().unwrap();
+    if ids.iter().any(|i| i == id) {
+        return false;
+    }
+    if ids.len() >= EXECUTED_IDS_CAP {
+        ids.pop_front();
+    }
+    ids.push_back(id.to_string());
+    true
+}
 
 /// Generate a fresh 6-digit pairing code from the OS CSPRNG. The previous
 /// clock-nanoseconds derivation was predictable — an attacker who could
@@ -236,7 +269,16 @@ fn handle_conn(app: AppHandle, stream: std::net::TcpStream) {
         let msg = {
             let mut w = ws.lock().unwrap();
             match w.read() {
-                Ok(Message::Text(text)) => Some(text),
+                Ok(Message::Text(text)) => {
+                    if text.len() > MAX_FRAME_BYTES {
+                        let _ = w.send(Message::Text(
+                            json!({"type": "error", "error": "frame too large"}).to_string(),
+                        ));
+                        None
+                    } else {
+                        Some(text)
+                    }
+                }
                 Ok(Message::Close(_)) => break,
                 Ok(Message::Ping(p)) => {
                     let _ = w.send(Message::Pong(p));
@@ -347,11 +389,36 @@ fn handle_conn(app: AppHandle, stream: std::net::TcpStream) {
                     }
                 };
 
+                // Server-side idempotency: the extension retries a timed-out
+                // call with the same id — if that id already reached
+                // execution, refuse the duplicate instead of running e.g.
+                // `write_file` twice.
+                if !id.is_empty() && !mark_executed(id) {
+                    let mut w = ws.lock().unwrap();
+                    let _ = w.send(Message::Text(make_tool_result_v2(
+                        id,
+                        "error",
+                        None,
+                        Some(json!({
+                            "code": "DUPLICATE_REQUEST",
+                            "message": "this request id was already executed; not running it twice",
+                        })),
+                        None,
+                    )));
+                    continue;
+                }
+
                 let ws = ws.clone();
                 let app = app.clone();
                 let id = id.to_string();
                 std::thread::spawn(move || {
+                    // Attribute everything this execution spawns (a PTY, for
+                    // run_command) to the request id, so a `cancel` frame for
+                    // it can kill the processes. Cleared afterwards so a
+                    // later call on this pooled thread cannot inherit it.
+                    crate::process::set_execution_owner(Some(id.clone()));
                     let result = crate::tool_call(&app, tool.clone(), "web");
+                    crate::process::set_execution_owner(None);
                     let meta = tool_meta(&tool);
                     let (status, result_val, error_val) = if result.ok {
                         (
@@ -455,7 +522,37 @@ fn handle_conn(app: AppHandle, stream: std::net::TcpStream) {
                     }
                 }
             }
-            _ => break,
+            // ── Protocol v2: cancel ─────────────────────────────────
+            // Stop the processes owned by a request. Previously the
+            // catch-all below *dropped the connection* on a cancel frame —
+            // and the running command kept going.
+            "cancel" => {
+                let id = parsed["id"].as_str().unwrap_or("");
+                let killed = if id.is_empty() {
+                    0
+                } else {
+                    crate::process::registry().kill_owner(id, Duration::from_millis(500))
+                };
+                let mut w = ws.lock().unwrap();
+                let _ = w.send(Message::Text(
+                    json!({"type": "cancel-ok", "id": id, "killed": killed}).to_string(),
+                ));
+            }
+
+            // Unknown frames get a clear error instead of a dropped
+            // connection — a typo (or a newer extension version) must not
+            // kill the session. The pre-pairing gate above still breaks.
+            other => {
+                eprintln!("[ws] unknown frame type: {other}");
+                let mut w = ws.lock().unwrap();
+                let _ = w.send(Message::Text(
+                    json!({
+                        "type": "error",
+                        "error": format!("unknown frame type: {other}"),
+                    })
+                    .to_string(),
+                ));
+            }
         }
     }
 

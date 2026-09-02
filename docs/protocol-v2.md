@@ -65,7 +65,7 @@ All messages follow this structure:
 | `tool_call` | Execute a tool | `id`, `tool`, `arguments` |
 | `tool_approve` | User approved/denied | `id`, `allow` |
 | `handoff_request` | Request handoff build | — |
-| `cancel` | Cancel pending request | `id` |
+| `cancel` | Kill the processes a request's `run_command` spawned | `id` |
 
 ### Rust → Extension
 
@@ -78,6 +78,22 @@ All messages follow this structure:
 | `tool_stream` | Streaming output chunk | `id`, `chunk`, `stream_id` |
 | `handoff` | Pushed handoff payload | `payload` |
 | `handoff_error` | Handoff build failed | `error` |
+| `cancel_ok` | Cancellation done | `id`, `killed` |
+| `error` | Malformed / unknown frame (connection survives) | `error` |
+
+### Cancellation and idempotency
+
+`cancel` with a request id SIGTERMs the process group of every `run_command`
+that request spawned (SIGKILL after a 500ms grace) and replies
+`cancel_ok` with the count. This is the only way to stop a long command
+short of its 120s timeout — dropping the WebSocket connection does *not*
+kill running commands.
+
+A `tool_call` whose `id` already reached execution is refused with
+`DUPLICATE_REQUEST` instead of re-running — the extension retries timed-out
+calls with the same id, and a re-executed `write_file` or `run_command` is
+not harmless. Frames above 10MB and frames with unknown `type` values are
+answered with `error` and *do not* terminate the connection.
 
 ---
 
@@ -142,6 +158,7 @@ All messages follow this structure:
 | `PERMISSION_DENIED` | Security | No |
 | `SENSITIVE_PATH` | Security | No |
 | `INVALID_ARGUMENTS` | Validation | No |
+| `DUPLICATE_REQUEST` | Idempotency | No |
 | `MALFORMED_JSON` | Detection | No |
 | `EXECUTION_FAILED` | Runtime | Maybe |
 | `COMMAND_TIMEOUT` | Runtime | Maybe |

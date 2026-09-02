@@ -12,6 +12,8 @@ pub mod git;
 
 pub mod pty;
 
+pub mod process;
+
 pub mod shell;
 
 pub mod transcript;
@@ -356,6 +358,21 @@ fn bridge_audit(
     limit: Option<usize>,
 ) -> Result<Vec<db::AuditEntry>, String> {
     db::last_audit(&state.conn.lock().unwrap(), limit.unwrap_or(30)).map_err(|e| e.to_string())
+}
+
+/// Cancel a running tool call: kill every process its `run_command` spawned
+/// (SIGTERM to the process group, SIGKILL after a grace period). `owner` is
+/// the WS request id the extension got back with its tool_result, or the
+/// id shown on the approval card.
+#[tauri::command]
+fn cancel_request(owner: String) -> Result<usize, String> {
+    Ok(process::registry().kill_owner(&owner, Duration::from_millis(500)))
+}
+
+/// Processes currently registered (live `run_command` executions).
+#[tauri::command]
+fn processes_list() -> Vec<process::ProcessEntry> {
+    process::registry().list()
 }
 
 /// Record an executed tool call as a trace step, so the live activity
@@ -914,6 +931,8 @@ pub fn run() {
             bridge_tool,
             bridge_approve,
             bridge_audit,
+            cancel_request,
+            processes_list,
             pair_get_code,
             pair_status,
             set_objective,
@@ -930,5 +949,12 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
-    app.run(|_handle, _event| {});
+    app.run(|_handle, event| {
+        // Never leave a spawned command behind: killing on ExitRequested
+        // (not Exit — by then the process is torn down) lets the registry
+        // TERM→KILL the process groups while we can still signal.
+        if let tauri::RunEvent::ExitRequested { .. } = event {
+            process::registry().kill_all(Duration::from_millis(500));
+        }
+    });
 }

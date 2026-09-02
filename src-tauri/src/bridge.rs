@@ -428,6 +428,12 @@ pub struct ApprovalRequest {
     pub tool: Tool,
     pub summary: String,
     pub source: String, // web | desktop
+    /// The WS request id that asked for this tool, when it came from the
+    /// extension. A gated `run_command` executes on the desktop's
+    /// `bridge_approve` thread, not the WS thread — carrying the owner here
+    /// is what lets the spawned PTY still be attributed to (and cancellable
+    /// by) the original request.
+    pub owner: Option<String>,
 }
 
 /// Bridge state shared via AppState.
@@ -462,6 +468,7 @@ impl Bridge {
                     summary: describe(&tool),
                     tool,
                     source: source.to_string(),
+                    owner: crate::process::execution_owner(),
                 });
                 (
                     ToolResult::pending(format!("{reason} (request #{id})")),
@@ -488,7 +495,14 @@ impl Bridge {
         drop(pending);
 
         let result = if allow {
-            execute(&req.tool, root, on_event)
+            // Execute attributed to the original WS request (see
+            // `ApprovalRequest::owner`), so a cancel for that request can
+            // kill a `run_command` spawned here on the desktop's thread.
+            let prev = crate::process::execution_owner();
+            crate::process::set_execution_owner(req.owner.clone());
+            let result = execute(&req.tool, root, on_event);
+            crate::process::set_execution_owner(prev);
+            result
         } else {
             ToolResult::err_code(
                 ErrorCode::Denied,
@@ -854,14 +868,34 @@ pub fn execute(
                         cb(CommandEvent::Output { data: chunk });
                     }
                 };
-                pty::run_command_stream(
+                // Register the PTY child so a `cancel` for the owning
+                // request can kill the whole process group mid-run — the
+                // registry owner is the WS request id set by the ws.rs
+                // handler (desktop calls register with no owner).
+                let mut reg_id = None;
+                let mut on_spawn = |pid: u32| {
+                    reg_id = Some(crate::process::registry().register(
+                        pid,
+                        crate::process::ProcessKind::Command,
+                        command.clone(),
+                        crate::process::execution_owner(),
+                    ));
+                };
+                let out = pty::run_command_stream(
                     Shell::detect(),
                     command,
                     root,
                     Duration::from_secs(120),
                     1_048_576,
                     &mut forward,
-                )
+                    Some(&mut on_spawn),
+                );
+                // Normal exit: the pid is gone; drop it from the registry
+                // so it cannot be signalled by a late cancel.
+                if let Some(id) = reg_id {
+                    crate::process::registry().unregister(id);
+                }
+                out
             };
             let out = match out {
                 Ok(o) => o,
