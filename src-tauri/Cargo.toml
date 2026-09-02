@@ -32,3 +32,6 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 tungstenite = "0.24"
 # Pairing codes come from the OS CSPRNG (clock-derived codes were guessable).
 getrandom = "0.2"
+# Signal the process *group* when cancelling a running command (unix only).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
