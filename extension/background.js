@@ -58,7 +58,7 @@ function handleTimeout(id) {
   const req = pendingRequests.get(id);
   if (!req) return;
 
-  if (req.retries < MAX_RETRIES) {
+  if (req.retries < MAX_RETRIES && !req.cancelled) {
     req.retries++;
     req.timeout = setTimeout(() => handleTimeout(id), getToolTimeout(req.tool.name || req.tool));
     // Resend the tool call
@@ -356,6 +356,15 @@ function connect() {
         console.log("[ACB] handoff-error from Rust:", msg.error);
         forwardToTabs(msg, null);
         break;
+
+      // The core killed the request's processes (or found none to kill —
+      // the command may still be awaiting desktop approval). Forwarded so
+      // the live terminal can update its status line; the terminal's
+      // final state comes from the tool_result that follows once the
+      // killed process makes run_command return.
+      case "cancel-ok":
+        forwardToTabs(msg, null);
+        break;
     }
   };
 
@@ -448,6 +457,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       recordCall(id, toolName, toolArgs);
       socket.send(JSON.stringify(v2Msg));
       sendResponse({ ok: true, id });
+      break;
+    }
+
+    // ── Protocol v2: cancel an in-flight run_command ───────────
+    // The core kills the process group the request spawned. A cancelled
+    // request must never be retried on timeout: the user asked for the
+    // command to stop, and a retry would resend the same id after the
+    // kill (refused as DUPLICATE_REQUEST anyway, but the intent matters).
+    case "cancel-tool": {
+      if (!socket || socket.readyState !== WebSocket.OPEN || !paired) {
+        sendResponse({ ok: false, error: "not paired with the desktop app" });
+        break;
+      }
+      if (!pendingRequests.has(msg.id)) {
+        sendResponse({ ok: false, error: "no such pending request" });
+        break;
+      }
+      pendingRequests.get(msg.id).cancelled = true;
+      socket.send(JSON.stringify({ type: "cancel", id: msg.id, timestamp: Date.now() }));
+      sendResponse({ ok: true });
       break;
     }
 

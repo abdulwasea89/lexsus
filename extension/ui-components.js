@@ -401,6 +401,24 @@
         <span class="acb-widget-time">${timeNow()}</span>
       `;
       this.header.appendChild(headerInner);
+      // Stop button — the core's process registry kills the process group
+      // this request spawned; the button only sends the `cancel` frame. It
+      // exists solely while the command is in flight, so finish() removes it.
+      this.stopBtn = el(
+        "button",
+        { class: "acb-btn acb-btn--deny acb-btn--sm acb-terminal-stop", title: "Kill this command" },
+        ["Stop"],
+      );
+      this.stopBtn.addEventListener("click", (e) => {
+        // Without this the click bubbles to the header and toggles the
+        // expand/collapse the same click was fighting with.
+        e.stopPropagation();
+        if (this.stopBtn.disabled) return;
+        this.stopBtn.disabled = true;
+        this.setNote("Stopping…");
+        if (this._onStop) this._onStop();
+      });
+      headerInner.appendChild(this.stopBtn);
       this._closeBtn = createCloseBtn();
       this.header.appendChild(this._closeBtn);
       this.el.appendChild(this.header);
@@ -441,11 +459,22 @@
         this.output.scrollTop = this.output.scrollHeight;
       });
     }
+    /** Replace the status line while the command is still in flight. */
+    setNote(text) {
+      const status = this.header.querySelector(".acb-terminal-status");
+      if (status) status.textContent = text;
+    }
     finish(ok, elapsed) {
       const status = this.header.querySelector(".acb-terminal-status");
       status.className = `acb-terminal-status ${ok ? "done" : "error"}`;
       status.textContent = ok ? "Done" : "Failed";
       this.footer.textContent = `Exit code: ${ok ? "0" : "1"} • ${elapsed || "?"}`;
+      // Nothing left to stop once the result is in.
+      if (this.stopBtn) this.stopBtn.remove();
+    }
+    /** Register the handler for the Stop button (sends the cancel frame). */
+    onStop(cb) {
+      this._onStop = cb;
     }
     onAction(cb) {
       // Close button

@@ -130,6 +130,11 @@
 
   // ── Scanning ────────────────────────────────────────────────────
   const sentSigs = new Set();
+  // request id → { terminal, output } for an in-flight run_command. The
+  // background generates the id, so the terminal (and its Stop button)
+  // can only mount once the sendMessage round-trip returns it.
+  const runningTerms = new Map();
+
   function sendTool(tool) {
     if (!tool) return;
     const sig = JSON.stringify(tool);
@@ -137,7 +142,34 @@
     sentSigs.add(sig);
     if (sentSigs.size > 200) sentSigs.delete(sentSigs.values().next().value);
     showWorkingStage(tool);
-    chrome.runtime.sendMessage({ type: "tool", tool }).catch(() => {});
+    chrome.runtime
+      .sendMessage({ type: "tool", tool })
+      .then((resp) => {
+        if (resp?.ok && resp.id && tool.name === "run_command") {
+          mountRunningTerminal(resp.id, tool.arguments?.command || "command");
+        }
+      })
+      .catch(() => {});
+  }
+
+  /**
+   * Mount a terminal for a command that is still running, so its Stop
+   * button is reachable before the 120s timeout. The result path later
+   * completes this same widget instead of mounting a second one.
+   */
+  function mountRunningTerminal(id, command) {
+    const root = ensureDock()?.timeline;
+    if (!root) return;
+    const terminal = new C.ACBTerminal(command, id);
+    const entry = { terminal, output: "" };
+    terminal.onAction((action) => {
+      if (action === "insert" && entry.output) insertIntoComposer(entry.output);
+    });
+    terminal.onStop(() => {
+      chrome.runtime.sendMessage({ type: "cancel-tool", id }).catch(() => {});
+    });
+    terminal.mount(root);
+    runningTerms.set(id, entry);
   }
 
   let lastScanned = "";
@@ -270,10 +302,14 @@
       const meta = msg.meta || {};
 
       if (status === "pending") {
-        // Informational only: approval happens in the desktop app, whose
-        // window no page script can reach. The final tool_result arrives
-        // here once the desktop resolves it.
         markStageAwait();
+        // A live run_command terminal already shows the command; only the
+        // note needs to change. Other tools still get a card.
+        const live = runningTerms.get(msg.id);
+        if (live) {
+          live.terminal.setNote("Awaiting approval…");
+          return;
+        }
         const toolObj = { name: meta.tool || "tool", arguments: meta };
         new C.ACBToolCard(toolObj, msg.id).mount(root);
         return;
@@ -281,6 +317,16 @@
 
       if (status === "denied" || status === "timeout" || status === "error") {
         markStageFailed();
+        // Complete the live terminal in place — a second widget for the
+        // same command would just duplicate its header.
+        const live = runningTerms.get(msg.id);
+        if (live) {
+          runningTerms.delete(msg.id);
+          live.output = error.message || (status === "error" ? "Unknown error" : status);
+          live.terminal.setOutput(live.output);
+          live.terminal.finish(false, null);
+          return;
+        }
         const resultBlock = new C.ACBResultBlock(
           { ok: false, output: error.message || (status === "error" ? "Unknown error" : status) },
           meta.tool || "tool",
@@ -292,17 +338,27 @@
 
       // status === "success"
       if (meta.tool === "run_command") {
-        const terminal = new C.ACBTerminal(
-          meta.command || "command",
-          msg.id,
-        );
         const output = result.output || "";
-        terminal.setOutput(output);
-        terminal.finish(true, meta.duration_ms ? `${meta.duration_ms}ms` : null);
-        terminal.onAction((action) => {
-          if (action === "insert") insertIntoComposer(output);
-        });
-        terminal.mount(root);
+        const live = runningTerms.get(msg.id);
+        if (live) {
+          runningTerms.delete(msg.id);
+          live.output = output;
+          live.terminal.setOutput(output);
+          live.terminal.finish(true, meta.duration_ms ? `${meta.duration_ms}ms` : null);
+        } else {
+          // No live terminal (e.g. this tab reloaded mid-command) — mount
+          // the finished widget the way it always rendered.
+          const terminal = new C.ACBTerminal(
+            meta.command || "command",
+            msg.id,
+          );
+          terminal.setOutput(output);
+          terminal.finish(true, meta.duration_ms ? `${meta.duration_ms}ms` : null);
+          terminal.onAction((action) => {
+            if (action === "insert") insertIntoComposer(output);
+          });
+          terminal.mount(root);
+        }
         // The web AI only sees what reaches the composer, so successful
         // command output is pasted automatically — the Insert button can
         // re-add it (or add it again after the user edits it away).
@@ -397,6 +453,12 @@
     }
     // v2: tool_result
     if (msg.type === "tool_result") showToolWidget(msg);
+    // v2: cancel-ok — the core answered a Stop click. The terminal's
+    // final state still comes from the tool_result that follows.
+    if (msg.type === "cancel-ok" && msg.id) {
+      const live = runningTerms.get(msg.id);
+      if (live) live.terminal.setNote(msg.killed > 0 ? "Stopping…" : "Nothing to kill — awaiting approval");
+    }
     // v1: tool-result (legacy)
     if (msg.type === "tool-result" && msg.result) showToolWidget(msg);
     if (msg.type === "status") {
