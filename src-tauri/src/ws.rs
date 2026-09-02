@@ -556,11 +556,30 @@ fn handle_conn(app: AppHandle, stream: std::net::TcpStream) {
         }
     }
 
+    // Only the connection that actually holds the paired socket may clear
+    // the global state. A stray probe can complete the handshake (a
+    // browser-origin client) without ever pairing; if its disconnect
+    // cleared state unconditionally it would steal the live extension's
+    // sender — push_handoff would silently stop working — flip the UI to
+    // unpaired, and make the failover monitor believe the web AI stalled.
+    // Identity is the Arc pointer: a superseded pairing (a second browser
+    // paired after this one) must not clobber the newer connection either.
     let state = app.state::<AppState>();
-    state.ws_connected.store(false, Ordering::SeqCst);
-    state.ws_tx.lock().unwrap().take();
-    let _ = app.emit("pair://status", false);
-    eprintln!("[ws] extension disconnected");
+    let was_active = {
+        let mut guard = state.ws_tx.lock().unwrap();
+        match guard.as_ref() {
+            Some(current) if Arc::ptr_eq(current, &ws) => {
+                *guard = None;
+                true
+            }
+            _ => false,
+        }
+    };
+    if was_active {
+        state.ws_connected.store(false, Ordering::SeqCst);
+        let _ = app.emit("pair://status", false);
+        eprintln!("[ws] extension disconnected");
+    }
 }
 
 /// Push a handoff payload to the paired extension (no-op when absent).
