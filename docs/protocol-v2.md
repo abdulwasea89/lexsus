@@ -186,7 +186,15 @@ also accepts per-tool aliases — a model that emits `Read`, `bash` or
 | Tool | Required Args | Optional Args | Max Output | Approval |
 |------|---------------|---------------|------------|----------|
 | `read_file` | `path: string` | `offset: u32`, `limit: u32` | 16KB per chunk | Auto (unless sensitive) |
+| `read_many_files` | `paths: [string]` (≤20) | — | 20KB total | Auto (sensitive paths skipped) |
 | `write_file` | `path, content` | — | — | Always |
+| `edit_file` | `path, old_string, new_string` | `replace_all: bool` | — | Auto (unless sensitive) |
+| `multi_edit` | `path, edits: [{old_string, new_string, replace_all?}]` | — | — | Auto (unless sensitive) |
+| `apply_patch` | `path, patch` | — | — | Always |
+| `delete_file` | `path` | — | — | Destructive |
+| `move_file` | `from, to` | — | — | Destructive |
+| `copy_file` | `from, to` | — | — | Always |
+| `create_directory` | `path` | — | — | Auto |
 | `run_command` | `command` | — | 1MB | Always |
 | `list_directory` | `path` | — | 256KB | Auto |
 | `git_status` | — | — | 64KB | Auto |
@@ -196,6 +204,26 @@ also accepts per-tool aliases — a model that emits `Read`, `bash` or
 `describe_tool` and `list_tools` answer from the spec table alone, so they work
 before a project is opened — an AI that has lost the manifest can always
 recover it.
+
+### Editing semantics
+
+`edit_file` replaces an exact string: zero matches is `STRING_NOT_FOUND`,
+several without `replace_all` is `AMBIGUOUS_MATCH` (the message names the
+count). `multi_edit` folds every edit through the file in memory and writes
+once — one bad edit leaves the file untouched. `apply_patch` takes a
+single-file unified diff; hunks whose stated line numbers are stale still
+apply within a ±20-line drift search, and a hunk whose context does not match
+anywhere is `PATCH_DOES_NOT_APPLY` with the file left untouched.
+
+### Session grants
+
+An approval card for a non-destructive call can carry a grant: "auto-approve
+edits under `src/` for this session". Grants live in the desktop app only (the
+WebSocket cannot create or resolve one), are scoped by tool class and path
+prefix, never cover destructive calls or sensitive paths, and are revoked —
+along with pausing the whole bridge — by the kill switch in the desktop UI.
+While the bridge is paused, every `tool_call` is refused with
+`BRIDGE_PAUSED`.
 
 ### Chunked reads
 

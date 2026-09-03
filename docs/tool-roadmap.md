@@ -3,7 +3,7 @@
 > The tool surface the web AI sees, phase by phase: what is **built**, what is
 > **planned**, and the invariants every new tool must uphold.
 >
-> Status date: 2026-08-31. **7 of 44 built.**
+> Status date: 2026-09-03. **15 of 44 built.**
 
 This is the capability roadmap for the coding-agent bridge. It is deliberately
 separate from `full-plan.md` §13, whose "Phase 0"–"Phase 7" describe the
@@ -31,13 +31,16 @@ Every tool carries exactly one, and it decides what the user sees:
 
 | Class | Meaning | Tools today |
 |---|---|---|
-| `Auto` | executes, result auto-inserted into the chat | `read_file`, `list_directory`, `git_status`, `list_tools`, `describe_tool` |
-| `SensitivePathOnly` | asks only when `is_sensitive_path()` fires | — |
-| `Always` | asks every time | `write_file`, `run_command` |
-| `Destructive` | asks every time **and the card must show what disappears** | — |
+| `Auto` | executes, result auto-inserted into the chat | `read_file`, `list_directory`, `git_status`, `list_tools`, `describe_tool`, `create_directory`, `read_many_files` |
+| `SensitivePathOnly` | asks only when `is_sensitive_path()` fires | `read_file`, `edit_file`, `multi_edit` |
+| `Always` | asks every time | `write_file`, `run_command`, `apply_patch`, `copy_file` |
+| `Destructive` | asks every time **and the card must show what disappears** | `delete_file`, `move_file` |
 
-No tool is `Destructive` yet. Phase 1 introduces the first ones, which is why
-the approval policy engine (Phase 6) is flagged to move earlier.
+The session-grants slice of Phase 6 has landed: a grant ("auto-approve edits
+under `src/` for this session") auto-approves matching `Always`/`SensitivePathOnly`
+calls, **never** a `Destructive` one and never a sensitive path, and the
+GrantsBar's kill switch revokes every grant and pauses the bridge. Grants are
+in-memory only — they die with the app.
 
 ## Phases at a glance
 
@@ -45,7 +48,7 @@ the approval policy engine (Phase 6) is flagged to move earlier.
 |---|---|---|---|---|
 | — | original MVP tools | 5 | — | 5 |
 | 0 | registry + progressive disclosure | 5 | 2 | 7 |
-| 1 | files & editing | 0 (+1 early) | 8 | 15 |
+| 1 | files & editing | 8 (+1 early) | 8 | 15 |
 | 2 | search | 0 | 2 | 17 |
 | 3 | git | 0 | 10 | 27 |
 | 4 | project memory | 0 | 9 | 36 |
@@ -84,10 +87,10 @@ ChatGPT and a Claude.ai chat.
 
 ---
 
-## Phase 1 — Files & Editing (8 tools) — NEXT
+## Phase 1 — Files & Editing (8 tools) ✅ DONE
 
 **Goal:** precise edits instead of whole-file rewrites. Today the only way the
-AI can change code is `write_file` on an entire file, over the chunked-read
+AI can change code is `write_file` on an entire file, overwriting the chunked-read
 protocol — every edit is a full-file round trip.
 
 `rm`/`mv`/`cp`/`mkdir` are already reachable through `run_command`, so the
@@ -96,24 +99,25 @@ is not path-checked; `delete_file "../../x"` is rejected by `resolve_path()`),
 **structured approval** (a card that shows what disappears, not a shell
 string), and **portability** (`rm` vs `del` depends on the detected shell).
 
-| Tool | Approval | Notes |
+| Tool | Approval | Status |
 |---|---|---|
-| `edit_file` | SensitivePathOnly | str-replace edit — the single highest-value tool in this plan |
-| `multi_edit` | SensitivePathOnly | batched `edit_file` ops, applied atomically |
-| `apply_patch` | Always | unified diff; new error codes `PatchDoesNotApply` |
-| `delete_file` | **Destructive** | card shows the resolved absolute path |
-| `move_file` | **Destructive** | **both** paths through `is_sensitive_path()` — else a secret can be laundered to a readable name |
-| `copy_file` | Always | same both-paths rule |
-| `create_directory` | Auto | `create_dir_all` |
-| `read_many_files` | Auto | batching is a real latency win: each call is a browser→WS→core→browser round trip with dedup and possible approval |
+| `edit_file` | SensitivePathOnly | ✅ built — str-replace edit, the single highest-value tool in this plan |
+| `multi_edit` | SensitivePathOnly | ✅ built — batched `edit_file` ops, applied atomically |
+| `apply_patch` | Always | ✅ built — unified diff with context-line drift search; `PatchDoesNotApply` |
+| `delete_file` | **Destructive** | ✅ built — card shows the resolved absolute path; refuses directories |
+| `move_file` | **Destructive** | ✅ built — **both** paths through `is_sensitive_path()` |
+| `copy_file` | Always | ✅ built — same both-paths rule |
+| `create_directory` | Auto | ✅ built — `create_dir_all` |
+| `read_many_files` | Auto | ✅ built — ≤20 paths, 20KB batch budget, sensitive paths skipped with a notice |
 
-**Already landed from this phase:** `read_file` `offset`/`limit` with chunked
-`cat -n` output and the inert `[to continue, call: …]` footer (`c830e35`).
-New error codes: `StringNotFound`, `AmbiguousMatch`, `PatchDoesNotApply`.
+New error codes: `StringNotFound`, `AmbiguousMatch`, `PatchDoesNotApply`,
+`BridgePaused`.
 
-**⚠️ Gating:** this phase introduces the first `Destructive` tools. Pull the
-session-grants slice of Phase 6 forward alongside it, or the approval card
-becomes reflexive clicking — which is worse than no gate.
+**⚠️ Gating — resolved:** the first `Destructive` tools shipped together with
+the session-grants slice of Phase 6 (grants scoped by tool class + path
+prefix, destructive never grantable, GrantsBar kill switch), so the approval
+card does not become reflexive clicking. What remains of Phase 6 is polish:
+persisted grant policies and per-tool configuration.
 
 ---
 
@@ -198,13 +202,15 @@ can stream into the terminal.
 
 No new tools — this is what contains the ~15 gated ones from Phases 1, 3 and 5:
 
-- Session grants scoped by **tool class** and **path prefix**
-  ("auto-approve writes under `src/` for this session").
-- **Destructive never auto-approves.** Not overridable by a grant.
-- A visible **kill switch**: one click revokes every grant and pauses the bridge.
+- **Session grants scoped by tool class and path prefix — landed with Phase 1**
+  ("auto-approve writes under `src/` for this session"). In-memory only;
+  source-scoped (a web-created grant never covers desktop calls).
+- **Destructive never auto-approves.** Not overridable by a grant. Landed.
+- **A visible kill switch**: the GrantsBar's "Revoke all & pause" button
+  revokes every grant and pauses the bridge. Landed.
 
-**Must land before Phase 1's destructive tools reach real users.** If it stays
-sixth, pull its session-grants slice into Phase 1.
+Remaining for a later pass: persisted grant policies, per-tool
+configuration, and grant expiry.
 
 ---
 
