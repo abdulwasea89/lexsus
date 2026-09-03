@@ -389,8 +389,12 @@ function connect() {
 }
 
 function scheduleReconnect() {
+  // Capped low on purpose: a 30s ceiling meant a tool call landing during the
+  // backoff window was refused ("not paired") for half a minute after an app
+  // restart. The tool handler also calls connect() directly on refusal now,
+  // so this timer is only the idle-path safety net.
   setTimeout(connect, reconnectDelay);
-  reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+  reconnectDelay = Math.min(reconnectDelay * 2, 10000);
 }
 
 // ── Message handling ──────────────────────────────────────────────
@@ -423,7 +427,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ ok: true });
       break;
     case "get-status":
-      sendResponse({ paired, connected: !!socket, serverVersion });
+      // Same definition as statusUpdate: a half-open handshake is not
+      // "connected", or the content script's retry queue would flush into a
+      // socket that can't carry it yet.
+      sendResponse({ paired, connected: paired && !!socket && socket.readyState === WebSocket.OPEN, serverVersion });
       break;
 
     // Persistent tool history for the dock's History view.
@@ -437,6 +444,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // ── Protocol v2: tool_call ─────────────────────────────────
     case "tool": {
       if (!socket || socket.readyState !== WebSocket.OPEN || !paired) {
+        // Don't just refuse — try to bring the connection back right now
+        // (the app may have restarted seconds ago; the idle backoff timer
+        // could be anywhere up to 10s out). The caller's retry queue then
+        // only has to survive until the next flush.
+        connect();
         sendResponse({ ok: false, error: "not paired with the desktop app" });
         break;
       }

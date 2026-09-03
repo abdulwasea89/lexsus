@@ -543,15 +543,20 @@
       }
     }
 
-    // Each region is replaced with spaces of the same length, so the string
-    // never shifts and `blanks` needs no sorting across the three passes.
-    let rest = text;
-    for (let i = blanks.length - 1; i >= 0; i--) {
-      rest =
-        rest.slice(0, blanks[i][0]) +
-        " ".repeat(blanks[i][1] - blanks[i][0]) +
-        rest.slice(blanks[i][1]);
+    // One sorted pass, not a splice per region: rebuilding the whole string
+    // for every blank was O(n²) on long streaming messages with many fences,
+    // and this runs on every scan. Sorting is safe here because the three
+    // passes above never produce overlapping regions (fenced/tagged blocks
+    // are consumed whole, and inline JSON objects are blanked before a
+    // later pass can see them).
+    const sorted = [...blanks].sort((a, b) => a[0] - b[0]);
+    let rest = "";
+    let at = 0;
+    for (const [s, e] of sorted) {
+      rest += text.slice(at, s) + " ".repeat(e - s);
+      at = e;
     }
+    rest += text.slice(at);
     return { tools, rest };
   }
 
