@@ -15,6 +15,15 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Mutex;
 use std::time::Duration;
 
+/// One replacement inside a `multi_edit` batch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Edit {
+    pub old_string: String,
+    pub new_string: String,
+    #[serde(default)]
+    pub replace_all: Option<bool>,
+}
+
 /// A web-AI tool call (serde: externally-tagged, mirrors `types.ts`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Tool {
@@ -32,6 +41,45 @@ pub enum Tool {
     WriteFile {
         path: String,
         content: String,
+    },
+    /// Replace one exact string in a file. The scalpel to `write_file`'s
+    /// mallet: a one-line fix no longer resends the whole file.
+    EditFile {
+        path: String,
+        old_string: String,
+        new_string: String,
+        #[serde(default)]
+        replace_all: Option<bool>,
+    },
+    /// Several edits in one call, applied together — all of them or none.
+    MultiEdit {
+        path: String,
+        edits: Vec<Edit>,
+    },
+    /// Apply a single-file unified diff (hunks with context lines).
+    ApplyPatch {
+        path: String,
+        patch: String,
+    },
+    DeleteFile {
+        path: String,
+    },
+    MoveFile {
+        from: String,
+        to: String,
+    },
+    CopyFile {
+        from: String,
+        to: String,
+    },
+    CreateDirectory {
+        path: String,
+    },
+    /// Read several files in one round-trip. Each browser→WS→core→browser
+    /// hop costs real latency, so batching is a win even before approval
+    /// queuing.
+    ReadManyFiles {
+        paths: Vec<String>,
     },
     RunCommand {
         command: String,
@@ -129,6 +177,94 @@ pub const SPECS: &[ToolSpec] = &[
         group: "Editing",
     },
     ToolSpec {
+        name: "edit_file",
+        aliases: &["edit", "str_replace", "replace", "apply_edit"],
+        args: "path, old_string, new_string, replace_all?",
+        summary: "Replace one exact string in a file",
+        approval: Approval::SensitivePathOnly,
+        trace_kind: Some("editing"),
+        timeout_ms: 15_000,
+        auto_insert: false,
+        group: "Editing",
+    },
+    ToolSpec {
+        name: "multi_edit",
+        aliases: &["multi_edit_file", "batch_edit", "edit_many"],
+        args: "path, edits[]",
+        summary: "Apply several exact-string edits to one file, atomically",
+        approval: Approval::SensitivePathOnly,
+        trace_kind: Some("editing"),
+        timeout_ms: 20_000,
+        auto_insert: false,
+        group: "Editing",
+    },
+    ToolSpec {
+        name: "apply_patch",
+        aliases: &["patch", "unified_diff"],
+        args: "path, patch",
+        summary: "Apply a single-file unified diff",
+        approval: Approval::Always,
+        trace_kind: Some("editing"),
+        timeout_ms: 20_000,
+        auto_insert: false,
+        group: "Editing",
+    },
+    ToolSpec {
+        name: "delete_file",
+        aliases: &["remove_file", "rm_file", "remove"],
+        args: "path",
+        summary: "Delete a file (not directories)",
+        approval: Approval::Destructive,
+        trace_kind: Some("editing"),
+        timeout_ms: 10_000,
+        auto_insert: false,
+        group: "Editing",
+    },
+    ToolSpec {
+        name: "move_file",
+        aliases: &["rename_file", "rename", "mv"],
+        args: "from, to",
+        summary: "Move or rename a file, overwriting the target",
+        approval: Approval::Destructive,
+        trace_kind: Some("editing"),
+        timeout_ms: 10_000,
+        auto_insert: false,
+        group: "Editing",
+    },
+    ToolSpec {
+        name: "copy_file",
+        aliases: &["cp_file", "duplicate_file", "cp"],
+        args: "from, to",
+        summary: "Copy a file, overwriting the target",
+        approval: Approval::Always,
+        trace_kind: Some("editing"),
+        timeout_ms: 10_000,
+        auto_insert: false,
+        group: "Editing",
+    },
+    ToolSpec {
+        name: "create_directory",
+        aliases: &["mkdir", "create_dir", "make_directory"],
+        args: "path",
+        summary: "Create a directory and its parents",
+        approval: Approval::Auto,
+        trace_kind: Some("editing"),
+        timeout_ms: 10_000,
+        auto_insert: false,
+        group: "Editing",
+    },
+    ToolSpec {
+        name: "read_many_files",
+        aliases: &["read_files", "read_many"],
+        args: "paths[]",
+        summary: "Read several files in one call, first chunk of each",
+        approval: Approval::Auto,
+        trace_kind: Some("reading"),
+        timeout_ms: 15_000,
+        auto_insert: true,
+        group: "Reading",
+    },
+    ToolSpec {
         name: "run_command",
         aliases: &["bash", "shell", "execute", "terminal", "sh"],
         args: "command",
@@ -179,6 +315,14 @@ pub fn tool_name(tool: &Tool) -> &'static str {
     match tool {
         Tool::ReadFile { .. } => "read_file",
         Tool::WriteFile { .. } => "write_file",
+        Tool::EditFile { .. } => "edit_file",
+        Tool::MultiEdit { .. } => "multi_edit",
+        Tool::ApplyPatch { .. } => "apply_patch",
+        Tool::DeleteFile { .. } => "delete_file",
+        Tool::MoveFile { .. } => "move_file",
+        Tool::CopyFile { .. } => "copy_file",
+        Tool::CreateDirectory { .. } => "create_directory",
+        Tool::ReadManyFiles { .. } => "read_many_files",
         Tool::RunCommand { .. } => "run_command",
         Tool::ListDirectory { .. } => "list_directory",
         Tool::GitStatus => "git_status",
@@ -276,12 +420,24 @@ pub fn tool_paths(tool: &Tool) -> Vec<&str> {
     match tool {
         Tool::ReadFile { path, .. }
         | Tool::WriteFile { path, .. }
+        | Tool::EditFile { path, .. }
+        | Tool::MultiEdit { path, .. }
+        | Tool::ApplyPatch { path, .. }
+        | Tool::DeleteFile { path }
+        | Tool::CreateDirectory { path }
         | Tool::ListDirectory { path } => {
             vec![path.as_str()]
         }
-        Tool::RunCommand { .. } | Tool::GitStatus | Tool::DescribeTool { .. } | Tool::ListTools => {
-            vec![]
-        }
+        // Both sides of a path pair: a secret can be laundered by copying
+        // it to an innocuous name, so the target is checked too.
+        Tool::MoveFile { from, to } | Tool::CopyFile { from, to } => vec![from.as_str(), to.as_str()],
+        // A batch's paths are filtered individually at execution; the trace
+        // carries the count instead (see `detail`).
+        Tool::ReadManyFiles { .. }
+        | Tool::RunCommand { .. }
+        | Tool::GitStatus
+        | Tool::DescribeTool { .. }
+        | Tool::ListTools => vec![],
     }
 }
 
@@ -297,6 +453,24 @@ pub fn detail(tool: &Tool) -> Option<String> {
         }),
         Tool::ListDirectory { path } => Some(path.clone()),
         Tool::WriteFile { path, content } => Some(format!("{path} ({} bytes)", content.len())),
+        Tool::EditFile {
+            path,
+            old_string,
+            new_string,
+            ..
+        } => Some(format!(
+            "{path} ({} → {} bytes)",
+            old_string.len(),
+            new_string.len()
+        )),
+        Tool::MultiEdit { path, edits } => Some(format!("{path} ({} edits)", edits.len())),
+        Tool::ApplyPatch { path, patch } => Some(format!("{path} ({} bytes patch)", patch.len())),
+        Tool::DeleteFile { path } => Some(path.clone()),
+        Tool::MoveFile { from, to } | Tool::CopyFile { from, to } => {
+            Some(format!("{from} → {to}"))
+        }
+        Tool::CreateDirectory { path } => Some(path.clone()),
+        Tool::ReadManyFiles { paths } => Some(format!("{} files", paths.len())),
         Tool::RunCommand { command } => Some(command.clone()),
         Tool::DescribeTool { name } => Some(name.clone()),
         Tool::GitStatus | Tool::ListTools => None,
@@ -332,6 +506,10 @@ pub enum ErrorCode {
     PermissionDenied,
     SensitivePath,
     InvalidArguments,
+    StringNotFound,
+    AmbiguousMatch,
+    PatchDoesNotApply,
+    BridgePaused,
     MalformedJson,
     ExecutionFailed,
     CommandTimeout,
@@ -352,6 +530,10 @@ impl std::fmt::Display for ErrorCode {
             ErrorCode::PermissionDenied => write!(f, "PERMISSION_DENIED"),
             ErrorCode::SensitivePath => write!(f, "SENSITIVE_PATH"),
             ErrorCode::InvalidArguments => write!(f, "INVALID_ARGUMENTS"),
+            ErrorCode::StringNotFound => write!(f, "STRING_NOT_FOUND"),
+            ErrorCode::AmbiguousMatch => write!(f, "AMBIGUOUS_MATCH"),
+            ErrorCode::PatchDoesNotApply => write!(f, "PATCH_DOES_NOT_APPLY"),
+            ErrorCode::BridgePaused => write!(f, "BRIDGE_PAUSED"),
             ErrorCode::MalformedJson => write!(f, "MALFORMED_JSON"),
             ErrorCode::ExecutionFailed => write!(f, "EXECUTION_FAILED"),
             ErrorCode::CommandTimeout => write!(f, "COMMAND_TIMEOUT"),
@@ -421,6 +603,54 @@ impl ToolResult {
     }
 }
 
+/// What a session grant covers. Scoped by the manifest group so a grant
+/// reads the way the user thinks about it ("edits", "commands") rather
+/// than by internal approval classes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GrantScope {
+    /// The "Editing" group: write_file, edit_file, multi_edit, apply_patch,
+    /// copy_file. Destructive tools (delete_file, move_file) are in the
+    /// group too but a grant never covers them — that rule lives in
+    /// [`grant_matches`] and is not overridable.
+    Editing,
+    /// The "Commands" group: run_command.
+    Commands,
+}
+
+impl GrantScope {
+    pub fn from_group(group: &str) -> Option<Self> {
+        match group {
+            "Editing" => Some(GrantScope::Editing),
+            "Commands" => Some(GrantScope::Commands),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GrantScope::Editing => "editing",
+            GrantScope::Commands => "commands",
+        }
+    }
+}
+
+/// One user-issued session grant: "auto-approve {scope} under {prefix} for
+/// this session". In-memory only — it dies with the app, so there is no
+/// standing permission to forget about; the SQLite audit keeps the record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionGrant {
+    pub id: u64,
+    pub scope: GrantScope,
+    /// Relative path prefix under the project root, or `None` for the whole
+    /// project. Commands have no path, so their grants carry `None`.
+    pub path_prefix: Option<String>,
+    /// Who created it ("web" | "desktop"); it only auto-approves calls from
+    /// the same source, so a desktop grant never silently covers a paired
+    /// extension's calls.
+    pub source: String,
+}
+
 /// A queued approval request shown to the user.
 #[derive(Debug, Clone)]
 pub struct ApprovalRequest {
@@ -442,6 +672,10 @@ pub struct Bridge {
     pub pending: Mutex<Vec<ApprovalRequest>>,
     /// WS callers waiting for approval resolution, keyed by request id.
     pub channels: Mutex<HashMap<u64, SyncSender<ToolResult>>>,
+    /// Active session grants (the Phase 6 approval-engine slice).
+    pub grants: Mutex<Vec<SessionGrant>>,
+    /// Kill switch: when set, every tool call is refused until unpaused.
+    pub paused: std::sync::atomic::AtomicBool,
     pub next_id: AtomicU64,
 }
 
@@ -450,22 +684,56 @@ impl Bridge {
         Self::default()
     }
 
-    /// Route a tool call: auto-execute or queue for approval.
-    /// Returns `(result, approval_id)` — if the call needs approval,
-    /// `result.pending` is set and `approval_id` is the id to resolve.
+    /// Route a tool call: auto-execute, execute under a session grant, or
+    /// queue for approval. Returns `(result, approval_id)` — if the call
+    /// needs approval, `result.pending` is set and `approval_id` is the id
+    /// to resolve. The `approved_by` string out-parameter records whether
+    /// execution happened via "auto" or a "grant" (for the audit log).
     pub fn submit(
         &self,
         tool: Tool,
         source: &str,
         root: Option<&Path>,
     ) -> (ToolResult, Option<u64>) {
+        let (result, approval_id, _how) = self.submit_with_audit(tool, source, root);
+        (result, approval_id)
+    }
+
+    /// As [`submit`], but also reports how an auto-execution was authorized
+    /// ("auto" or "grant:<scope>[:<prefix>]") for the audit log.
+    pub fn submit_with_audit(
+        &self,
+        tool: Tool,
+        source: &str,
+        root: Option<&Path>,
+    ) -> (ToolResult, Option<u64>, String) {
+        if self.paused.load(Ordering::SeqCst) {
+            return (
+                ToolResult::err_code(
+                    ErrorCode::BridgePaused,
+                    "bridge paused by user — no tool calls are running",
+                ),
+                None,
+                "paused".to_string(),
+            );
+        }
         match needs_approval(&tool) {
-            None => (execute(&tool, root, None), None),
+            None => (execute(&tool, root, None), None, "auto".to_string()),
             Some(reason) => {
+                if let Some(grant) = self
+                    .grants
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|g| grant_matches(g, &tool, source, root))
+                {
+                    let label = grant_label(grant);
+                    return (execute(&tool, root, None), None, label);
+                }
                 let id = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;
                 self.pending.lock().unwrap().push(ApprovalRequest {
                     id,
-                    summary: describe(&tool),
+                    summary: describe_for_approval(&tool, root),
                     tool,
                     source: source.to_string(),
                     owner: crate::process::execution_owner(),
@@ -473,6 +741,7 @@ impl Bridge {
                 (
                     ToolResult::pending(format!("{reason} (request #{id})")),
                     Some(id),
+                    "pending".to_string(),
                 )
             }
         }
@@ -514,6 +783,51 @@ impl Bridge {
             let _ = tx.send(result.clone());
         }
         Some((result, req))
+    }
+
+    /// Add a session grant; returns its id.
+    pub fn grant_add(&self, scope: GrantScope, path_prefix: Option<String>, source: &str) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;
+        self.grants.lock().unwrap().push(SessionGrant {
+            id,
+            scope,
+            path_prefix,
+            source: source.to_string(),
+        });
+        id
+    }
+
+    /// Revoke one grant by id.
+    pub fn grant_revoke(&self, id: u64) -> bool {
+        let mut grants = self.grants.lock().unwrap();
+        match grants.iter().position(|g| g.id == id) {
+            Some(i) => {
+                grants.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Revoke every grant (the kill switch's first half).
+    pub fn grants_clear(&self) -> usize {
+        let n = self.grants.lock().unwrap().len();
+        self.grants.lock().unwrap().clear();
+        n
+    }
+
+    /// Set or clear the paused flag (the kill switch's second half). Pausing
+    /// also revokes every grant — a kill switch that left standing
+    /// auto-approvals armed would not be a kill switch.
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::SeqCst);
+        if paused {
+            self.grants.lock().unwrap().clear();
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
     }
 }
 
@@ -578,6 +892,107 @@ pub fn needs_approval(tool: &Tool) -> Option<String> {
             .then(|| "read of sensitive path".to_string()),
         Approval::Always => Some(s.name.to_string()),
         Approval::Destructive => Some(format!("{} (destructive)", s.name)),
+    }
+}
+
+/// Does a grant auto-approve this call? The rules, in order:
+///
+/// - Same source that created it (a desktop grant never covers web calls).
+/// - The tool's group is the grant's scope.
+/// - **Destructive never auto-approves.** Not overridable by any grant.
+/// - No touched path is sensitive — otherwise `copy_file .env notes.txt`
+///   launders a secret to a name the read gate doesn't stop at.
+/// - Every path resolves under the grant's prefix (via `resolve_path`, not
+///   a raw `starts_with`, so a `..`-laden path can't widen the scope).
+pub fn grant_matches(
+    grant: &SessionGrant,
+    tool: &Tool,
+    source: &str,
+    root: Option<&Path>,
+) -> bool {
+    if grant.source != source {
+        return false;
+    }
+    let s = spec(tool);
+    if s.approval == Approval::Destructive {
+        return false;
+    }
+    if GrantScope::from_group(s.group) != Some(grant.scope) {
+        return false;
+    }
+    let paths = tool_paths(tool);
+    if paths.iter().any(|p| is_sensitive_path(Path::new(p))) {
+        return false;
+    }
+    match (&grant.path_prefix, root) {
+        (None, _) => true,
+        (Some(prefix), Some(root)) => {
+            // Resolve the prefix and each path independently, then compare
+            // canonical absolute paths — joining "{prefix}/{path}" first
+            // would let a `src/../root.txt` path normalize its way back
+            // under the prefix and widen the grant's scope.
+            let Ok(base) = resolve_path(root, prefix) else {
+                return false;
+            };
+            paths
+                .iter()
+                .all(|p| resolve_path(root, p).is_ok_and(|abs| abs.starts_with(&base)))
+        }
+        // No root to anchor a prefix against: don't guess, don't approve.
+        (Some(_), None) => false,
+    }
+}
+
+/// Audit label for a grant-authorized execution.
+fn grant_label(grant: &SessionGrant) -> String {
+    match &grant.path_prefix {
+        Some(p) => format!("grant:{}:{p}", grant.scope.as_str()),
+        None => format!("grant:{}", grant.scope.as_str()),
+    }
+}
+
+/// What an approval card can offer as a follow-up grant, for the
+/// `bridge://approval-requested` payload. `None` when the tool cannot be
+/// grant-covered (destructive) or has no meaningful scope.
+pub fn grantable(tool: &Tool) -> Option<(GrantScope, Option<String>)> {
+    let s = spec(tool);
+    if s.approval == Approval::Destructive {
+        return None;
+    }
+    let scope = GrantScope::from_group(s.group)?;
+    // The suggested prefix is the directory of the tool's first path — the
+    // common "auto-approve edits under src/" shape. Commands have no path.
+    let prefix = match tool_paths(tool).first() {
+        Some(p) => {
+            let dir = Path::new(p).parent()?;
+            match dir.to_string_lossy().to_string() {
+                d if d.is_empty() || d == "." => None,
+                d => Some(d),
+            }
+        }
+        None => None,
+    };
+    Some((scope, prefix))
+}
+
+/// The summary shown on the approval card. Destructive tools resolve their
+/// paths against the project root so the card shows exactly what disappears
+/// (`delete_file /home/me/proj/old.ts`), not a relative name that could be
+/// any of three nested files with the same name.
+pub fn describe_for_approval(tool: &Tool, root: Option<&Path>) -> String {
+    let name = tool_name(tool);
+    let resolve = |p: &str| -> String {
+        root.and_then(|r| resolve_path(r, p).ok())
+            .map(|abs| abs.display().to_string())
+            .unwrap_or_else(|| p.to_string())
+    };
+    match tool {
+        Tool::DeleteFile { path } => format!("{name} {}", resolve(path)),
+        Tool::MoveFile { from, to } => {
+            format!("{name} {} → {}", resolve(from), resolve(to))
+        }
+        // Non-destructive tools keep the terse default.
+        _ => describe(tool),
     }
 }
 
@@ -756,6 +1171,225 @@ fn resolve_path(root: &Path, rel: &str) -> Result<PathBuf, String> {
     Ok(normalized)
 }
 
+/// `resolve_path` mapped to the error convention `execute` returns.
+fn resolve_tool_path(root: &Path, rel: &str) -> Result<PathBuf, ToolResult> {
+    resolve_path(root, rel).map_err(|e| {
+        if e.contains("escapes project root") {
+            ToolResult::err_code(ErrorCode::PathEscapesRoot, e)
+        } else {
+            ToolResult::err_code(ErrorCode::FileNotFound, e)
+        }
+    })
+}
+
+/// Read a file as text with the same binary/cap checks `read_file` applies.
+fn read_text_file(p: &Path, rel: &str) -> Result<String, ToolResult> {
+    let md = match std::fs::metadata(p) {
+        Ok(md) if md.is_dir() => {
+            return Err(ToolResult::err_code(
+                ErrorCode::InvalidArguments,
+                format!("is a directory: {rel}"),
+            ));
+        }
+        Ok(md) => md,
+        Err(e) => return Err(ToolResult::err_code(ErrorCode::FileNotFound, format!("{rel}: {e}"))),
+    };
+    if md.len() > READ_CAP {
+        return Err(ToolResult::err_code(
+            ErrorCode::FileTooLarge,
+            format!("{rel}: file too large ({} bytes)", md.len()),
+        ));
+    }
+    match std::fs::read(p) {
+        Ok(bytes) => {
+            if bytes.contains(&0) {
+                return Err(ToolResult::err_code(
+                    ErrorCode::FileIsBinary,
+                    format!("{rel}: binary file ({} bytes, not shown)", bytes.len()),
+                ));
+            }
+            Ok(String::from_utf8_lossy(&bytes).into_owned())
+        }
+        Err(e) => Err(ToolResult::err_code(
+            ErrorCode::ExecutionFailed,
+            format!("{rel}: {e}"),
+        )),
+    }
+}
+
+/// Apply one exact-string replacement to `text`. Empty `old` is rejected
+/// (it would match everywhere), a missing match is `StringNotFound`, and
+/// multiple matches without `replace_all` are `AmbiguousMatch` — the count
+/// is in the message so the AI can disambiguate on its next attempt.
+fn apply_str_edit(text: &str, old: &str, new: &str, replace_all: bool) -> Result<String, ToolError> {
+    if old.is_empty() {
+        return Err(ToolError {
+            code: ErrorCode::InvalidArguments,
+            message: "old_string is empty — it would match everywhere".into(),
+        });
+    }
+    let matches = text.match_indices(old).count();
+    match matches {
+        0 => Err(ToolError {
+            code: ErrorCode::StringNotFound,
+            message: "old_string not found".into(),
+        }),
+        1 => Ok(text.replacen(old, new, 1)),
+        _ if replace_all => Ok(text.replace(old, new)),
+        _ => Err(ToolError {
+            code: ErrorCode::AmbiguousMatch,
+            message: format!("old_string matches {matches} times — extend it to be unique, or pass replace_all"),
+        }),
+    }
+}
+
+/// One hunk of a unified diff: the 1-based old-file start line plus the
+/// lines to match (context `' '` and removed `'-'`) and the lines to put in
+/// their place (context and added `'+'`).
+struct Hunk {
+    old_start: usize,
+    match_lines: Vec<String>,  // context + removals, in order
+    output_lines: Vec<String>, // context + additions, in order
+}
+
+/// Parse a single-file unified diff into hunks. `---`/`+++` headers and
+/// `\ No newline at end of file` markers are ignored; the target path comes
+/// from the tool argument, not the headers (which a web AI often mangles).
+fn parse_hunks(patch: &str) -> Result<Vec<Hunk>, ToolError> {
+    let mut hunks = Vec::new();
+    let mut current: Option<Hunk> = None;
+    for line in patch.lines() {
+        if line.starts_with("--- ") || line.starts_with("+++ ") || line.starts_with("diff ") {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("@@") {
+            // Close out the previous hunk.
+            if let Some(h) = current.take() {
+                hunks.push(h);
+            }
+            // `@@ -12,3 +13,4 @@ ...` — only the old start matters; the
+            // rest is advisory and models get counts wrong.
+            let old = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.strip_prefix('-'))
+                .and_then(|s| s.split(',').next().map(str::parse::<usize>))
+                .transpose()
+                .map_err(|_| ToolError {
+                    code: ErrorCode::InvalidArguments,
+                    message: format!("bad hunk header: {line}"),
+                })?
+                .ok_or_else(|| ToolError {
+                    code: ErrorCode::InvalidArguments,
+                    message: format!("bad hunk header: {line}"),
+                })?;
+            current = Some(Hunk {
+                old_start: old.max(1),
+                match_lines: Vec::new(),
+                output_lines: Vec::new(),
+            });
+            continue;
+        }
+        if line.starts_with('\\') {
+            // "\ No newline at end of file" — informational; treat the
+            // patch as applying to the newline-terminated form.
+            continue;
+        }
+        let Some(hunk) = current.as_mut() else {
+            // Prose around the first @@ header (explanations, code fences)
+            // is common; skip it rather than rejecting the patch.
+            continue;
+        };
+        match line.chars().next() {
+            Some(' ') | Some('\t') => {
+                let l = &line[1..];
+                hunk.match_lines.push(l.to_string());
+                hunk.output_lines.push(l.to_string());
+            }
+            Some('-') => hunk.match_lines.push(line[1..].to_string()),
+            Some('+') => hunk.output_lines.push(line[1..].to_string()),
+            // A line with no prefix — the model dropped the leading space
+            // off a context line, or wrote trailing prose. Treating it as
+            // context fails safe: a wrong guess makes the hunk not match
+            // (PATCH_DOES_NOT_APPLY) rather than silently mis-applying.
+            _ => {
+                hunk.match_lines.push(line.to_string());
+                hunk.output_lines.push(line.to_string());
+            }
+        }
+    }
+    if let Some(h) = current.take() {
+        hunks.push(h);
+    }
+    if hunks.is_empty() {
+        return Err(ToolError {
+            code: ErrorCode::InvalidArguments,
+            message: "no hunks found — expected @@ -a,b +c,d @@ sections".into(),
+        });
+    }
+    Ok(hunks)
+}
+
+/// How far a hunk's stated position may drift before it is declared
+/// unappliable (lines). `patch` and `git apply` search similarly; without
+/// it, a stale offset in the model's head would reject a valid edit.
+const HUNK_DRIFT: isize = 20;
+
+/// Apply parsed hunks to the file's lines. Every hunk must apply or none
+/// does — the caller only writes on `Ok`.
+fn apply_hunks(lines: &[String], hunks: &[Hunk]) -> Result<Vec<String>, ToolError> {
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut consumed = 0usize; // lines of the old file already emitted/skipped
+    for (i, hunk) in hunks.iter().enumerate() {
+        let want = hunk.old_start.saturating_sub(1); // 0-based expected start
+        // Exact position first, then a drift search forward and backward.
+        let mut found: Option<usize> = None;
+        for delta in 0..=HUNK_DRIFT {
+            for cand in [
+                want.checked_add_signed(delta),
+                delta.checked_neg().and_then(|d| want.checked_add_signed(d)),
+            ] {
+                let Some(c) = cand.filter(|&c| c >= consumed) else {
+                    continue;
+                };
+                if c + hunk.match_lines.len() <= lines.len()
+                    && lines[c..c + hunk.match_lines.len()] == hunk.match_lines[..]
+                {
+                    found = Some(c);
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        let Some(at) = found else {
+            return Err(ToolError {
+                code: ErrorCode::PatchDoesNotApply,
+                message: format!(
+                    "hunk {} (from line {}) does not match the file",
+                    i + 1,
+                    hunk.old_start
+                ),
+            });
+        };
+        // Emit the untouched lines before the hunk, then its output.
+        out.extend(lines[consumed..at].iter().cloned());
+        out.extend(hunk.output_lines.iter().cloned());
+        consumed = at + hunk.match_lines.len();
+    }
+    out.extend(lines[consumed..].iter().cloned());
+    Ok(out)
+}
+
+/// How many files a `read_many_files` call may batch, and the batch's total
+/// byte budget. The budget keeps the whole auto-inserted result inside the
+/// extension's 24KB composer cap: a rendered 400-line chunk is ~16KB of
+/// content plus ~2.5KB of line numbers and a footer, so 20KB admits one
+/// full chunk with headroom for headers.
+const MANY_FILES_MAX: usize = 20;
+const MANY_BYTES_BUDGET: usize = 20 * 1024;
+
 /// Execute a tool call locally. `root: None` → tool requires the root.
 /// `on_event` streams command events while a `run_command` executes.
 pub fn execute(
@@ -855,6 +1489,249 @@ pub fn execute(
                 Ok(()) => ToolResult::ok(format!("wrote {} bytes to {path}", content.len())),
                 Err(e) => ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{path}: {e}")),
             }
+        }
+        Tool::EditFile {
+            path,
+            old_string,
+            new_string,
+            replace_all,
+        } => {
+            let p = match resolve_tool_path(root, path) {
+                Ok(p) => p,
+                Err(r) => return r,
+            };
+            let text = match read_text_file(&p, path) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            match apply_str_edit(&text, old_string, new_string, replace_all.unwrap_or(false)) {
+                Ok(new_text) => match std::fs::write(&p, new_text.as_bytes()) {
+                    Ok(()) => ToolResult::ok(format!("edited {path}")),
+                    Err(e) => {
+                        ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{path}: {e}"))
+                    }
+                },
+                Err(e) => ToolResult::err_code(e.code, format!("{path}: {}", e.message)),
+            }
+        }
+        Tool::MultiEdit { path, edits } => {
+            if edits.is_empty() {
+                return ToolResult::err_code(
+                    ErrorCode::InvalidArguments,
+                    "edits is empty — nothing to apply",
+                );
+            }
+            let p = match resolve_tool_path(root, path) {
+                Ok(p) => p,
+                Err(r) => return r,
+            };
+            let text = match read_text_file(&p, path) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            // Fold every edit through the in-memory text before touching
+            // the file: one bad edit leaves the file exactly as it was.
+            let mut new_text = text;
+            for (i, e) in edits.iter().enumerate() {
+                match apply_str_edit(
+                    &new_text,
+                    &e.old_string,
+                    &e.new_string,
+                    e.replace_all.unwrap_or(false),
+                ) {
+                    Ok(t) => new_text = t,
+                    Err(err) => {
+                        return ToolResult::err_code(
+                            err.code,
+                            format!("{path}: edit {} of {}: {}", i + 1, edits.len(), err.message),
+                        );
+                    }
+                }
+            }
+            match std::fs::write(&p, new_text.as_bytes()) {
+                Ok(()) => ToolResult::ok(format!(
+                    "applied {} edits to {path}",
+                    edits.len()
+                )),
+                Err(e) => ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{path}: {e}")),
+            }
+        }
+        Tool::ApplyPatch { path, patch } => {
+            let p = match resolve_tool_path(root, path) {
+                Ok(p) => p,
+                Err(r) => return r,
+            };
+            let text = match read_text_file(&p, path) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            let hunks = match parse_hunks(patch) {
+                Ok(h) => h,
+                Err(e) => return ToolResult::err_code(e.code, format!("{path}: {}", e.message)),
+            };
+            let lines: Vec<String> = text.lines().map(str::to_string).collect();
+            let new_lines = match apply_hunks(&lines, &hunks) {
+                Ok(l) => l,
+                Err(e) => return ToolResult::err_code(e.code, format!("{path}: {}", e.message)),
+            };
+            let mut new_text = new_lines.join("\n");
+            if text.ends_with('\n') {
+                new_text.push('\n');
+            }
+            match std::fs::write(&p, new_text.as_bytes()) {
+                Ok(()) => ToolResult::ok(format!(
+                    "applied {} hunks to {path}",
+                    hunks.len()
+                )),
+                Err(e) => ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{path}: {e}")),
+            }
+        }
+        Tool::DeleteFile { path } => {
+            let p = match resolve_tool_path(root, path) {
+                Ok(p) => p,
+                Err(r) => return r,
+            };
+            match std::fs::metadata(&p) {
+                Ok(md) if md.is_dir() => {
+                    return ToolResult::err_code(
+                        ErrorCode::InvalidArguments,
+                        format!("is a directory: {path} — this tool deletes files only"),
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return ToolResult::err_code(ErrorCode::FileNotFound, format!("{path}: {e}"));
+                }
+            }
+            match std::fs::remove_file(&p) {
+                Ok(()) => ToolResult::ok(format!("deleted {path}")),
+                Err(e) => ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{path}: {e}")),
+            }
+        }
+        Tool::MoveFile { from, to } => {
+            let src = match resolve_tool_path(root, from) {
+                Ok(p) => p,
+                Err(r) => return r,
+            };
+            let dst = match resolve_tool_path(root, to) {
+                Ok(p) => p,
+                Err(r) => return r,
+            };
+            if !src.exists() {
+                return ToolResult::err_code(ErrorCode::FileNotFound, format!("{from}: not found"));
+            }
+            if let Some(parent) = dst.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    return ToolResult::err_code(
+                        ErrorCode::ExecutionFailed,
+                        format!("{to}: {e}"),
+                    );
+                }
+            }
+            // Overwrites the target — the approval card shows both paths.
+            match std::fs::rename(&src, &dst) {
+                Ok(()) => ToolResult::ok(format!("moved {from} → {to}")),
+                Err(e) => ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{from}: {e}")),
+            }
+        }
+        Tool::CopyFile { from, to } => {
+            let src = match resolve_tool_path(root, from) {
+                Ok(p) => p,
+                Err(r) => return r,
+            };
+            let dst = match resolve_tool_path(root, to) {
+                Ok(p) => p,
+                Err(r) => return r,
+            };
+            if !src.exists() {
+                return ToolResult::err_code(ErrorCode::FileNotFound, format!("{from}: not found"));
+            }
+            if let Some(parent) = dst.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    return ToolResult::err_code(
+                        ErrorCode::ExecutionFailed,
+                        format!("{to}: {e}"),
+                    );
+                }
+            }
+            match std::fs::copy(&src, &dst) {
+                Ok(n) => ToolResult::ok(format!("copied {from} → {to} ({n} bytes)")),
+                Err(e) => ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{from}: {e}")),
+            }
+        }
+        Tool::CreateDirectory { path } => {
+            let p = match resolve_tool_path(root, path) {
+                Ok(p) => p,
+                Err(r) => return r,
+            };
+            match std::fs::create_dir_all(&p) {
+                Ok(()) => ToolResult::ok(format!("created directory {path}")),
+                Err(e) => ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{path}: {e}")),
+            }
+        }
+        Tool::ReadManyFiles { paths } => {
+            if paths.is_empty() {
+                return ToolResult::err_code(ErrorCode::InvalidArguments, "paths is empty");
+            }
+            if paths.len() > MANY_FILES_MAX {
+                return ToolResult::err_code(
+                    ErrorCode::InvalidArguments,
+                    format!(
+                        "{} paths — batch at most {MANY_FILES_MAX}",
+                        paths.len()
+                    ),
+                );
+            }
+            let mut out = String::new();
+            let mut budget = MANY_BYTES_BUDGET;
+            let mut shown = 0usize;
+            for path in paths {
+                // Sensitive paths are skipped, not refused: one .env in a
+                // batch of package files shouldn't block the rest.
+                if is_sensitive_path(Path::new(path)) {
+                    out.push_str(&format!("[{path} — skipped: sensitive]\n"));
+                    continue;
+                }
+                let p = match resolve_tool_path(root, path) {
+                    Ok(p) => p,
+                    Err(r) => {
+                        let msg = r.error.unwrap_or_default();
+                        out.push_str(&format!("[{path} — {msg}]\n"));
+                        continue;
+                    }
+                };
+                let text = match read_text_file(&p, path) {
+                    Ok(t) => t,
+                    Err(r) => {
+                        let msg = r.error.unwrap_or_default();
+                        out.push_str(&format!("[{path} — {msg}]\n"));
+                        continue;
+                    }
+                };
+                if budget == 0 {
+                    out.push_str(&format!(
+                        "[{path} — batch budget spent; call read_file on it]\n"
+                    ));
+                    continue;
+                }
+                let chunk = chunk_text(path, &text, None, None);
+                if chunk.len() > budget {
+                    out.push_str(&format!(
+                        "[{path} — {} lines, too large for this batch; call read_file on it]\n",
+                        text.lines().count()
+                    ));
+                    continue;
+                }
+                out.push_str(&format!("── {path} ──\n"));
+                out.push_str(&chunk);
+                budget -= chunk.len();
+                shown += 1;
+            }
+            out.push_str(&format!(
+                "\n[{shown} of {} files shown]\n",
+                paths.len()
+            ));
+            ToolResult::ok(out)
         }
         Tool::RunCommand { command } => {
             if let Some(cb) = on_event.as_mut() {
@@ -1047,6 +1924,66 @@ mod tests {
         .is_some());
         assert!(needs_approval(&Tool::ListDirectory { path: ".".into() }).is_none());
         assert!(needs_approval(&Tool::GitStatus).is_none());
+
+        // Phase 1 tools.
+        assert!(needs_approval(&Tool::EditFile {
+            path: "src/a.ts".into(),
+            old_string: "x".into(),
+            new_string: "y".into(),
+            replace_all: None,
+        })
+        .is_none());
+        assert!(needs_approval(&Tool::EditFile {
+            path: ".env".into(),
+            old_string: "x".into(),
+            new_string: "y".into(),
+            replace_all: None,
+        })
+        .is_some());
+        assert!(needs_approval(&Tool::MultiEdit {
+            path: "src/a.ts".into(),
+            edits: vec![],
+        })
+        .is_none());
+        assert!(needs_approval(&Tool::ApplyPatch {
+            path: "a.ts".into(),
+            patch: String::new(),
+        })
+        .is_some());
+        assert!(needs_approval(&Tool::DeleteFile { path: "a.ts".into() }).is_some());
+        assert!(needs_approval(&Tool::MoveFile {
+            from: "a".into(),
+            to: "b".into()
+        })
+        .is_some());
+        assert!(needs_approval(&Tool::CopyFile {
+            from: "a".into(),
+            to: "b".into()
+        })
+        .is_some());
+        assert!(needs_approval(&Tool::CreateDirectory { path: "d".into() }).is_none());
+        assert!(needs_approval(&Tool::ReadManyFiles {
+            paths: vec!["a".into()]
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn path_pair_tools_report_both_paths() {
+        // A secret laundered by copying it to an innocuous name must still
+        // trip the sensitive-path gate: both sides are reported.
+        let t = Tool::CopyFile {
+            from: "notes.txt".into(),
+            to: "secrets.txt".into(),
+        };
+        assert_eq!(tool_paths(&t), vec!["notes.txt", "secrets.txt"]);
+        assert!(tool_paths(&t).iter().any(|p| is_sensitive_path(Path::new(p))));
+
+        let t = Tool::MoveFile {
+            from: ".env".into(),
+            to: "notes.txt".into(),
+        };
+        assert!(tool_paths(&t).iter().any(|p| is_sensitive_path(Path::new(p))));
     }
 
     #[test]
@@ -1198,6 +2135,596 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Fresh temp dir unique to this test (tests run in parallel; each
+    /// caller passes its own tag).
+    fn temp_project(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bridge-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn edit_file_replaces_exactly_once() {
+        let dir = temp_project("edit");
+        execute(
+            &Tool::WriteFile {
+                path: "a.txt".into(),
+                content: "alpha\nbeta\ngamma\n".into(),
+            },
+            Some(&dir),
+            None,
+        )
+        .ok();
+
+        let r = execute(
+            &Tool::EditFile {
+                path: "a.txt".into(),
+                old_string: "beta".into(),
+                new_string: "BETA".into(),
+                replace_all: None,
+            },
+            Some(&dir),
+            None,
+        );
+        assert!(r.ok, "{:?}", r.error);
+        let read = execute(
+            &Tool::ReadFile {
+                path: "a.txt".into(),
+                offset: None,
+                limit: None,
+            },
+            Some(&dir),
+            None,
+        );
+        assert!(read.output.unwrap().contains("BETA"));
+
+        // Not found.
+        let r = execute(
+            &Tool::EditFile {
+                path: "a.txt".into(),
+                old_string: "delta".into(),
+                new_string: "x".into(),
+                replace_all: None,
+            },
+            Some(&dir),
+            None,
+        );
+        assert_eq!(r.error_code, Some(ErrorCode::StringNotFound));
+
+        // Ambiguous without replace_all.
+        execute(
+            &Tool::WriteFile {
+                path: "b.txt".into(),
+                content: "x x x\n".into(),
+            },
+            Some(&dir),
+            None,
+        )
+        .ok();
+        let r = execute(
+            &Tool::EditFile {
+                path: "b.txt".into(),
+                old_string: "x".into(),
+                new_string: "y".into(),
+                replace_all: None,
+            },
+            Some(&dir),
+            None,
+        );
+        assert_eq!(r.error_code, Some(ErrorCode::AmbiguousMatch));
+        assert!(r.error.unwrap().contains("3"), "message names the count");
+
+        // replace_all resolves it.
+        let r = execute(
+            &Tool::EditFile {
+                path: "b.txt".into(),
+                old_string: "x".into(),
+                new_string: "y".into(),
+                replace_all: Some(true),
+            },
+            Some(&dir),
+            None,
+        );
+        assert!(r.ok);
+
+        // Empty old_string is refused.
+        let r = execute(
+            &Tool::EditFile {
+                path: "b.txt".into(),
+                old_string: String::new(),
+                new_string: "y".into(),
+                replace_all: None,
+            },
+            Some(&dir),
+            None,
+        );
+        assert_eq!(r.error_code, Some(ErrorCode::InvalidArguments));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_edit_is_atomic() {
+        let dir = temp_project("multiedit");
+        execute(
+            &Tool::WriteFile {
+                path: "a.txt".into(),
+                content: "one\ntwo\nthree\nfour\n".into(),
+            },
+            Some(&dir),
+            None,
+        )
+        .ok();
+
+        // The second edit targets a string that does not exist — the batch
+        // fails and the file must be exactly as it was (not half-edited).
+        let r = execute(
+            &Tool::MultiEdit {
+                path: "a.txt".into(),
+                edits: vec![
+                    Edit {
+                        old_string: "two".into(),
+                        new_string: "TWO".into(),
+                        replace_all: None,
+                    },
+                    Edit {
+                        old_string: "THREE".into(),
+                        new_string: "3".into(),
+                        replace_all: None,
+                    },
+                ],
+            },
+            Some(&dir),
+            None,
+        );
+        assert!(!r.ok);
+        let read = execute(
+            &Tool::ReadFile {
+                path: "a.txt".into(),
+                offset: None,
+                limit: None,
+            },
+            Some(&dir),
+            None,
+        );
+        let out = read.output.unwrap();
+        assert!(out.contains("two") && !out.contains("TWO"), "batch not atomic: {out}");
+
+        // A valid sequential batch applies in order.
+        let r = execute(
+            &Tool::MultiEdit {
+                path: "a.txt".into(),
+                edits: vec![
+                    Edit {
+                        old_string: "two".into(),
+                        new_string: "THREE".into(),
+                        replace_all: None,
+                    },
+                    Edit {
+                        old_string: "THREE".into(),
+                        new_string: "3".into(),
+                        replace_all: None,
+                    },
+                ],
+            },
+            Some(&dir),
+            None,
+        );
+        assert!(r.ok, "{:?}", r.error);
+        let read = execute(
+            &Tool::ReadFile {
+                path: "a.txt".into(),
+                offset: None,
+                limit: None,
+            },
+            Some(&dir),
+            None,
+        );
+        let out = read.output.unwrap();
+        assert!(out.contains("3") && !out.contains("two"));
+
+        // An empty batch is rejected outright.
+        let r = execute(
+            &Tool::MultiEdit {
+                path: "a.txt".into(),
+                edits: vec![],
+            },
+            Some(&dir),
+            None,
+        );
+        assert_eq!(r.error_code, Some(ErrorCode::InvalidArguments));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_patch_roundtrip() {
+        let dir = temp_project("patch");
+        execute(
+            &Tool::WriteFile {
+                path: "a.txt".into(),
+                content: "one\ntwo\nthree\nfour\nfive\n".into(),
+            },
+            Some(&dir),
+            None,
+        )
+        .ok();
+
+        // A clean patch with headers and context.
+        let patch =
+            "--- a/a.txt\n+++ b/a.txt\n@@ -1,5 +1,5 @@\n one\n-two\n+TWO\n three\n four\n five\n";
+        let r = execute(
+            &Tool::ApplyPatch {
+                path: "a.txt".into(),
+                patch: patch.into(),
+            },
+            Some(&dir),
+            None,
+        );
+        assert!(r.ok, "{:?}", r.error);
+        let read = execute(
+            &Tool::ReadFile {
+                path: "a.txt".into(),
+                offset: None,
+                limit: None,
+            },
+            Some(&dir),
+            None,
+        );
+        assert!(read.output.unwrap().contains("TWO"));
+
+        // Wrong context → PATCH_DOES_NOT_APPLY, file untouched.
+        let bad = "@@ -1,3 +1,3 @@\n one\n nonexistent context\n three\n";
+        let r = execute(
+            &Tool::ApplyPatch {
+                path: "a.txt".into(),
+                patch: bad.into(),
+            },
+            Some(&dir),
+            None,
+        );
+        assert_eq!(r.error_code, Some(ErrorCode::PatchDoesNotApply));
+        let read = execute(
+            &Tool::ReadFile {
+                path: "a.txt".into(),
+                offset: None,
+                limit: None,
+            },
+            Some(&dir),
+            None,
+        );
+        assert!(read.output.unwrap().contains("TWO"));
+
+        // A stale offset (line numbers far off) still applies via the
+        // drift search.
+        let drifted = "@@ -9,2 +9,2 @@\n four\n-five\n+FIVE\n";
+        let r = execute(
+            &Tool::ApplyPatch {
+                path: "a.txt".into(),
+                patch: drifted.into(),
+            },
+            Some(&dir),
+            None,
+        );
+        assert!(r.ok, "{:?}", r.error);
+
+        // No hunks at all.
+        let r = execute(
+            &Tool::ApplyPatch {
+                path: "a.txt".into(),
+                patch: "just some prose".into(),
+            },
+            Some(&dir),
+            None,
+        );
+        assert_eq!(r.error_code, Some(ErrorCode::InvalidArguments));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_management_tools_roundtrip() {
+        let dir = temp_project("fileops");
+        execute(
+            &Tool::WriteFile {
+                path: "src/deep/a.txt".into(),
+                content: "content".into(),
+            },
+            Some(&dir),
+            None,
+        )
+        .ok();
+
+        // create_directory, parents included.
+        let r = execute(
+            &Tool::CreateDirectory {
+                path: "x/y/z".into(),
+            },
+            Some(&dir),
+            None,
+        );
+        assert!(r.ok);
+        assert!(dir.join("x/y/z").is_dir());
+
+        // copy_file into a fresh nested target.
+        let r = execute(
+            &Tool::CopyFile {
+                from: "src/deep/a.txt".into(),
+                to: "x/y/b.txt".into(),
+            },
+            Some(&dir),
+            None,
+        );
+        assert!(r.ok, "{:?}", r.error);
+        assert!(dir.join("x/y/b.txt").exists());
+
+        // move_file overwrites the target and creates parents.
+        execute(
+            &Tool::WriteFile {
+                path: "victim.txt".into(),
+                content: "old".into(),
+            },
+            Some(&dir),
+            None,
+        )
+        .ok();
+        let r = execute(
+            &Tool::MoveFile {
+                from: "x/y/b.txt".into(),
+                to: "victim.txt".into(),
+            },
+            Some(&dir),
+            None,
+        );
+        assert!(r.ok, "{:?}", r.error);
+        assert!(!dir.join("x/y/b.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("victim.txt")).unwrap(),
+            "content"
+        );
+
+        // delete_file removes a file, refuses a directory, refuses escape.
+        let r = execute(
+            &Tool::DeleteFile {
+                path: "victim.txt".into(),
+            },
+            Some(&dir),
+            None,
+        );
+        assert!(r.ok);
+        assert!(!dir.join("victim.txt").exists());
+
+        let r = execute(&Tool::DeleteFile { path: "src".into() }, Some(&dir), None);
+        assert_eq!(r.error_code, Some(ErrorCode::InvalidArguments));
+
+        let r = execute(
+            &Tool::DeleteFile {
+                path: "../../outside.txt".into(),
+            },
+            Some(&dir),
+            None,
+        );
+        assert_eq!(r.error_code, Some(ErrorCode::PathEscapesRoot));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_many_files_batches_and_skips() {
+        let dir = temp_project("readmany");
+        for (name, content) in [
+            ("a.txt", "alpha\n"),
+            ("b.txt", "beta\n"),
+            (".env", "SECRET=1\n"),
+        ] {
+            execute(
+                &Tool::WriteFile {
+                    path: name.into(),
+                    content: content.into(),
+                },
+                Some(&dir),
+                None,
+            )
+            .ok();
+        }
+
+        let r = execute(
+            &Tool::ReadManyFiles {
+                paths: vec![
+                    "a.txt".into(),
+                    "b.txt".into(),
+                    ".env".into(),
+                    "missing.txt".into(),
+                ],
+            },
+            Some(&dir),
+            None,
+        );
+        assert!(r.ok, "{:?}", r.error);
+        let out = r.output.unwrap();
+        assert!(out.contains("── a.txt ──"), "{out}");
+        assert!(out.contains("alpha"));
+        assert!(out.contains("beta"));
+        assert!(out.contains("skipped: sensitive"), ".env must be skipped");
+        assert!(!out.contains("SECRET=1"));
+        assert!(out.contains("missing.txt"), "the miss is named, not silent");
+        assert!(out.contains("[2 of 4 files shown]"));
+
+        // Over the batch cap.
+        let r = execute(
+            &Tool::ReadManyFiles {
+                paths: (0..21).map(|i| format!("f{i}.txt")).collect(),
+            },
+            Some(&dir),
+            None,
+        );
+        assert_eq!(r.error_code, Some(ErrorCode::InvalidArguments));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_grants_matrix() {
+        let dir = temp_project("grants");
+        execute(
+            &Tool::WriteFile {
+                path: "src/a.txt".into(),
+                content: "x".into(),
+            },
+            Some(&dir),
+            None,
+        )
+        .ok();
+        execute(
+            &Tool::WriteFile {
+                path: "root.txt".into(),
+                content: "x".into(),
+            },
+            Some(&dir),
+            None,
+        )
+        .ok();
+        execute(
+            &Tool::WriteFile {
+                path: "src/creds.txt".into(),
+                content: "x".into(),
+            },
+            Some(&dir),
+            None,
+        )
+        .ok();
+        let bridge = Bridge::new();
+        let edit = |path: &str| Tool::EditFile {
+            path: path.into(),
+            old_string: "x".into(),
+            new_string: "y".into(),
+            replace_all: None,
+        };
+
+        // Without a grant, a gated edit asks.
+        let (r, id, how) = bridge.submit_with_audit(edit("src/a.txt"), "web", Some(&dir));
+        assert!(r.pending.is_some());
+        assert_eq!(how, "pending");
+        bridge.resolve(id.unwrap(), false, Some(&dir), None); // discard
+
+        // An editing grant under src/ auto-approves an edit there…
+        bridge.grant_add(GrantScope::Editing, Some("src".into()), "web");
+        let (r, id, how) = bridge.submit_with_audit(edit("src/a.txt"), "web", Some(&dir));
+        assert!(r.ok, "{:?}", r.error);
+        assert!(id.is_none());
+        assert_eq!(how, "grant:editing:src");
+
+        // …but not outside the prefix.
+        let (r, _, _) = bridge.submit_with_audit(edit("root.txt"), "web", Some(&dir));
+        assert!(r.pending.is_some(), "prefix must confine the grant");
+
+        // …not for the desktop source.
+        let (r, _, _) = bridge.submit_with_audit(edit("src/a.txt"), "desktop", Some(&dir));
+        assert!(r.pending.is_some(), "grants are source-scoped");
+
+        // …never for destructive tools.
+        let (r, _, _) = bridge.submit_with_audit(
+            Tool::DeleteFile {
+                path: "src/a.txt".into(),
+            },
+            "web",
+            Some(&dir),
+        );
+        assert!(r.pending.is_some(), "destructive never auto-approves");
+
+        // …and never on a sensitive path (secret laundering).
+        let (r, _, _) = bridge.submit_with_audit(
+            Tool::CopyFile {
+                from: "src/creds.txt".into(),
+                to: "src/notes.txt".into(),
+            },
+            "web",
+            Some(&dir),
+        );
+        assert!(r.pending.is_some(), "sensitive paths bypass grants");
+
+        // A `..`-laden path can't widen the prefix.
+        let (r, _, _) = bridge.submit_with_audit(edit("src/../root.txt"), "web", Some(&dir));
+        assert!(r.pending.is_some(), "a .. escape must not match the grant");
+
+        // Kill switch: revoke + pause.
+        bridge.set_paused(true);
+        assert!(bridge.grants.lock().unwrap().is_empty());
+        let (r, _, _) = bridge.submit_with_audit(edit("src/a.txt"), "web", Some(&dir));
+        assert_eq!(r.error_code, Some(ErrorCode::BridgePaused));
+        bridge.set_paused(false);
+        let (r, _, _) = bridge.submit_with_audit(edit("src/a.txt"), "web", Some(&dir));
+        assert!(r.pending.is_some(), "unpause must not resurrect grants");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn destructive_cards_show_absolute_paths() {
+        let dir = temp_project("cards");
+        let s = describe_for_approval(
+            &Tool::DeleteFile {
+                path: "src/deep/a.txt".into(),
+            },
+            Some(&dir),
+        );
+        let abs = dir.canonicalize().unwrap().join("src/deep/a.txt");
+        assert!(s.contains(abs.display().to_string().as_str()), "{s}");
+        assert!(s.starts_with("delete_file "), "{s}");
+
+        let s = describe_for_approval(
+            &Tool::MoveFile {
+                from: "a".into(),
+                to: "b".into(),
+            },
+            Some(&dir),
+        );
+        assert!(s.contains("→"), "{s}");
+
+        // Non-destructive tools keep the terse default; without a root the
+        // raw path is shown rather than guessed at.
+        assert_eq!(
+            describe_for_approval(
+                &Tool::WriteFile {
+                    path: "a".into(),
+                    content: "x".into()
+                },
+                Some(&dir)
+            ),
+            "write_file a (1 bytes)"
+        );
+        assert_eq!(
+            describe_for_approval(&Tool::DeleteFile { path: "a".into() }, None),
+            "delete_file a"
+        );
+
+        // What an approval card may offer as a grant.
+        let g = grantable(&Tool::EditFile {
+            path: "src/deep/a.ts".into(),
+            old_string: String::new(),
+            new_string: String::new(),
+            replace_all: None,
+        });
+        assert_eq!(
+            g,
+            Some((GrantScope::Editing, Some("src/deep".to_string())))
+        );
+        assert_eq!(
+            grantable(&Tool::RunCommand {
+                command: "npm test".into()
+            }),
+            Some((GrantScope::Commands, None))
+        );
+        assert_eq!(
+            grantable(&Tool::DeleteFile { path: "a".into() }),
+            None,
+            "destructive is never grantable"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// One row per variant. Kept exhaustive by the `match` below, so adding
     /// a `Tool` variant without a `SPECS` row fails to compile here.
     fn every_variant() -> Vec<Tool> {
@@ -1210,6 +2737,37 @@ mod tests {
             Tool::WriteFile {
                 path: "a".into(),
                 content: String::new(),
+            },
+            Tool::EditFile {
+                path: "a".into(),
+                old_string: "o".into(),
+                new_string: "n".into(),
+                replace_all: None,
+            },
+            Tool::MultiEdit {
+                path: "a".into(),
+                edits: vec![Edit {
+                    old_string: "o".into(),
+                    new_string: "n".into(),
+                    replace_all: None,
+                }],
+            },
+            Tool::ApplyPatch {
+                path: "a".into(),
+                patch: "@@ -1 +1 @@\n-o\n+n".into(),
+            },
+            Tool::DeleteFile { path: "a".into() },
+            Tool::MoveFile {
+                from: "a".into(),
+                to: "b".into(),
+            },
+            Tool::CopyFile {
+                from: "a".into(),
+                to: "b".into(),
+            },
+            Tool::CreateDirectory { path: "d".into() },
+            Tool::ReadManyFiles {
+                paths: vec!["a".into()],
             },
             Tool::RunCommand {
                 command: "true".into(),
@@ -1226,6 +2784,14 @@ mod tests {
             match t {
                 Tool::ReadFile { .. }
                 | Tool::WriteFile { .. }
+                | Tool::EditFile { .. }
+                | Tool::MultiEdit { .. }
+                | Tool::ApplyPatch { .. }
+                | Tool::DeleteFile { .. }
+                | Tool::MoveFile { .. }
+                | Tool::CopyFile { .. }
+                | Tool::CreateDirectory { .. }
+                | Tool::ReadManyFiles { .. }
                 | Tool::RunCommand { .. }
                 | Tool::ListDirectory { .. }
                 | Tool::GitStatus

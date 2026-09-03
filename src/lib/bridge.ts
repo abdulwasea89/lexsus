@@ -10,6 +10,7 @@ import type {
   FactsSnapshot,
   FileDiff,
   GitFileStatus,
+  GrantState,
   Handoff,
   SessionEvent,
   SessionSummary,
@@ -88,12 +89,31 @@ export function bridgeTool(tool: BridgeTool): Promise<ToolResult> {
   return invoke("bridge_tool", { tool });
 }
 
-export function bridgeApprove(id: number, allow: boolean): Promise<ToolResult> {
-  return invoke("bridge_approve", { id, allow });
+export function bridgeApprove(
+  id: number,
+  allow: boolean,
+  grant?: { scope: "editing" | "commands"; path_prefix: string | null },
+): Promise<ToolResult> {
+  return invoke("bridge_approve", { id, allow, grant: grant ?? null });
 }
 
 export function bridgeAudit(limit?: number): Promise<AuditEntry[]> {
   return invoke("bridge_audit", { limit });
+}
+
+// --- session grants (Phase 6 slice) ------------------------------------------
+
+export function bridgeGrantState(): Promise<GrantState> {
+  return invoke("bridge_grant_state");
+}
+
+export function bridgeGrantRevoke(id: number): Promise<boolean> {
+  return invoke("bridge_grant_revoke", { id });
+}
+
+/** The kill switch: revoke every grant and pause the bridge (or unpause). */
+export function bridgePause(paused: boolean): Promise<void> {
+  return invoke("bridge_pause", { paused });
 }
 
 export function pairGetCode(): Promise<string> {

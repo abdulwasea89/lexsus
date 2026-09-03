@@ -185,6 +185,65 @@ const checks = [
   ["json offset quoted digits", S.parseJsonBlock('{"tool":"read_file","path":"a","offset":"401"}')?.arguments.offset === 401],
   ["json offset garbage dropped", S.parseJsonBlock('{"tool":"read_file","path":"a","offset":"soon"}')?.arguments.offset === undefined],
   ["json read_file still needs a path", S.parseJsonBlock('{"tool":"read_file","offset":2}') === null],
+
+  // ── Phase 1: editing & file management ─────────────────────────────
+  ["specByName edit alias", S.specByName("edit")?.name === "edit_file"],
+  ["specByName mkdir alias", S.specByName("mkdir")?.name === "create_directory"],
+  ["specByName mv alias", S.specByName("mv")?.name === "move_file"],
+  ["delete_file line fires", S.parseToolLine('delete_file("old.txt")')?.arguments.path === "old.txt"],
+  ["unterminated delete_file still parses", S.parseToolLine('delete_file("old.txt')?.arguments.path === "old.txt"],
+  [
+    "move_file line fires with both paths",
+    S.parseToolLine('move_file("a.txt", "b.txt")')?.arguments.from === "a.txt" &&
+      S.parseToolLine('move_file("a.txt", "b.txt")')?.arguments.to === "b.txt",
+  ],
+  ["copy_file line fires", S.parseToolLine('copy_file("a.txt", "b.txt")')?.arguments.to === "b.txt"],
+  ["create_directory line fires", S.parseToolLine('create_directory("src/new")')?.arguments.path === "src/new"],
+  ["bare delete_file prose inert", S.parseToolLine("delete_file removes the file") === null],
+  ["bare move_file prose inert", S.parseToolLine("move_file: somewhere else") === null],
+  ["mid-sentence edit_file inert", S.parseToolLine('then edit_file("a.ts") applies it') === null],
+  [
+    "edit_file JSON parses",
+    S.parseJsonBlock('{"tool":"edit_file","path":"a.ts","old_string":"x","new_string":"y"}')?.name ===
+      "edit_file",
+  ],
+  [
+    "edit_file replace_all bool coerced",
+    S.parseJsonBlock('{"tool":"edit_file","path":"a","old_string":"x","new_string":"y","replace_all":"true"}')
+      ?.arguments.replace_all === true,
+  ],
+  [
+    "multi_edit edits array passes through",
+    S.parseJsonBlock('{"tool":"multi_edit","path":"a","edits":[{"old_string":"x","new_string":"y"}]}')
+      ?.arguments.edits?.length === 1,
+  ],
+  ["multi_edit without edits rejected", S.parseJsonBlock('{"tool":"multi_edit","path":"a"}') === null],
+  [
+    "read_many_files paths array parses",
+    S.parseJsonBlock('{"tool":"read_many_files","paths":["a.ts","b.ts"]}')?.arguments.paths?.length === 2,
+  ],
+  [
+    "read_many_files single string accepted",
+    S.parseJsonBlock('{"tool":"read_many_files","paths":"a.ts"}')?.arguments.paths?.[0] === "a.ts",
+  ],
+  ["read_many_files is autoInsert", S.isAutoInsert("read_many_files") === true],
+  ["edit_file is not autoInsert", S.isAutoInsert("edit_file") === false],
+  [
+    "destructive approval classes",
+    S.specByName("delete_file")?.approval === "destructive" &&
+      S.specByName("move_file")?.approval === "destructive",
+  ],
+  [
+    "apply_patch and edit_file are json-only (no lineRe)",
+    S.TOOLS.find((t) => t.name === "apply_patch")?.lineRe === undefined &&
+      S.TOOLS.find((t) => t.name === "edit_file")?.lineRe === undefined,
+  ],
+  // read_many_files emits bracketed pointers that name read_file; like the
+  // chunk footer, the leading "[" must keep them inert when echoed.
+  [
+    "read_many_files pointer line inert",
+    S.parseToolLine("[a.ts — batch budget spent; call read_file on it]") === null,
+  ],
 ];
 
 // The manifest and the handoff prompt are pasted into the chat, so the AI
@@ -195,6 +254,16 @@ const promptText = S.promptToolSection();
 for (const line of promptText.split("\n")) {
   const hit = S.parseToolLine(line.trim());
   if (hit) problems.push(`prompt line executes ${hit.name}: ${JSON.stringify(line)}`);
+}
+// Every gated tool (always/destructive) must be named in the "pause for the
+// user's approval" sentence — the destructive ones especially.
+const gatedLine = promptText
+  .split("\n")
+  .find((l) => l.includes("pause for the user's approval"));
+for (const t of S.TOOLS.filter((x) => x.approval === "always" || x.approval === "destructive")) {
+  if (!gatedLine?.includes(t.name)) {
+    problems.push(`prompt does not warn that ${t.name} pauses for approval`);
+  }
 }
 // The ```acb example must still teach the JSON form, so write_file is the one
 // expected hit; anything else means a block leaked in.
