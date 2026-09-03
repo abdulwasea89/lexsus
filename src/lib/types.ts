@@ -59,6 +59,22 @@ export interface BridgeTool {
   /** `offset` is the 1-based first line; omit it for the first chunk. */
   ReadFile?: { path: string; offset?: number; limit?: number };
   WriteFile?: { path: string; content: string };
+  EditFile?: {
+    path: string;
+    old_string: string;
+    new_string: string;
+    replace_all?: boolean;
+  };
+  MultiEdit?: {
+    path: string;
+    edits: { old_string: string; new_string: string; replace_all?: boolean }[];
+  };
+  ApplyPatch?: { path: string; patch: string };
+  DeleteFile?: { path: string };
+  MoveFile?: { from: string; to: string };
+  CopyFile?: { from: string; to: string };
+  CreateDirectory?: { path: string };
+  ReadManyFiles?: { paths: string[] };
   RunCommand?: { command: string };
   ListDirectory?: { path: string };
   GitStatus?: null;
@@ -75,6 +91,26 @@ export interface ApprovalRequested {
   id: number;
   summary: string;
   source: string;
+  /** Destructive calls may destroy work — the card renders them as danger. */
+  destructive: boolean;
+  /** When set, the card can offer a session grant covering this call. */
+  grantable?: {
+    scope: "editing" | "commands";
+    suggested_prefix: string | null;
+  };
+}
+
+export interface SessionGrant {
+  id: number;
+  scope: "editing" | "commands";
+  path_prefix: string | null;
+  source: string;
+}
+
+/** Grants + paused snapshot; also the `bridge://grants-changed` payload. */
+export interface GrantState {
+  grants: SessionGrant[];
+  paused: boolean;
 }
 
 export interface AuditEntry {

@@ -10,6 +10,7 @@ import {
   startWatch,
 } from "./lib/bridge";
 import ApprovalBanner from "./components/ApprovalBanner";
+import GrantsBar from "./components/GrantsBar";
 import BridgeView from "./views/BridgeView";
 import FailoverBanner from "./components/FailoverBanner";
 import GitView from "./views/GitView";
@@ -65,7 +66,7 @@ export default function App() {
   const [recents, setRecents] = useState<string[]>([]);
   const [view, setView] = useState<View>(loadView);
   const [projectOpen, setProjectOpen] = useState(false);
-  const { approvals, decide } = useApprovals();
+  const { approvals, grantState, decide } = useApprovals();
 
   useEffect(() => {
     localStorage.setItem(VIEW_KEY, view);
@@ -156,6 +157,7 @@ export default function App() {
 
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <ApprovalBanner approvals={approvals} onDecide={decide} />
+        <GrantsBar grantState={grantState} />
         <FailoverBanner />
 
         {error && (

@@ -171,8 +171,20 @@ fn tool_meta(tool: &crate::bridge::Tool) -> serde_json::Value {
     match tool {
         Tool::ReadFile { path, .. }
         | Tool::WriteFile { path, .. }
+        | Tool::EditFile { path, .. }
+        | Tool::MultiEdit { path, .. }
+        | Tool::ApplyPatch { path, .. }
+        | Tool::DeleteFile { path }
+        | Tool::CreateDirectory { path }
         | Tool::ListDirectory { path } => {
             meta["path"] = json!(path);
+        }
+        // The widget shows meta.path; the from → to detail carries the pair.
+        Tool::MoveFile { from, .. } | Tool::CopyFile { from, .. } => {
+            meta["path"] = json!(from);
+        }
+        Tool::ReadManyFiles { paths } => {
+            meta["path"] = json!(paths.first().cloned().unwrap_or_default());
         }
         Tool::RunCommand { command } => {
             meta["command"] = json!(command);
@@ -200,6 +212,16 @@ fn parse_tool_call_v2(
             .map(|s| s.to_string())
             .ok_or_else(|| format!("missing '{key}' argument"))
     };
+    // First present key wins — a model guesses argument names the way it
+    // guesses tool names (`from`/`src`, `old_string`/`old_str`/`find`).
+    let str_arg_any = |keys: &[&str]| -> Result<String, String> {
+        for k in keys {
+            if let Some(s) = args[*k].as_str() {
+                return Ok(s.to_string());
+            }
+        }
+        Err(format!("missing '{}' argument", keys[0]))
+    };
     // Line numbers arrive as a JSON number from our own parser, but a web AI
     // writing raw JSON often quotes them.
     let u32_arg = |key: &str| -> Option<u32> {
@@ -207,6 +229,61 @@ fn parse_tool_call_v2(
             .as_u64()
             .or_else(|| args[key].as_str().and_then(|s| s.trim().parse().ok()))
             .map(|n| n.min(u32::MAX as u64) as u32)
+    };
+    // Bools get the same quoting treatment as offsets.
+    let bool_arg = |key: &str| -> Option<bool> {
+        args[key].as_bool().or_else(|| {
+            args[key]
+                .as_str()
+                .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+                    "true" | "1" | "yes" => Some(true),
+                    "false" | "0" | "no" => Some(false),
+                    _ => None,
+                })
+        })
+    };
+    // A model will send one path where an array belongs.
+    let string_array_arg = |key: &str| -> Option<Vec<String>> {
+        match args.get(key)? {
+            serde_json::Value::Array(items) => items
+                .iter()
+                .map(|v| v.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>(),
+            serde_json::Value::String(s) => Some(vec![s.clone()]),
+            _ => None,
+        }
+    };
+    let edits_arg = |key: &str| -> Result<Vec<crate::bridge::Edit>, String> {
+        let items = match args.get(key) {
+            Some(serde_json::Value::Array(items)) => items.clone(),
+            _ => return Err(format!("missing '{key}' argument")),
+        };
+        let mut edits = Vec::with_capacity(items.len());
+        for item in &items {
+            let old_string = item["old_string"]
+                .as_str()
+                .ok_or("an edit is missing 'old_string'")?
+                .to_string();
+            let new_string = item["new_string"]
+                .as_str()
+                .ok_or("an edit is missing 'new_string'")?
+                .to_string();
+            let replace_all = item["replace_all"].as_bool().or_else(|| {
+                item["replace_all"]
+                    .as_str()
+                    .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+                        "true" | "1" | "yes" => Some(true),
+                        "false" | "0" | "no" => Some(false),
+                        _ => None,
+                    })
+            });
+            edits.push(crate::bridge::Edit {
+                old_string,
+                new_string,
+                replace_all,
+            });
+        }
+        Ok(edits)
     };
     match spec.name {
         "read_file" => Ok(crate::bridge::Tool::ReadFile {
@@ -217,6 +294,38 @@ fn parse_tool_call_v2(
         "write_file" => Ok(crate::bridge::Tool::WriteFile {
             path: str_arg("path")?,
             content: str_arg("content")?,
+        }),
+        "edit_file" => Ok(crate::bridge::Tool::EditFile {
+            path: str_arg_any(&["path", "file"])?,
+            old_string: str_arg_any(&["old_string", "old_str", "find"])?,
+            new_string: str_arg_any(&["new_string", "new_str", "replace", "replace_with"])?,
+            replace_all: bool_arg("replace_all"),
+        }),
+        "multi_edit" => Ok(crate::bridge::Tool::MultiEdit {
+            path: str_arg("path")?,
+            edits: edits_arg("edits")?,
+        }),
+        "apply_patch" => Ok(crate::bridge::Tool::ApplyPatch {
+            path: str_arg("path")?,
+            patch: str_arg("patch")?,
+        }),
+        "delete_file" => Ok(crate::bridge::Tool::DeleteFile {
+            path: str_arg("path")?,
+        }),
+        "move_file" => Ok(crate::bridge::Tool::MoveFile {
+            from: str_arg_any(&["from", "src", "source"])?,
+            to: str_arg_any(&["to", "dest", "destination"])?,
+        }),
+        "copy_file" => Ok(crate::bridge::Tool::CopyFile {
+            from: str_arg_any(&["from", "src", "source"])?,
+            to: str_arg_any(&["to", "dest", "destination"])?,
+        }),
+        "create_directory" => Ok(crate::bridge::Tool::CreateDirectory {
+            path: str_arg("path")?,
+        }),
+        "read_many_files" => Ok(crate::bridge::Tool::ReadManyFiles {
+            paths: string_array_arg("paths")
+                .ok_or_else(|| "missing 'paths' argument".to_string())?,
         }),
         "run_command" => Ok(crate::bridge::Tool::RunCommand {
             command: str_arg("command")?,

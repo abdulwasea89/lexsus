@@ -20,8 +20,9 @@
   // variant    legacy v1 serde variant (`{"ReadFile":{...}}`)
   // aliases    other names a web AI might emit; resolved for JSON calls
   // args       [{ name, hint?, required?, multiline?, type? }]
-  //            type: "int" is coerced with Number(); everything else stays a
-  //            string, because that is what the wire and the core expect.
+  //            type: "int" coerces with Number(); "bool" accepts true/false,
+  //            "true"/"false", 1/0. Arrays pass through untouched (the core
+  //            validates shape). Everything else must be a string.
   // approval   auto | sensitive-path | always | destructive
   // autoInsert read-only result → paste straight into the composer
   // timeoutMs  must match the Rust spec's timeout_ms
@@ -67,6 +68,131 @@
       lineRe: /write_file\s*[(:]\s*["']([^"']+)["']\s*[,)\s]\s*["']([\s\S]*?)["']\s*\)?/i,
       lineArgs: ["path", "content"],
       stage: { verb: "Writing", arg: "path", fallback: "file" },
+    },
+    {
+      name: "edit_file",
+      variant: "EditFile",
+      aliases: ["edit", "str_replace", "replace", "apply_edit"],
+      args: [
+        { name: "path", required: true },
+        { name: "old_string", required: true, multiline: true },
+        { name: "new_string", required: true, multiline: true },
+        { name: "replace_all", hint: "replace_all?", required: false, type: "bool" },
+      ],
+      summary: "Replace one exact string in a file",
+      group: "Editing",
+      approval: "sensitive-path",
+      autoInsert: false,
+      timeoutMs: 15000,
+      // No lineRe: old/new strings are routinely multiline, so this is
+      // taught as an acb JSON block (like write_file).
+      stage: { verb: "Editing", arg: "path", fallback: "file" },
+    },
+    {
+      name: "multi_edit",
+      variant: "MultiEdit",
+      aliases: ["multi_edit_file", "batch_edit", "edit_many"],
+      args: [
+        { name: "path", required: true },
+        { name: "edits", hint: "edits[]", required: true, multiline: true },
+      ],
+      summary: "Apply several exact-string edits to one file, atomically",
+      group: "Editing",
+      approval: "sensitive-path",
+      autoInsert: false,
+      timeoutMs: 20000,
+      stage: { verb: "Editing", arg: "path", fallback: "file" },
+    },
+    {
+      name: "apply_patch",
+      variant: "ApplyPatch",
+      aliases: ["patch", "unified_diff"],
+      args: [
+        { name: "path", required: true },
+        { name: "patch", required: true, multiline: true },
+      ],
+      summary: "Apply a single-file unified diff",
+      group: "Editing",
+      approval: "always",
+      autoInsert: false,
+      timeoutMs: 20000,
+      stage: { verb: "Patching", arg: "path", fallback: "file" },
+    },
+    {
+      name: "delete_file",
+      variant: "DeleteFile",
+      aliases: ["remove_file", "rm_file", "remove"],
+      args: [{ name: "path", required: true }],
+      summary: "Delete a file (not directories)",
+      group: "Editing",
+      approval: "destructive",
+      autoInsert: false,
+      timeoutMs: 10000,
+      lineRe: /delete_file\s*[(:]\s*["']([^"'\s)]+)["']?\s*\)?/i,
+      lineArgs: ["path"],
+      stage: { verb: "Deleting", arg: "path", fallback: "file" },
+    },
+    {
+      name: "move_file",
+      variant: "MoveFile",
+      aliases: ["rename_file", "rename", "mv"],
+      args: [
+        { name: "from", required: true },
+        { name: "to", required: true },
+      ],
+      summary: "Move or rename a file, overwriting the target",
+      group: "Editing",
+      approval: "destructive",
+      autoInsert: false,
+      timeoutMs: 10000,
+      lineRe: /move_file\s*[(:]\s*["']([^"']+)["']\s*,\s*["']([^"']+)["']\s*\)?/i,
+      lineArgs: ["from", "to"],
+      stage: { verb: "Moving", arg: "from", fallback: "file" },
+    },
+    {
+      name: "copy_file",
+      variant: "CopyFile",
+      aliases: ["cp_file", "duplicate_file", "cp"],
+      args: [
+        { name: "from", required: true },
+        { name: "to", required: true },
+      ],
+      summary: "Copy a file, overwriting the target",
+      group: "Editing",
+      approval: "always",
+      autoInsert: false,
+      timeoutMs: 10000,
+      lineRe: /copy_file\s*[(:]\s*["']([^"']+)["']\s*,\s*["']([^"']+)["']\s*\)?/i,
+      lineArgs: ["from", "to"],
+      stage: { verb: "Copying", arg: "from", fallback: "file" },
+    },
+    {
+      name: "create_directory",
+      variant: "CreateDirectory",
+      aliases: ["mkdir", "create_dir", "make_directory"],
+      args: [{ name: "path", required: true }],
+      summary: "Create a directory and its parents",
+      group: "Editing",
+      approval: "auto",
+      autoInsert: false,
+      timeoutMs: 10000,
+      lineRe: /create_directory\s*[(:]\s*["']([^"'\s)]+)["']?\s*\)?/i,
+      lineArgs: ["path"],
+      stage: { verb: "Creating", arg: "path", fallback: "directory" },
+    },
+    {
+      name: "read_many_files",
+      variant: "ReadManyFiles",
+      aliases: ["read_files", "read_many"],
+      args: [{ name: "paths", hint: "paths[]", required: true, multiline: true }],
+      summary: "Read several files in one call, first chunk of each",
+      group: "Reading",
+      approval: "auto",
+      autoInsert: true,
+      timeoutMs: 15000,
+      // No lineRe: an argument list is awkward in line syntax; acb JSON
+      // block only.
+      stage: { verb: "Reading", noun: "the files" },
     },
     {
       name: "run_command",
@@ -248,8 +374,12 @@
    * Coerce one captured argument to the type its spec declares. Returns
    * `undefined` when the value is unusable, so the required check can reject.
    *
-   * Only `int` is special: a chunk offset arrives as a JSON number from a
-   * model writing raw JSON and as a digit string from `parseToolLine`.
+   * `int` is coerced with Number() (a chunk offset arrives as a JSON number
+   * from a model writing raw JSON and as a digit string from
+   * `parseToolLine`). `bool` accepts true/false, "true"/"false" and 1/0 —
+   * models quote booleans exactly like they quote offsets. Arrays pass
+   * through untouched (`edits`, `paths`): the core validates their shape,
+   * and duplicating that validation here would drift.
    */
   function coerceArg(arg, raw) {
     if (raw == null) return undefined;
@@ -257,6 +387,17 @@
       const n = Number(raw);
       return Number.isFinite(n) ? Math.trunc(n) : undefined;
     }
+    if (arg && arg.type === "bool") {
+      if (typeof raw === "boolean") return raw;
+      if (typeof raw === "number") return raw === 1 ? true : raw === 0 ? false : undefined;
+      if (typeof raw === "string") {
+        const s = raw.trim().toLowerCase();
+        if (s === "true" || s === "1" || s === "yes") return true;
+        if (s === "false" || s === "0" || s === "no") return false;
+      }
+      return undefined;
+    }
+    if (Array.isArray(raw)) return raw;
     return typeof raw === "string" ? raw : undefined;
   }
 
@@ -441,9 +582,11 @@
    * Deliberately rendered as an aligned table, NOT in call syntax. This text
    * is pasted into the chat, so the AI reliably echoes it back — and when it
    * did, `parseToolLine` matched every row and executed the entire tool
-   * surface at once, approval cards and all. Six of the seven line regexes
-   * require a quote after `(` or `:`, so omitting parens and quotes here is
-   * what makes the manifest inert. Never format these rows as calls.
+   * surface at once, approval cards and all. Nine of the eleven line regexes
+   * require a quote after `(` or `:` (`run_command` is deliberately lenient,
+   * and the two paren-only tools require `()`), so omitting parens and
+   * quotes here is what makes the manifest inert. Never format these rows
+   * as calls.
    */
   function manifest() {
     const lines = [];

@@ -257,21 +257,20 @@ pub(crate) fn command_stream(app: &AppHandle) -> impl FnMut(bridge::CommandEvent
 pub(crate) fn tool_call(app: &AppHandle, tool: bridge::Tool, source: &str) -> bridge::ToolResult {
     let state = app.state::<AppState>();
     let root = state.project_root.lock().unwrap().clone();
-    let (result, approval_id) =
-        state
-            .bridge
-            .lock()
-            .unwrap()
-            .submit(tool.clone(), source, root.as_deref());
+    let (result, approval_id, authorized_by) = state
+        .bridge
+        .lock()
+        .unwrap()
+        .submit_with_audit(tool.clone(), source, root.as_deref());
     let Some(_id) = approval_id else {
-        // Auto-approved: audit and trace immediately.
+        // Auto-approved (or covered by a session grant): audit and trace.
         let _ = db::record_audit(
             &state.conn.lock().unwrap(),
             source,
             "tool",
             &serde_json::json!(tool).to_string(),
             true,
-            "auto",
+            &authorized_by,
             result.ok,
         );
         if result.ok {
@@ -279,10 +278,25 @@ pub(crate) fn tool_call(app: &AppHandle, tool: bridge::Tool, source: &str) -> br
         }
         return result;
     };
-    let summary = bridge::describe(&tool);
+    // What the card shows: destructive tools carry resolved absolute paths,
+    // and grantable tools can be offered a session grant checkbox.
+    let summary = bridge::describe_for_approval(&tool, root.as_deref());
+    let destructive = bridge::spec(&tool).approval == bridge::Approval::Destructive;
+    let grantable = (!destructive)
+        .then(|| bridge::grantable(&tool))
+        .flatten()
+        .map(|(scope, prefix)| {
+            serde_json::json!({"scope": scope.as_str(), "suggested_prefix": prefix})
+        });
     let _ = app.emit(
         "bridge://approval-requested",
-        serde_json::json!({"id": _id, "summary": summary, "source": source}),
+        serde_json::json!({
+            "id": _id,
+            "summary": summary,
+            "source": source,
+            "destructive": destructive,
+            "grantable": grantable,
+        }),
     );
     if source == "web" {
         // WS caller: wait for the user's decision (up to 5 minutes).
@@ -316,13 +330,40 @@ fn bridge_tool(
     Ok(tool_call(&app, tool, "desktop"))
 }
 
-/// Resolve a pending approval: execute (allow) or deny.
+/// A session grant offered from an approval card ("don't ask again for
+/// edits under src/ this session").
+#[derive(Debug, serde::Deserialize)]
+struct GrantRequest {
+    scope: bridge::GrantScope,
+    path_prefix: Option<String>,
+}
+
+/// The grants + paused snapshot the UI renders; also the payload of
+/// `bridge://grants-changed`.
+#[derive(Clone, serde::Serialize)]
+struct GrantState {
+    grants: Vec<bridge::SessionGrant>,
+    paused: bool,
+}
+
+fn grant_state(state: &AppState) -> GrantState {
+    let bridge = state.bridge.lock().unwrap();
+    let grants = bridge.grants.lock().unwrap().clone();
+    GrantState {
+        grants,
+        paused: bridge.is_paused(),
+    }
+}
+
+/// Resolve a pending approval: execute (allow) or deny. With `grant`, also
+/// creates a session grant covering this class of call.
 #[tauri::command]
 fn bridge_approve(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
     id: u64,
     allow: bool,
+    grant: Option<GrantRequest>,
 ) -> Result<bridge::ToolResult, String> {
     let root = state.project_root.lock().unwrap().clone();
     let mut stream = command_stream(&app);
@@ -344,11 +385,49 @@ fn bridge_approve(
     if allow && result.ok {
         record_tool_trace(&state, &app, &req.tool);
     }
+    if allow {
+        if let Some(g) = &grant {
+            state.bridge.lock().unwrap().grant_add(
+                g.scope,
+                g.path_prefix.clone(),
+                &req.source,
+            );
+            let _ = app.emit("bridge://grants-changed", grant_state(&state));
+        }
+    }
     let _ = app.emit(
         "bridge://approval-resolved",
         serde_json::json!({"id": id, "allowed": allow, "result": result}),
     );
     Ok(result)
+}
+
+/// Current session grants and the paused flag.
+#[tauri::command]
+fn bridge_grant_state(state: State<'_, AppState>) -> GrantState {
+    grant_state(&state)
+}
+
+/// Revoke one session grant by id.
+#[tauri::command]
+fn bridge_grant_revoke(state: State<'_, AppState>, app: tauri::AppHandle, id: u64) -> Result<bool, String> {
+    let revoked = state.bridge.lock().unwrap().grant_revoke(id);
+    let _ = app.emit("bridge://grants-changed", grant_state(&state));
+    Ok(revoked)
+}
+
+/// The kill switch: revoke every grant and pause the bridge (or unpause).
+/// Pausing revokes too — a kill switch that left standing auto-approvals
+/// armed would not be a kill switch.
+#[tauri::command]
+fn bridge_pause(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    paused: bool,
+) -> Result<(), String> {
+    state.bridge.lock().unwrap().set_paused(paused);
+    let _ = app.emit("bridge://grants-changed", grant_state(&state));
+    Ok(())
 }
 
 /// Recent audit trail (approval + auto-executed tool calls).
@@ -931,6 +1010,9 @@ pub fn run() {
             bridge_tool,
             bridge_approve,
             bridge_audit,
+            bridge_grant_state,
+            bridge_grant_revoke,
+            bridge_pause,
             cancel_request,
             processes_list,
             pair_get_code,
