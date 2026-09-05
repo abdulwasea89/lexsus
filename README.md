@@ -1,7 +1,7 @@
 <div align="center">
 
 # Lexsus — AI Continuity Bridge
-
+ 
 **Your AI can change. Your work doesn't.**
 
 [![Stars](https://img.shields.io/github/stars/abdulwasea89/lexsus?style=flat-square)](https://github.com/abdulwasea89/lexsus/stargazers)

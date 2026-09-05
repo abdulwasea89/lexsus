@@ -4,7 +4,7 @@
 # Python FastAPI service is containerized here.
 services:
   compression-service:
-    build:
+    build: 
       context: .
       dockerfile: Dockerfile
     container_name: aicb-compression-service

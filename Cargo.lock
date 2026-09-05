@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "lexsus"
+name = "lexsus" 
 version = "0.1.0"
