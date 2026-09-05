@@ -54,81 +54,87 @@ export default function BridgeView() {
             <ChevronDownIcon className="size-4" />
           </CollapsibleTrigger>
           <CollapsibleContent>
-            <div className="flex flex-col gap-3 rounded-lg border border-border/60 bg-surface-2/50 p-3">
-              <div className="flex items-end gap-2">
-                <Label className="shrink-0 text-[11px] text-muted-foreground">
+            <div className="flex min-h-0 flex-col gap-3 rounded-lg border border-border/60 bg-surface-2/50 p-3">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:gap-3">
+                <Label className="shrink-0 text-[11px] text-muted-foreground sm:w-28 sm:pb-2">
                   read_file
                 </Label>
-                <Input
-                  value={readPath}
-                  onChange={(e) => setReadPath(e.currentTarget.value)}
-                  className="font-mono text-xs"
-                />
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="shrink-0"
-                  onClick={() =>
-                    void sandboxRun({ ReadFile: { path: readPath } })
-                  }
-                >
-                  Read
-                </Button>
+                <div className="flex min-w-0 flex-1 items-end gap-2">
+                  <Input
+                    value={readPath}
+                    onChange={(e) => setReadPath(e.currentTarget.value)}
+                    className="min-w-0 flex-1 font-mono text-xs"
+                  />
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="shrink-0"
+                    onClick={() =>
+                      void sandboxRun({ ReadFile: { path: readPath } })
+                    }
+                  >
+                    Read
+                  </Button>
+                </div>
               </div>
-              <div className="flex items-end gap-2">
-                <Label className="shrink-0 text-[11px] text-muted-foreground">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:gap-3">
+                <Label className="shrink-0 text-[11px] text-muted-foreground sm:w-28 sm:pb-2">
                   write_file
                 </Label>
-                <Input
-                  value={writePath}
-                  placeholder="path"
-                  onChange={(e) => setWritePath(e.currentTarget.value)}
-                  className="font-mono text-xs"
-                />
-                <Input
-                  value={writeContent}
-                  placeholder="content"
-                  onChange={(e) => setWriteContent(e.currentTarget.value)}
-                  className="min-w-0 flex-1 font-mono text-xs"
-                />
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="shrink-0"
-                  onClick={() =>
-                    void sandboxRun({
-                      WriteFile: { path: writePath, content: writeContent },
-                    })
-                  }
-                >
-                  Write
-                </Button>
+                <div className="flex min-w-0 flex-1 flex-col gap-2 sm:flex-row sm:items-end">
+                  <Input
+                    value={writePath}
+                    placeholder="path"
+                    onChange={(e) => setWritePath(e.currentTarget.value)}
+                    className="min-w-0 flex-1 font-mono text-xs"
+                  />
+                  <Input
+                    value={writeContent}
+                    placeholder="content"
+                    onChange={(e) => setWriteContent(e.currentTarget.value)}
+                    className="min-w-0 flex-[2] font-mono text-xs"
+                  />
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="shrink-0"
+                    onClick={() =>
+                      void sandboxRun({
+                        WriteFile: { path: writePath, content: writeContent },
+                      })
+                    }
+                  >
+                    Write
+                  </Button>
+                </div>
               </div>
-              <div className="flex items-end gap-2">
-                <Label className="shrink-0 text-[11px] text-muted-foreground">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:gap-3">
+                <Label className="shrink-0 text-[11px] text-muted-foreground sm:w-28 sm:pb-2">
                   run_command
                 </Label>
-                <Input
-                  value={command}
-                  onChange={(e) => setCommand(e.currentTarget.value)}
-                  className="font-mono text-xs"
-                />
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="shrink-0"
-                  onClick={() =>
-                    void sandboxRun({ RunCommand: { command } })
-                  }
-                >
-                  Run
-                </Button>
+                <div className="flex min-w-0 flex-1 items-end gap-2">
+                  <Input
+                    value={command}
+                    onChange={(e) => setCommand(e.currentTarget.value)}
+                    className="min-w-0 flex-1 font-mono text-xs"
+                  />
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="shrink-0"
+                    onClick={() =>
+                      void sandboxRun({ RunCommand: { command } })
+                    }
+                  >
+                    Run
+                  </Button>
+                </div>
               </div>
               {sandbox && (
-                <ScrollArea className="h-28 rounded-md border border-border/60 bg-background/60 p-3">
+                <ScrollArea className="h-28 min-h-0 rounded-md border border-border/60 bg-background/60 p-3">
                   <pre
                     className={cn(
-                      "font-mono text-[11px] leading-relaxed",
+                      "whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed",
                       sandbox.ok ? "text-foreground" : "text-danger",
                     )}
                   >
@@ -148,7 +154,7 @@ export default function BridgeView() {
             <ChevronDownIcon className="size-4" />
           </CollapsibleTrigger>
           <CollapsibleContent>
-            <ScrollArea className="h-40 rounded-lg border border-border/60 bg-surface-2/50 p-3">
+            <ScrollArea className="h-40 min-h-0 rounded-lg border border-border/60 bg-surface-2/50 p-3">
               {audit.length === 0 ? (
                 <p className="text-xs text-muted-foreground">
                   No tool calls recorded yet.
@@ -166,7 +172,7 @@ export default function BridgeView() {
                       <span className="shrink-0 text-muted-foreground">
                         [{a.ts}]
                       </span>
-                      <span className="min-w-0 flex-1 truncate">
+                      <span className="min-w-0 flex-1 whitespace-pre-wrap break-words">
                         {a.agent} · {a.tool} · {a.args} ·{" "}
                         {a.allowed
                           ? `allowed (${a.approved_by})`
