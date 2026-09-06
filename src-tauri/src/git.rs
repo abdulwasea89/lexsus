@@ -235,9 +235,40 @@ pub fn branches(repo: &git2::Repository) -> Result<Vec<BranchInfo>, git2::Error>
 pub fn checkout(repo: &git2::Repository, name: &str) -> Result<(), git2::Error> {
     let refname = format!("refs/heads/{name}");
     let commit = repo.find_commit(repo.refname_to_id(&refname)?)?;
-    let mut co = git2::build::CheckoutBuilder::new();
-    co.force();
     let tree = commit.tree()?;
+
+    // Roadmap invariant: git_checkout must refuse on a dirty tree. A force
+    // checkout would silently overwrite staged/unstaged tracked changes, so
+    // refuse while any exist. (Untracked files alone don't block — the safe
+    // checkout below still refuses if switching would clobber one.)
+    let mut status_opts = git2::StatusOptions::new();
+    status_opts.include_untracked(false).include_ignored(false);
+    let dirty: Vec<String> = repo
+        .statuses(Some(&mut status_opts))?
+        .iter()
+        .filter_map(|e| e.path().map(|p| p.to_string()))
+        .collect();
+    if !dirty.is_empty() {
+        let mut msg = format!(
+            "cannot switch to '{name}': {} uncommitted change(s) — commit or stash before switching ({})",
+            dirty.len(),
+            dirty[0]
+        );
+        for path in dirty.iter().skip(1).take(2) {
+            msg.push_str(", ");
+            msg.push_str(path);
+        }
+        if dirty.len() > 3 {
+            msg.push_str(&format!(", and {} more", dirty.len() - 3));
+        }
+        msg.push(')');
+        return Err(git2::Error::from_str(&msg));
+    }
+
+    // Safe checkout: the tree is clean so nothing tracked can be lost, and
+    // without force() libgit2 refuses to overwrite an untracked file that a
+    // target branch happens to contain.
+    let mut co = git2::build::CheckoutBuilder::new();
     repo.checkout_tree(tree.as_object(), Some(&mut co))?;
     repo.set_head(&refname)?;
     Ok(())
