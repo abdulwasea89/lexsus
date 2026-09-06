@@ -785,6 +785,22 @@ impl Bridge {
         Some((result, req))
     }
 
+    /// Remove a still-pending approval without executing it — used when the
+    /// waiting caller (the paired web AI) gave up before the user decided
+    /// (approval timed out). Drops the request's channel too, and returns the
+    /// removed request so the caller can audit it and dismiss the card. A
+    /// later [`resolve`](Self::resolve) on the same id finds nothing and so
+    /// executes nothing — an Allow on the now-stale card can no longer run the
+    /// tool.
+    pub fn expire(&self, id: u64) -> Option<ApprovalRequest> {
+        let mut pending = self.pending.lock().unwrap();
+        let idx = pending.iter().position(|p| p.id == id)?;
+        let req = pending.remove(idx);
+        drop(pending);
+        self.channels.lock().unwrap().remove(&id);
+        Some(req)
+    }
+
     /// Add a session grant; returns its id.
     pub fn grant_add(&self, scope: GrantScope, path_prefix: Option<String>, source: &str) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;

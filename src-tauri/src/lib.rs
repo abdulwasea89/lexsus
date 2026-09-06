@@ -262,7 +262,7 @@ pub(crate) fn tool_call(app: &AppHandle, tool: bridge::Tool, source: &str) -> br
         .lock()
         .unwrap()
         .submit_with_audit(tool.clone(), source, root.as_deref());
-    let Some(_id) = approval_id else {
+    let Some(id) = approval_id else {
         // Auto-approved (or covered by a session grant): audit and trace.
         let _ = db::record_audit(
             &state.conn.lock().unwrap(),
@@ -291,7 +291,7 @@ pub(crate) fn tool_call(app: &AppHandle, tool: bridge::Tool, source: &str) -> br
     let _ = app.emit(
         "bridge://approval-requested",
         serde_json::json!({
-            "id": _id,
+            "id": id,
             "summary": summary,
             "source": source,
             "destructive": destructive,
@@ -308,11 +308,38 @@ pub(crate) fn tool_call(app: &AppHandle, tool: bridge::Tool, source: &str) -> br
             .channels
             .lock()
             .unwrap()
-            .insert(_id, tx);
+            .insert(id, tx);
 
         match rx.recv_timeout(Duration::from_secs(300)) {
             Ok(r) => r,
-            Err(_) => bridge::ToolResult::err("approval timed out"),
+            Err(_) => {
+                // The web caller waited 5 minutes and was already told the
+                // call failed, so this approval must not stay executable.
+                // Dequeue it (and drop its channel): an Allow on the now-stale
+                // card then resolves nothing instead of silently running the
+                // write long after — with nobody watching.
+                let expired = state.bridge.lock().unwrap().expire(id);
+                if let Some(req) = expired {
+                    let _ = db::record_audit(
+                        &state.conn.lock().unwrap(),
+                        &req.source,
+                        "tool",
+                        &serde_json::json!(req.tool).to_string(),
+                        false,
+                        "timeout",
+                        false,
+                    );
+                    let _ = app.emit(
+                        "bridge://approval-resolved",
+                        serde_json::json!({
+                            "id": id,
+                            "allowed": false,
+                            "result": bridge::ToolResult::err("approval timed out"),
+                        }),
+                    );
+                }
+                bridge::ToolResult::err("approval timed out")
+            }
         }
     } else {
         result
