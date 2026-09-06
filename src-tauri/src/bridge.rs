@@ -496,7 +496,7 @@ pub enum CommandEvent {
 }
 
 /// Structured error code for tool call failures.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {
     FileNotFound,
@@ -2171,7 +2171,7 @@ mod tests {
             Some(&dir),
             None,
         )
-        .ok();
+        ;
 
         let r = execute(
             &Tool::EditFile {
@@ -2217,7 +2217,7 @@ mod tests {
             Some(&dir),
             None,
         )
-        .ok();
+        ;
         let r = execute(
             &Tool::EditFile {
                 path: "b.txt".into(),
@@ -2271,7 +2271,7 @@ mod tests {
             Some(&dir),
             None,
         )
-        .ok();
+        ;
 
         // The second edit targets a string that does not exist — the batch
         // fails and the file must be exactly as it was (not half-edited).
@@ -2365,7 +2365,7 @@ mod tests {
             Some(&dir),
             None,
         )
-        .ok();
+        ;
 
         // A clean patch with headers and context.
         let patch =
@@ -2450,7 +2450,7 @@ mod tests {
             Some(&dir),
             None,
         )
-        .ok();
+        ;
 
         // create_directory, parents included.
         let r = execute(
@@ -2484,7 +2484,7 @@ mod tests {
             Some(&dir),
             None,
         )
-        .ok();
+        ;
         let r = execute(
             &Tool::MoveFile {
                 from: "x/y/b.txt".into(),
@@ -2542,7 +2542,7 @@ mod tests {
                 Some(&dir),
                 None,
             )
-            .ok();
+            ;
         }
 
         let r = execute(
@@ -2583,60 +2583,63 @@ mod tests {
     #[test]
     fn session_grants_matrix() {
         let dir = temp_project("grants");
-        execute(
-            &Tool::WriteFile {
-                path: "src/a.txt".into(),
-                content: "x".into(),
-            },
-            Some(&dir),
-            None,
-        )
-        .ok();
-        execute(
-            &Tool::WriteFile {
-                path: "root.txt".into(),
-                content: "x".into(),
-            },
-            Some(&dir),
-            None,
-        )
-        .ok();
-        execute(
-            &Tool::WriteFile {
-                path: "src/creds.txt".into(),
-                content: "x".into(),
-            },
-            Some(&dir),
-            None,
-        )
-        .ok();
+        // Seeds — the sensitive-copy case needs a real source file to exist.
+        for (path, content) in [
+            ("src/a.txt", "x"),
+            ("root.txt", "x"),
+            ("src/secrets.txt", "x"),
+        ] {
+            execute(
+                &Tool::WriteFile {
+                    path: path.into(),
+                    content: content.into(),
+                },
+                Some(&dir),
+                None,
+            );
+        }
         let bridge = Bridge::new();
-        let edit = |path: &str| Tool::EditFile {
+        // A non-sensitive edit is SensitivePathOnly: it runs without asking.
+        let (r, _, how) = bridge.submit_with_audit(
+            Tool::EditFile {
+                path: "src/a.txt".into(),
+                old_string: "x".into(),
+                new_string: "y".into(),
+                replace_all: None,
+            },
+            "web",
+            Some(&dir),
+        );
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(how, "auto", "edits only ask on sensitive paths");
+
+        // Grants exercise the Always-class tools in the Editing group
+        // (write_file / apply_patch / copy_file) — the ones that ask on
+        // every call and can legally be covered.
+        let write = |path: &str| Tool::WriteFile {
             path: path.into(),
-            old_string: "x".into(),
-            new_string: "y".into(),
-            replace_all: None,
+            content: "y".into(),
         };
 
-        // Without a grant, a gated edit asks.
-        let (r, id, how) = bridge.submit_with_audit(edit("src/a.txt"), "web", Some(&dir));
+        // Without a grant, an Always-gated write asks.
+        let (r, id, how) = bridge.submit_with_audit(write("src/b.txt"), "web", Some(&dir));
         assert!(r.pending.is_some());
         assert_eq!(how, "pending");
         bridge.resolve(id.unwrap(), false, Some(&dir), None); // discard
 
-        // An editing grant under src/ auto-approves an edit there…
+        // An editing grant under src/ auto-approves an Always write there…
         bridge.grant_add(GrantScope::Editing, Some("src".into()), "web");
-        let (r, id, how) = bridge.submit_with_audit(edit("src/a.txt"), "web", Some(&dir));
+        let (r, id, how) = bridge.submit_with_audit(write("src/c.txt"), "web", Some(&dir));
         assert!(r.ok, "{:?}", r.error);
         assert!(id.is_none());
         assert_eq!(how, "grant:editing:src");
 
         // …but not outside the prefix.
-        let (r, _, _) = bridge.submit_with_audit(edit("root.txt"), "web", Some(&dir));
+        let (r, _, _) = bridge.submit_with_audit(write("root.txt"), "web", Some(&dir));
         assert!(r.pending.is_some(), "prefix must confine the grant");
 
         // …not for the desktop source.
-        let (r, _, _) = bridge.submit_with_audit(edit("src/a.txt"), "desktop", Some(&dir));
+        let (r, _, _) = bridge.submit_with_audit(write("src/d.txt"), "desktop", Some(&dir));
         assert!(r.pending.is_some(), "grants are source-scoped");
 
         // …never for destructive tools.
@@ -2652,7 +2655,7 @@ mod tests {
         // …and never on a sensitive path (secret laundering).
         let (r, _, _) = bridge.submit_with_audit(
             Tool::CopyFile {
-                from: "src/creds.txt".into(),
+                from: "src/secrets.txt".into(),
                 to: "src/notes.txt".into(),
             },
             "web",
@@ -2661,16 +2664,16 @@ mod tests {
         assert!(r.pending.is_some(), "sensitive paths bypass grants");
 
         // A `..`-laden path can't widen the prefix.
-        let (r, _, _) = bridge.submit_with_audit(edit("src/../root.txt"), "web", Some(&dir));
+        let (r, _, _) = bridge.submit_with_audit(write("src/../root.txt"), "web", Some(&dir));
         assert!(r.pending.is_some(), "a .. escape must not match the grant");
 
         // Kill switch: revoke + pause.
         bridge.set_paused(true);
         assert!(bridge.grants.lock().unwrap().is_empty());
-        let (r, _, _) = bridge.submit_with_audit(edit("src/a.txt"), "web", Some(&dir));
+        let (r, _, _) = bridge.submit_with_audit(write("src/e.txt"), "web", Some(&dir));
         assert_eq!(r.error_code, Some(ErrorCode::BridgePaused));
         bridge.set_paused(false);
-        let (r, _, _) = bridge.submit_with_audit(edit("src/a.txt"), "web", Some(&dir));
+        let (r, _, _) = bridge.submit_with_audit(write("src/f.txt"), "web", Some(&dir));
         assert!(r.pending.is_some(), "unpause must not resurrect grants");
 
         let _ = std::fs::remove_dir_all(&dir);
