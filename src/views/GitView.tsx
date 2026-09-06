@@ -64,12 +64,12 @@ export default function GitView() {
   const [result, setResult] = useState("");
   const [error, setError] = useState("");
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (opts?: { clearError?: boolean }) => {
     try {
       setDiffs(await gitDiff());
       setBranches(await gitBranches());
       setHistory(await gitLog(30));
-      setError("");
+      if (opts?.clearError !== false) setError("");
     } catch (e) {
       setError(String(e));
     }
@@ -79,22 +79,27 @@ export default function GitView() {
     void refresh();
   }, [refresh]);
 
-  async function stage(path: string) {
-    await gitStage(path).catch((e) => setError(String(e)));
-    await refresh();
+  /** Run a git mutation, then refresh. On failure the error is surfaced
+   *  (banner + toast) and the follow-up refresh must NOT clear it. */
+  async function runGit(op: () => Promise<unknown>) {
+    let failed: unknown = null;
+    try {
+      await op();
+    } catch (e) {
+      failed = e;
+      setError(String(e));
+      toast.add({
+        title: "Git operation failed",
+        description: String(e),
+        type: "error",
+      });
+    }
+    await refresh(failed ? { clearError: false } : undefined);
   }
-  async function unstage(path: string) {
-    await gitUnstage(path).catch((e) => setError(String(e)));
-    await refresh();
-  }
-  async function stageAll() {
-    await gitStageAll().catch((e) => setError(String(e)));
-    await refresh();
-  }
-  async function checkout(name: string) {
-    await gitCheckout(name).catch((e) => setError(String(e)));
-    await refresh();
-  }
+  const stage = (path: string) => runGit(() => gitStage(path));
+  const unstage = (path: string) => runGit(() => gitUnstage(path));
+  const stageAll = () => runGit(() => gitStageAll());
+  const checkout = (name: string) => runGit(() => gitCheckout(name));
   async function commit() {
     try {
       const oid = await gitCommit(message);
