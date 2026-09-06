@@ -3,7 +3,11 @@
 > The tool surface the web AI sees, phase by phase: what is **built**, what is
 > **planned**, and the invariants every new tool must uphold.
 >
-> Status date: 2026-09-03. **15 of 44 built.**
+> Status date: 2026-09-06. **15 of 44 built.**
+>
+> **Completed:** Phase 0 ✅, Phase 1 ✅. **Not started:** Phases 2, 3, 5, 7.
+> **Partial:** Phase 4 (0 tools shipped, 6 of 9 have built backing) and
+> Phase 6 (session-grants slice landed; persisted policy/config/expiry remain).
 
 This is the capability roadmap for the coding-agent bridge. It is deliberately
 separate from `full-plan.md` §13, whose "Phase 0"–"Phase 7" describe the
@@ -44,17 +48,17 @@ in-memory only — they die with the app.
 
 ## Phases at a glance
 
-| Phase | Theme | Built | Added | Total |
-|---|---|---|---|---|
-| — | original MVP tools | 5 | — | 5 |
-| 0 | registry + progressive disclosure | 5 | 2 | 7 |
-| 1 | files & editing | 8 (+1 early) | 8 | 15 |
-| 2 | search | 0 | 2 | 17 |
-| 3 | git | 0 | 10 | 27 |
-| 4 | project memory | 0 | 9 | 36 |
-| 5 | background commands | 0 | 3 | 39 |
-| 6 | approval policy engine | — | 0 | 39 |
-| 7 | web & long tail | 0 | 5 | 44 |
+| Phase | Theme | Built | Added | Total | Status |
+|---|---|---|---|---|---|---|
+| — | original MVP tools | 5 | — | 5 | ✅ done |
+| 0 | registry + progressive disclosure | 5 | 2 | 7 | ✅ done |
+| 1 | files & editing | 8 (+1 early) | 8 | 15 | ✅ done |
+| 2 | search | 0 | 2 | 17 | ⏳ not started |
+| 3 | git | 0 | 10 | 27 | ⏳ not started |
+| 4 | project memory | 0 | 9 | 36 | 🔶 partial |
+| 5 | background commands | 0 | 3 | 39 | ⏳ not started |
+| 6 | approval policy engine | — | 0 | 39 | 🔶 partial |
+| 7 | web & long tail | 0 | 5 | 44 | ⏳ not started |
 
 Of the 37 not yet built, **~18 are wiring over code that already exists** — all
 of Phase 3 (git.rs has every function), 6 of 9 in Phase 4 (the SQLite tables and
@@ -121,7 +125,7 @@ persisted grant policies and per-tool configuration.
 
 ---
 
-## Phase 2 — Search (2 tools)
+## Phase 2 — Search (2 tools) ⏳ NOT STARTED
 
 **Goal:** the AI can find things instead of guessing filenames.
 
@@ -141,7 +145,7 @@ got.
 
 ---
 
-## Phase 3 — Git (10 tools) — the cheapest phase
+## Phase 3 — Git (10 tools) — the cheapest phase ⏳ NOT STARTED
 
 **Goal:** expose the git workflow the app already has to the AI using it.
 Almost pure wiring: `git.rs` has every function, and most already have Tauri
@@ -163,7 +167,7 @@ commands in `lib.rs` for the UI panel. Only `git_create_branch` and
 
 ---
 
-## Phase 4 — Project Memory (9 tools)
+## Phase 4 — Project Memory (9 tools) 🔶 PARTIAL
 
 **Goal:** this tier is the product thesis, not just capability — the AI that
 inherits the work also inherits the *why*.
@@ -183,7 +187,7 @@ Feeds `build_handoff_impl()`: todos become part of the next handoff prompt.
 
 ---
 
-## Phase 5 — Background Commands (3 tools)
+## Phase 5 — Background Commands (3 tools) ⏳ NOT STARTED
 
 **Goal:** long-running commands that don't hold the tool channel open.
 
@@ -198,7 +202,7 @@ can stream into the terminal.
 
 ---
 
-## Phase 6 — Approval Policy Engine (0 tools)
+## Phase 6 — Approval Policy Engine (0 tools) 🔶 PARTIAL
 
 No new tools — this is what contains the ~15 gated ones from Phases 1, 3 and 5:
 
@@ -214,7 +218,7 @@ configuration, and grant expiry.
 
 ---
 
-## Phase 7 — Web & Long Tail (5 tools)
+## Phase 7 — Web & Long Tail (5 tools) ⏳ NOT STARTED
 
 | Tool | Notes |
 |---|---|
