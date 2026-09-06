@@ -74,15 +74,15 @@ function handleTimeout(id) {
       socket.send(JSON.stringify(v2Msg));
     }
   } else {
-    // Final timeout - notify content script
-    forwardToTabs(
+    // Final timeout - notify the content script that sent the request.
+    void deliverResult(
       {
         type: "tool_result",
         id,
         status: "timeout",
         error: { code: "TIMEOUT", message: "Request timed out after retries" },
       },
-      null,
+      req.tabId,
     );
     recordOutcome(id, "timeout");
     pendingRequests.delete(id);
@@ -229,6 +229,39 @@ function forwardToTabs(msg, preferredHost) {
   });
 }
 
+/** The tab that sent the request with this id, if the service worker knows it. */
+function originatingTabId(id) {
+  return pendingRequests.get(id)?.tabId;
+}
+
+/**
+ * Deliver a request-scoped message (a tool_result) to the chat that sent the
+ * originating tool_call — never a broadcast. Every request already records its
+ * `tabId` in `trackRequest`; routing by it keeps project A's output out of
+ * project B's open chat when several chats are open at once. When the origin
+ * is unknown (service worker restarted mid-request) or its tab has closed,
+ * deliver only when exactly one chat is open — anything else would
+ * misattribute the result into a chat that never asked for it.
+ */
+async function deliverResult(msg, tabId) {
+  if (tabId != null) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab?.id != null && (await deliver(tab, msg))) return;
+    } catch {
+      // Origin tab closed or unreachable — fall through to the heuristic.
+    }
+  }
+  const tabs = await chrome.tabs.query({ url: Object.values(TARGET_HOSTS) });
+  if (tabs?.length === 1) {
+    await deliver(tabs[0], msg);
+  } else if (tabs?.length > 1) {
+    console.warn(
+      `[ACB] ${msg.type} ${msg.id}: origin tab gone/unknown with ${tabs.length} chats open — result dropped`,
+    );
+  }
+}
+
 function hostForTarget(target) {
   return TARGET_HOSTS[target] || TARGET_HOSTS.chatgpt;
 }
@@ -319,12 +352,15 @@ function connect() {
 
       // ── Protocol v2: tool_result ────────────────────────────
       case "tool_result": {
-        // Track the request if we have it
+        // Capture the originating tab before the request is untracked, then
+        // deliver only to that chat — a broadcast would drop project A's
+        // output into project B's open chat.
+        const tabId = msg.id ? originatingTabId(msg.id) : undefined;
         if (msg.id && pendingRequests.has(msg.id)) {
           untrackRequest(msg.id);
         }
         recordOutcome(msg.id, msg.status, msg.result?.output ?? msg.error?.message);
-        forwardToTabs(msg, null);
+        void deliverResult(msg, tabId);
         break;
       }
 
@@ -341,10 +377,11 @@ function connect() {
             : null,
           meta: null,
         };
+        const tabId = msg.id ? originatingTabId(String(msg.id)) : undefined;
         if (msg.id && pendingRequests.has(msg.id)) {
           untrackRequest(String(msg.id));
         }
-        forwardToTabs(v2Msg, null);
+        void deliverResult(v2Msg, tabId);
         break;
       }
 
