@@ -1,6 +1,6 @@
 <div align="center">
 
-# Lexsus — AI Continuity Bridge
+# Lexsus
  
 **Your AI can change. Your work doesn't.**
 
