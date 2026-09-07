@@ -208,32 +208,55 @@ pub(crate) fn kill_tree(pid: u32, grace: Duration) {
     }
     // PTY children are session leaders, so the process group id equals the
     // child pid and `kill(-pid, …)` reaches the whole tree (the shell *and*
-    // the pipeline it spawned). If the group signal fails (ESRCH), fall back
-    // to the single pid.
-    unsafe {
-        if libc::kill(-(pid as i32), libc::SIGTERM) != 0 {
+    // the pipeline it spawned). If the group signal fails (ESRCH — the pid
+    // is not a session leader), fall back to the single pid.
+    let whole_group = unsafe { libc::kill(-(pid as i32), libc::SIGTERM) == 0 };
+    if !whole_group {
+        unsafe {
             libc::kill(pid as i32, libc::SIGTERM);
         }
     }
+
+    // Wait for the *whole group* to go down, not just the leader. A shell can
+    // exit on SIGTERM while a child it spawned ignores it; once the leader is
+    // gone a per-pid probe reads "dead" and would return early without
+    // escalating, orphaning that child. `signal(0)` against the group fails
+    // only once no member remains.
     let deadline = Instant::now() + grace;
     while Instant::now() < deadline {
-        if !alive(pid) {
+        if group_gone(pid, whole_group) {
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    if alive(pid) {
-        unsafe {
-            if libc::kill(-(pid as i32), libc::SIGKILL) != 0 {
-                libc::kill(pid as i32, libc::SIGKILL);
-            }
-        }
+
+    // Escalate: any survivor (a child that trapped or ignored TERM) must go.
+    unsafe {
+        let target = if whole_group {
+            -(pid as i32)
+        } else {
+            pid as i32
+        };
+        libc::kill(target, libc::SIGKILL);
     }
 }
 
+/// True when no process (or group member) remains alive for `pid`. The
+/// signal(0) probe delivers nothing; over pids we own it fails only with
+/// ESRCH (EPERM cannot apply to our own children), so any other errno still
+/// counts as "alive".
 #[cfg(unix)]
-fn alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+fn group_gone(pid: u32, whole_group: bool) -> bool {
+    let target = if whole_group {
+        -(pid as i32)
+    } else {
+        pid as i32
+    };
+    if unsafe { libc::kill(target, 0) } != 0 {
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    } else {
+        false
+    }
 }
 
 #[cfg(not(unix))]
