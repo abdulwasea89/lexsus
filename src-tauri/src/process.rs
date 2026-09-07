@@ -202,7 +202,7 @@ fn pid_is_protected(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
-fn kill_tree(pid: u32, grace: Duration) {
+pub(crate) fn kill_tree(pid: u32, grace: Duration) {
     if pid_is_protected(pid) {
         return;
     }
@@ -237,7 +237,7 @@ fn alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn kill_tree(pid: u32, _grace: Duration) {
+pub(crate) fn kill_tree(pid: u32, _grace: Duration) {
     if pid_is_protected(pid) {
         return;
     }
