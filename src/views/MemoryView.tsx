@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   BrainIcon,
   ChevronRightIcon,
@@ -69,6 +69,10 @@ export default function MemoryView() {
   const [openEvents, setOpenEvents] = useState<SessionEvent[] | null>(null);
   const [openId, setOpenId] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
+  // The most recently *requested* session. `openId` state lags the click (and
+  // reads stale in the async continuation), so compare against this ref to
+  // drop responses that arrive after the user has already switched sessions.
+  const requestedRef = useRef<number | null>(null);
 
   async function scan() {
     setBusy(true);
@@ -90,16 +94,26 @@ export default function MemoryView() {
   }
 
   async function toggleSession(id: number) {
-    if (openId === id) {
+    if (requestedRef.current === id) {
+      requestedRef.current = null;
       setOpenId(null);
       setOpenEvents(null);
       return;
     }
+    requestedRef.current = id;
+    setOpenId(id);
+    // Drop whatever the previous session was showing so a slow fetch for it
+    // can't render its events under this new session while we wait.
+    setOpenEvents(null);
     try {
-      setOpenId(id);
-      setOpenEvents(await sessionEventsGet(id, 30));
+      const events = await sessionEventsGet(id, 30);
+      // A slower response for an earlier click must not clobber a newer
+      // selection (or reopen a session the user already closed).
+      if (requestedRef.current === id) setOpenEvents(events);
     } catch (e) {
-      toast.add({ title: "Could not load events", description: String(e) });
+      if (requestedRef.current === id) {
+        toast.add({ title: "Could not load events", description: String(e) });
+      }
     }
   }
 
