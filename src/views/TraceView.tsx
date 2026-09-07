@@ -39,10 +39,22 @@ export default function TraceView() {
   const idRef = useRef(0);
 
   useEffect(() => {
-    let unlistens: UnlistenFn[] = [];
+    // `listen` registers asynchronously, and this view mounts/unmounts on tab
+    // switch (and is double-mounted by StrictMode in dev). If it unmounts
+    // before all three registrations resolve, the cleanup runs with an empty
+    // array and the late-arriving listeners are never removed — a leak that
+    // keeps firing setState on every visit. Register incrementally and, the
+    // moment the effect is disposed, drop anything that lands after cleanup.
+    let disposed = false;
+    const unlistens: UnlistenFn[] = [];
+    const flush = () => {
+      for (const u of unlistens) u();
+      unlistens.length = 0;
+    };
     void (async () => {
-      unlistens = [
+      unlistens.push(
         await listen<TraceStep>("trace://step", (e) => {
+          if (disposed) return;
           const step = e.payload;
           setItems((prev) => [
             ...prev,
@@ -53,7 +65,14 @@ export default function TraceView() {
             },
           ]);
         }),
+      );
+      if (disposed) {
+        flush();
+        return;
+      }
+      unlistens.push(
         await listen<{ path: string }>("trace://confirm", (e) => {
+          if (disposed) return;
           setItems((prev) =>
             prev.map((it) =>
               it.kind === "editing" && it.file === e.payload.path
@@ -62,7 +81,14 @@ export default function TraceView() {
             ),
           );
         }),
+      );
+      if (disposed) {
+        flush();
+        return;
+      }
+      unlistens.push(
         await listen<FsEvent>("fs://event", () => {
+          if (disposed) return;
           setItems((prev) => [
             ...prev,
             {
@@ -77,10 +103,12 @@ export default function TraceView() {
             },
           ]);
         }),
-      ];
+      );
+      if (disposed) flush();
     })();
     return () => {
-      for (const u of unlistens) u();
+      disposed = true;
+      flush();
     };
   }, []);
 

@@ -39,8 +39,12 @@ export default function HandoffView() {
   async function continueWithChatGPT() {
     if (!handoff) return;
     await setObjective(objective).catch(() => {});
-    await handoffSend();
-    await navigator.clipboard.writeText(handoffText(handoff)).catch(() => {});
+    // handoffSend() rebuilds the payload from *current* state (the edited
+    // objective, refreshed trace) and returns it — copy that, not the
+    // `handoff` snapshot from the last build(), which is stale by the time
+    // the user edits the objective and clicks send.
+    const sent = await handoffSend();
+    await navigator.clipboard.writeText(handoffText(sent)).catch(() => {});
     setStatus("handoff sent to the extension (also copied to clipboard)");
     toast.add({
       title: "Handoff sent",
