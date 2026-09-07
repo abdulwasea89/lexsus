@@ -41,6 +41,10 @@ use tauri::{AppHandle, Emitter, Manager, State};
 pub(crate) struct AppState {
     pub(crate) conn: Mutex<rusqlite::Connection>,
     pub(crate) project_root: Mutex<Option<PathBuf>>,
+    /// The one live project watcher (trace grounding + local-activity veto).
+    /// Replaced — never stacked — on each `start_watch`, so a stale watcher
+    /// from an earlier root cannot keep vetoing the local failover idle timer.
+    pub(crate) fs_watcher: Mutex<Option<notify::RecommendedWatcher>>,
     pub(crate) pair_code: Mutex<String>,
     pub(crate) ws_connected: AtomicBool,
     pub(crate) ws_tx: Mutex<Option<Arc<Mutex<tungstenite::WebSocket<std::net::TcpStream>>>>>,
@@ -187,9 +191,23 @@ fn start_watch(state: State<'_, AppState>, app: tauri::AppHandle) -> Result<(), 
         .unwrap()
         .clone()
         .ok_or_else(|| "project root not set".to_string())?;
-    let rx = watcher::watch(&root).map_err(|e| e.to_string())?;
+    let watch = watcher::watch(&root).map_err(|e| e.to_string())?;
+    // Split so the notify handle (which keeps the OS watch alive) can be held
+    // in app state — a single, replaceable watch — while this thread drains
+    // its events.
+    let (handle, rx) = watch.into_parts();
+
+    // Replace, never stack: overwriting drops the previous `RecommendedWatcher`,
+    // which stops its OS watch *and* disconnects its channel, so the previous
+    // reader thread below wakes and exits. Before this, every `start_watch`
+    // (mount + each project switch) leaked a watcher whose events kept
+    // recording local activity and vetoing the local failover idle timer.
+    *state.fs_watcher.lock().unwrap() = Some(handle);
+
     thread::spawn(move || {
         let state = app.state::<AppState>();
+        // Ends when this watch is replaced (channel disconnects): the new
+        // watch has its own reader, so an exited thread is not a leak.
         while let Ok(ev) = rx.recv() {
             let raw = ev.path.to_string_lossy().into_owned();
 
@@ -988,6 +1006,7 @@ pub fn run() {
         .manage(AppState {
             conn: Mutex::new(rusqlite::Connection::open_in_memory().expect("in-memory db")),
             project_root: Mutex::new(None),
+            fs_watcher: Mutex::new(None),
             pair_code: Mutex::new(String::new()),
             ws_connected: AtomicBool::new(false),
             ws_tx: Mutex::new(None),
