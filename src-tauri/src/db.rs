@@ -549,49 +549,55 @@ const FACT_TABLES: &[&str] = &[
 ];
 
 /// Persist an extraction for a session, replacing any previous one so
-/// re-extraction stays idempotent.
+/// re-extraction stays idempotent. The delete-then-insert runs in one
+/// transaction: without it, a failure midway (constraint, disk, ...) would
+/// strand the session half-wiped — old facts gone, new ones not yet in.
+/// `unchecked_transaction` is safe here because every caller holds the app's
+/// single connection behind its `Mutex` (or owns it outright), so nobody else
+/// can be mid-statement on the same connection.
 pub fn save_facts(conn: &Connection, session_id: i64, f: &ProjectFacts) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
     for table in FACT_TABLES {
-        conn.execute(
+        tx.execute(
             &format!("DELETE FROM {table} WHERE session_id = ?1"),
             [session_id],
         )?;
     }
     if let Some(text) = f.objective.as_deref().filter(|t| !t.is_empty()) {
-        conn.execute(
+        tx.execute(
             "INSERT INTO objectives (session_id, text, active) VALUES (?1, ?2, 1)",
             (session_id, text),
         )?;
     }
     for d in &f.decisions {
-        conn.execute(
+        tx.execute(
             "INSERT INTO decisions (session_id, summary) VALUES (?1, ?2)",
             (session_id, d),
         )?;
     }
     for a in &f.failed_attempts {
-        conn.execute(
+        tx.execute(
             "INSERT INTO attempts (session_id, description, succeeded) VALUES (?1, ?2, 0)",
             (session_id, a),
         )?;
     }
     for c in &f.constraints {
-        conn.execute(
+        tx.execute(
             "INSERT INTO constraints (session_id, text) VALUES (?1, ?2)",
             (session_id, c),
         )?;
     }
     for p in &f.changed_files {
-        conn.execute(
+        tx.execute(
             "INSERT INTO changed_files (session_id, path, change_kind) VALUES (?1, ?2, 'write')",
             (session_id, p),
         )?;
     }
-    conn.execute(
+    tx.execute(
         "INSERT INTO progress (session_id, percent, note) VALUES (?1, ?2, 'heuristic')",
         rusqlite::params![session_id, f.progress_percent],
     )?;
-    Ok(())
+    tx.commit()
 }
 
 /// Read back persisted facts for a session (defaults when none saved).
@@ -787,5 +793,61 @@ mod tests {
 
         let empty = get_facts(&conn, 999).unwrap();
         assert_eq!(empty, ProjectFacts::default());
+    }
+
+    #[test]
+    fn save_facts_is_atomic_across_delete_then_insert() {
+        let conn = mem();
+        let id = upsert_session(
+            &conn,
+            &NewSession {
+                agent: "claude",
+                source: "/t/s3.jsonl",
+                cwd: None,
+                objective: None,
+                source_mtime: 1,
+            },
+        )
+        .unwrap();
+        let original = ExtractedFacts {
+            objective: Some("original goal".into()),
+            decisions: vec!["original decision".into()],
+            failed_attempts: vec!["original attempt".into()],
+            constraints: vec!["original constraint".into()],
+            changed_files: vec!["src/orig.rs".into()],
+            progress_percent: 10,
+        };
+        save_facts(&conn, id, &original.clone().into()).unwrap();
+
+        // Sabotage the *later* inserts: any INSERT into `constraints` (after
+        // objectives, decisions and attempts have already been written) now
+        // aborts. A non-transactional delete-then-insert would leave the
+        // session half-wiped here; the transaction must roll back everything.
+        conn.execute_batch(
+            "CREATE TRIGGER sabotage_constraints
+             BEFORE INSERT ON constraints
+             BEGIN SELECT RAISE(ABORT, 'sabotage'); END;",
+        )
+        .unwrap();
+
+        let replacement = ExtractedFacts {
+            objective: Some("new goal".into()),
+            decisions: vec!["new decision".into()],
+            failed_attempts: vec!["new attempt".into()],
+            constraints: vec!["new constraint".into()],
+            changed_files: vec!["src/new.rs".into()],
+            progress_percent: 90,
+        };
+        let res = save_facts(&conn, id, &replacement.into());
+        assert!(res.is_err(), "sabotaged save must fail");
+
+        // Rolled back: the original facts are fully intact, not half-deleted.
+        let got = get_facts(&conn, id).unwrap();
+        assert_eq!(got.objective.as_deref(), Some("original goal"));
+        assert_eq!(got.decisions, vec!["original decision".to_string()]);
+        assert_eq!(got.failed_attempts, vec!["original attempt".to_string()]);
+        assert_eq!(got.constraints, vec!["original constraint".to_string()]);
+        assert_eq!(got.changed_files, vec!["src/orig.rs".to_string()]);
+        assert_eq!(got.progress_percent, 10);
     }
 }
