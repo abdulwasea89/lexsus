@@ -24,6 +24,10 @@ pub const DEFAULT_ROWS: u16 = 24;
 
 pub const DEFAULT_COLS: u16 = 80;
 
+/// Grace allowed for a process group to exit on SIGTERM before a timed-out or
+/// truncated PTY command escalates to SIGKILL.
+const KILL_GRACE: Duration = Duration::from_millis(200);
+
 /// One-shot command result (serde: mirrors `CommandOutput` in the frontend).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CommandOutput {
@@ -124,6 +128,15 @@ pub fn run_command_stream(
         }
     }
     if timed_out || truncated {
+        // `child.kill()` alone stops only the shell. The command — and any
+        // pipeline or background process it spawned — runs as the shell's
+        // children in the same PTY process group, so a bare shell kill leaves
+        // them orphaned and still running. Signal the whole group instead,
+        // matching what the process registry does on cancel.
+        if let Some(pid) = child.process_id() {
+            crate::process::kill_tree(pid, KILL_GRACE);
+        }
+        // Belt-and-braces: stop the direct child even if no pid was reported.
         let _ = child.kill();
     }
 
