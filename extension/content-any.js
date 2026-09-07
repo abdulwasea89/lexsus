@@ -84,9 +84,12 @@
   // synchronous mutation froze the tab. Frames keep the main thread free.
   const INSERT_CHUNK = 8 * 1024;
 
+  // Always resolves with a boolean (never returns one synchronously), so
+  // callers can chain `.then` on every host: the contenteditable path is
+  // async (chunked, one frame apart) and the textarea path is instant.
   function insertIntoComposer(text) {
     const el = findComposer();
-    if (!el) return false;
+    if (!el) return Promise.resolve(false);
     // Every insert path funnels through here, so one cap covers auto-insert,
     // both Insert buttons, the handoff prompt and the manifest button.
     text = S.capForComposer(text);
@@ -104,7 +107,7 @@
       setter.call(el, el.value + text);
       el.dispatchEvent(new Event("input", { bubbles: true }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
-      return true;
+      return Promise.resolve(true);
     }
     // Chunked, one frame apart. `el` can be re-rendered out from under us
     // between frames — re-focus each time so the caret stays at the end.
