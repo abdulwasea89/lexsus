@@ -141,6 +141,13 @@ pub const GROUPS: &[&str] = &[
     "Reading", "Editing", "Commands", "Search", "Git", "Planning", "Meta",
 ];
 
+/// Caller/transport labels. Recorded in audits and grants, and compared so a
+/// session grant stays scoped to the path that earned it ("web" grants never
+/// auto-approve an "mcp" call, and vice versa).
+pub const SOURCE_DESKTOP: &str = "desktop"; // in-app sandbox / UI
+pub const SOURCE_WEB: &str = "web"; // browser-extension loopback (ws.rs)
+pub const SOURCE_MCP: &str = "mcp"; // native-MCP connector (mcp.rs)
+
 /// Every tool the bridge can execute.
 pub const SPECS: &[ToolSpec] = &[
     ToolSpec {

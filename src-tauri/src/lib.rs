@@ -10,6 +10,8 @@ pub mod facts;
 
 pub mod git;
 
+pub mod mcp;
+
 pub mod pty;
 
 pub mod process;
@@ -54,6 +56,10 @@ pub(crate) struct AppState {
     pub(crate) recent_edits: Mutex<VecDeque<(String, Instant)>>,
     /// Automatic-failover state machines (local + web directions).
     pub(crate) failover: Mutex<failover::ActivityMonitor>,
+    /// Live read-only/write gate for the native-MCP connector (Path B). Off
+    /// by default: the connector surface is read-only until this is flipped,
+    /// which then also re-exposes the write/command tools.
+    pub(crate) mcp_allow_write: Arc<AtomicBool>,
 }
 
 /// A trace step emitted to the UI (mirrors `TraceStep` in the frontend).
@@ -317,51 +323,57 @@ pub(crate) fn tool_call(app: &AppHandle, tool: bridge::Tool, source: &str) -> br
             "grantable": grantable,
         }),
     );
-    if source == "web" {
-        // WS caller: wait for the user's decision (up to 5 minutes).
-        let (tx, rx) = bridge::wait_channel();
-        state
-            .bridge
-            .lock()
-            .unwrap()
-            .channels
-            .lock()
-            .unwrap()
-            .insert(id, tx);
+    // Remote callers (extension loopback, MCP connector) wait here for the
+    // user's decision on the desktop. The desktop itself never blocks: it
+    // resolves the same request through `bridge_approve`.
+    let timeout = match source {
+        bridge::SOURCE_WEB => Duration::from_secs(300),
+        bridge::SOURCE_MCP => Duration::from_secs(crate::mcp::APPROVAL_WAIT_SECS),
+        // Desktop sandbox / anything else: return the queued marker; the UI
+        // resolves via bridge_approve and gets the executed result there.
+        _ => return result,
+    };
 
-        match rx.recv_timeout(Duration::from_secs(300)) {
-            Ok(r) => r,
-            Err(_) => {
-                // The web caller waited 5 minutes and was already told the
-                // call failed, so this approval must not stay executable.
-                // Dequeue it (and drop its channel): an Allow on the now-stale
-                // card then resolves nothing instead of silently running the
-                // write long after — with nobody watching.
-                let expired = state.bridge.lock().unwrap().expire(id);
-                if let Some(req) = expired {
-                    let _ = db::record_audit(
-                        &state.conn.lock().unwrap(),
-                        &req.source,
-                        "tool",
-                        &serde_json::json!(req.tool).to_string(),
-                        false,
-                        "timeout",
-                        false,
-                    );
-                    let _ = app.emit(
-                        "bridge://approval-resolved",
-                        serde_json::json!({
-                            "id": id,
-                            "allowed": false,
-                            "result": bridge::ToolResult::err("approval timed out"),
-                        }),
-                    );
-                }
-                bridge::ToolResult::err("approval timed out")
+    let (tx, rx) = bridge::wait_channel();
+    state
+        .bridge
+        .lock()
+        .unwrap()
+        .channels
+        .lock()
+        .unwrap()
+        .insert(id, tx);
+
+    match rx.recv_timeout(timeout) {
+        Ok(r) => r,
+        Err(_) => {
+            // The remote caller waited its full window and was already told
+            // the call failed, so this approval must not stay executable.
+            // Dequeue it (and drop its channel): an Allow on the now-stale
+            // card then resolves nothing instead of silently running the
+            // write long after — with nobody watching.
+            let expired = state.bridge.lock().unwrap().expire(id);
+            if let Some(req) = expired {
+                let _ = db::record_audit(
+                    &state.conn.lock().unwrap(),
+                    &req.source,
+                    "tool",
+                    &serde_json::json!(req.tool).to_string(),
+                    false,
+                    "timeout",
+                    false,
+                );
+                let _ = app.emit(
+                    "bridge://approval-resolved",
+                    serde_json::json!({
+                        "id": id,
+                        "allowed": false,
+                        "result": bridge::ToolResult::err("approval timed out"),
+                    }),
+                );
             }
+            bridge::ToolResult::err("approval timed out")
         }
-    } else {
-        result
     }
 }
 
@@ -373,7 +385,7 @@ fn bridge_tool(
     tool: bridge::Tool,
 ) -> Result<bridge::ToolResult, String> {
     let _ = &state;
-    Ok(tool_call(&app, tool, "desktop"))
+    Ok(tool_call(&app, tool, bridge::SOURCE_DESKTOP))
 }
 
 /// A session grant offered from an approval card ("don't ask again for
@@ -1019,6 +1031,7 @@ pub fn run() {
             objective: Mutex::new(None),
             recent_edits: Mutex::new(VecDeque::new()),
             failover: Mutex::new(failover::ActivityMonitor::new()),
+            mcp_allow_write: Arc::new(AtomicBool::new(false)),
         })
         .setup(|app| {
             // Auto-init: app-data SQLite, persisted settings, WS server.
@@ -1040,6 +1053,9 @@ pub fn run() {
             *state.pair_code.lock().unwrap() = code;
             ws::spawn_server(app.handle().clone());
             spawn_failover_ticker(app.handle().clone());
+            // Path B (additive): the desktop-local MCP endpoint. Extension
+            // pairing above stays exactly as it is.
+            mcp::spawn_server(app.handle().clone(), state.mcp_allow_write.clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

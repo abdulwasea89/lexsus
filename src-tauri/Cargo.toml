@@ -32,6 +32,14 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 tungstenite = "0.24"
 # Pairing codes come from the OS CSPRNG (clock-derived codes were guessable).
 getrandom = "0.2"
+# Desktop-local MCP server (Path B, additive): rmcp serves a Streamable-HTTP
+# MCP endpoint over loopback (axum drives its tower Service). Reuses the same
+# bridge tool engine and approval system as the extension path — nothing here
+# replaces or alters Path A.
+rmcp = { version = "3.2", features = ["transport-streamable-http-server"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync"] }
+tokio-util = "0.7"
 # Signal the process *group* when cancelling a running command (unix only).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

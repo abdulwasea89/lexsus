@@ -383,7 +383,7 @@ fn handle_conn(app: AppHandle, stream: std::net::TcpStream) {
                     // it can kill the processes. Cleared afterwards so a
                     // later call on this pooled thread cannot inherit it.
                     crate::process::set_execution_owner(Some(id.clone()));
-                    let result = crate::tool_call(&app, tool.clone(), "web");
+                    let result = crate::tool_call(&app, tool.clone(), crate::bridge::SOURCE_WEB);
                     crate::process::set_execution_owner(None);
                     let meta = tool_meta(&tool);
                     let (status, result_val, error_val) = if result.ok {
@@ -455,7 +455,7 @@ fn handle_conn(app: AppHandle, stream: std::net::TcpStream) {
                 let ws = ws.clone();
                 let app = app.clone();
                 std::thread::spawn(move || {
-                    let result = crate::tool_call(&app, tool, "web");
+                    let result = crate::tool_call(&app, tool, crate::bridge::SOURCE_WEB);
                     let mut w = ws.lock().unwrap();
                     let _ = w.send(Message::Text(make_tool_result_v1(id, &result)));
                 });
