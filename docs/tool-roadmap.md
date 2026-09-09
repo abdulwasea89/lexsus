@@ -3,11 +3,12 @@
 > The tool surface the web AI sees, phase by phase: what is **built**, what is
 > **planned**, and the invariants every new tool must uphold.
 >
-> Status date: 2026-09-06. **15 of 44 built.**
+> Status date: 2026-09-09. **27 of 44 built.**
 >
-> **Completed:** Phase 0 ✅, Phase 1 ✅. **Not started:** Phases 2, 3, 5, 7.
-> **Partial:** Phase 4 (0 tools shipped, 6 of 9 have built backing) and
-> Phase 6 (session-grants slice landed; persisted policy/config/expiry remain).
+> **Completed:** Phase 0 ✅, Phase 1 ✅, Phase 2 ✅, Phase 3 ✅. **Not started:**
+> Phases 5, 7. **Partial:** Phase 4 (0 tools shipped, 6 of 9 have built
+> backing) and Phase 6 (session-grants slice landed; persisted
+> policy/config/expiry remain).
 
 This is the capability roadmap for the coding-agent bridge. It is deliberately
 separate from `full-plan.md` §13, whose "Phase 0"–"Phase 7" describe the
@@ -53,16 +54,16 @@ in-memory only — they die with the app.
 | — | original MVP tools | 5 | — | 5 | ✅ done |
 | 0 | registry + progressive disclosure | 5 | 2 | 7 | ✅ done |
 | 1 | files & editing | 8 (+1 early) | 8 | 15 | ✅ done |
-| 2 | search | 0 | 2 | 17 | ⏳ not started |
-| 3 | git | 0 | 10 | 27 | ⏳ not started |
+| 2 | search | 0 | 2 | 17 | ✅ done |
+| 3 | git | 0 | 10 | 27 | ✅ done |
 | 4 | project memory | 0 | 9 | 36 | 🔶 partial |
 | 5 | background commands | 0 | 3 | 39 | ⏳ not started |
 | 6 | approval policy engine | — | 0 | 39 | 🔶 partial |
 | 7 | web & long tail | 0 | 5 | 44 | ⏳ not started |
 
-Of the 37 not yet built, **~18 are wiring over code that already exists** — all
-of Phase 3 (git.rs has every function), 6 of 9 in Phase 4 (the SQLite tables and
-extraction are built), and the thin file ops.
+Of the 17 not yet built, **~11 are wiring over code that already exists** —
+most of Phase 4 (the SQLite tables and extraction are built) and the thin
+file ops.
 
 ---
 
@@ -125,7 +126,7 @@ persisted grant policies and per-tool configuration.
 
 ---
 
-## Phase 2 — Search (2 tools) ⏳ NOT STARTED
+## Phase 2 — Search (2 tools) ✅ DONE
 
 **Goal:** the AI can find things instead of guessing filenames.
 
@@ -139,13 +140,12 @@ through `is_sensitive_path()`. Without it, search becomes a secret-exfiltration
 path that bypasses the `read_file` gate entirely: `grep ".env"` must return
 nothing for `.env` itself even though the file matches.
 
-Gated behind the chunked-read work (now landed): search output can exceed
-anything the UI handles, so results need the same paging treatment `read_file`
-got.
+Both walk the project tree with `walkdir`, prune `.git`/vendored/build
+directories, skip binary and over-large files, filter every hit (and glob
+result) through `is_sensitive_path()`, and cap files/hits/output bytes so an
+`Auto` search can't hang or flood the chat.
 
----
-
-## Phase 3 — Git (10 tools) — the cheapest phase ⏳ NOT STARTED
+## Phase 3 — Git (10 tools) — the cheapest phase ✅ DONE
 
 **Goal:** expose the git workflow the app already has to the AI using it.
 Almost pure wiring: `git.rs` has every function, and most already have Tauri
@@ -154,16 +154,16 @@ commands in `lib.rs` for the UI panel. Only `git_create_branch` and
 
 | Tool | Approval | Backing |
 |---|---|---|
-| `git_diff` | Auto | `git.rs::diff_workdir`, `lib.rs:122` |
-| `git_log` | Auto | `git.rs::log`, `lib.rs:152` |
+| `git_diff` | Auto | `git.rs::diff_workdir` |
+| `git_log` | Auto | `git.rs::log` |
 | `git_add` | Always | `git.rs::stage`/`stage_all` |
 | `git_unstage` | Always | `git.rs::unstage` |
-| `git_commit` | Always | `git.rs::commit` |
-| `git_branches` | Auto | `git.rs::branches`, `lib.rs:142` |
-| `git_create_branch` | Always | ~20 new lines in `git.rs` |
-| `git_checkout` | **Destructive** | `git.rs::checkout`, `lib.rs:147` — **must refuse on a dirty tree** |
-| `git_commit_diff` | Auto | `git.rs::commit_diff`, `lib.rs:160` |
-| `git_show` | Auto | new: render a commit (message + diff) by oid |
+| `git_commit` | Always | `git.rs::commit` — refuses an empty/staged-nothing commit |
+| `git_branches` | Auto | `git.rs::branches` |
+| `git_create_branch` | Always | `git.rs::create_branch` |
+| `git_checkout` | **Destructive** | `git.rs::checkout` — refuses on a dirty tree |
+| `git_commit_diff` | Auto | `git.rs::commit_diff` |
+| `git_show` | Auto | `git.rs::show` — commit message + diff by oid |
 
 ---
 

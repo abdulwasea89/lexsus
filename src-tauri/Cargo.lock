@@ -35,9 +35,11 @@ version = "0.1.0"
 dependencies = [
  "getrandom 0.2.17",
  "git2",
+ "glob",
  "libc",
  "notify",
  "portable-pty",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
@@ -46,6 +48,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
  "tungstenite",
+ "walkdir",
 ]
 
 [[package]]

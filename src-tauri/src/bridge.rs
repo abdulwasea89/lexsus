@@ -87,7 +87,59 @@ pub enum Tool {
     ListDirectory {
         path: String,
     },
+    /// Search file contents for a regular-expression pattern. Results are
+    /// filtered through `is_sensitive_path`, so search is not a backdoor past
+    /// the `read_file` gate.
+    Grep {
+        pattern: String,
+        /// Optional directory/file to search under. Absent → the project root.
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        case_sensitive: Option<bool>,
+    },
+    /// List files whose path matches a glob pattern. Same sensitive-path
+    /// filtering invariant as `grep`.
+    Glob {
+        pattern: String,
+        /// Optional directory to search under. Absent → the project root.
+        #[serde(default)]
+        path: Option<String>,
+    },
     GitStatus,
+    GitDiff {
+        /// Optional single path to restrict the diff to (gitignore-pattern).
+        #[serde(default)]
+        path: Option<String>,
+    },
+    GitLog {
+        /// Max commits to list. Absent → default (20).
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+    GitAdd {
+        /// File path to stage, or "all"/"." to stage everything.
+        path: String,
+    },
+    GitUnstage {
+        path: String,
+    },
+    GitCommit {
+        message: String,
+    },
+    GitBranches,
+    GitCreateBranch {
+        name: String,
+    },
+    GitCheckout {
+        branch: String,
+    },
+    GitCommitDiff {
+        commit: String,
+    },
+    GitShow {
+        commit: String,
+    },
     /// Meta: the full argument schema for one tool. Needs no project root.
     DescribeTool {
         name: String,
@@ -265,6 +317,28 @@ pub const SPECS: &[ToolSpec] = &[
         group: "Reading",
     },
     ToolSpec {
+        name: "grep",
+        aliases: &["search", "search_files", "find_text", "rg"],
+        args: "pattern, path?",
+        summary: "Search file contents for a regex, filtering out sensitive paths",
+        approval: Approval::Auto,
+        trace_kind: Some("reading"),
+        timeout_ms: 30_000,
+        auto_insert: true,
+        group: "Search",
+    },
+    ToolSpec {
+        name: "glob",
+        aliases: &["list_matching", "find", "match_paths"],
+        args: "pattern, path?",
+        summary: "List files whose path matches a glob pattern",
+        approval: Approval::Auto,
+        trace_kind: Some("reading"),
+        timeout_ms: 20_000,
+        auto_insert: true,
+        group: "Search",
+    },
+    ToolSpec {
         name: "run_command",
         aliases: &["bash", "shell", "execute", "terminal", "sh"],
         args: "command",
@@ -280,6 +354,116 @@ pub const SPECS: &[ToolSpec] = &[
         aliases: &["status", "git_st"],
         args: "",
         summary: "Show changed files in the git working tree",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 10_000,
+        auto_insert: true,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_diff",
+        aliases: &["diff", "git_diff_workdir"],
+        args: "path?",
+        summary: "Show the working-tree diff against the last commit",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 15_000,
+        auto_insert: true,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_log",
+        aliases: &["log", "git_history"],
+        args: "limit?",
+        summary: "Show recent commit history",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 10_000,
+        auto_insert: true,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_add",
+        aliases: &["git_stage", "stage", "add"],
+        args: "path",
+        summary: "Stage a file's changes, or \"all\" to stage everything",
+        approval: Approval::Always,
+        trace_kind: None,
+        timeout_ms: 10_000,
+        auto_insert: false,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_unstage",
+        aliases: &["unstage", "git_reset_file"],
+        args: "path",
+        summary: "Unstage a file (working tree untouched)",
+        approval: Approval::Always,
+        trace_kind: None,
+        timeout_ms: 10_000,
+        auto_insert: false,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_commit",
+        aliases: &["commit"],
+        args: "message",
+        summary: "Commit the currently staged changes",
+        approval: Approval::Always,
+        trace_kind: None,
+        timeout_ms: 10_000,
+        auto_insert: false,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_branches",
+        aliases: &["branch", "branches", "git_branch_list"],
+        args: "",
+        summary: "List local branches",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 10_000,
+        auto_insert: true,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_create_branch",
+        aliases: &["create_branch", "git_branch_new"],
+        args: "name",
+        summary: "Create a new branch at the current HEAD",
+        approval: Approval::Always,
+        trace_kind: None,
+        timeout_ms: 10_000,
+        auto_insert: false,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_checkout",
+        aliases: &["checkout", "git_switch", "switch_branch"],
+        args: "branch",
+        summary: "Switch to a branch (refuses on a dirty tree)",
+        approval: Approval::Destructive,
+        trace_kind: None,
+        timeout_ms: 10_000,
+        auto_insert: false,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_commit_diff",
+        aliases: &["show_diff", "commit_diff"],
+        args: "commit",
+        summary: "Show the patch of a specific commit",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 10_000,
+        auto_insert: true,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_show",
+        aliases: &["git_commit_show", "show_commit"],
+        args: "commit",
+        summary: "Show one commit: message, author and full diff",
         approval: Approval::Auto,
         trace_kind: None,
         timeout_ms: 10_000,
@@ -325,7 +509,19 @@ pub fn tool_name(tool: &Tool) -> &'static str {
         Tool::ReadManyFiles { .. } => "read_many_files",
         Tool::RunCommand { .. } => "run_command",
         Tool::ListDirectory { .. } => "list_directory",
+        Tool::Grep { .. } => "grep",
+        Tool::Glob { .. } => "glob",
         Tool::GitStatus => "git_status",
+        Tool::GitDiff { .. } => "git_diff",
+        Tool::GitLog { .. } => "git_log",
+        Tool::GitAdd { .. } => "git_add",
+        Tool::GitUnstage { .. } => "git_unstage",
+        Tool::GitCommit { .. } => "git_commit",
+        Tool::GitBranches => "git_branches",
+        Tool::GitCreateBranch { .. } => "git_create_branch",
+        Tool::GitCheckout { .. } => "git_checkout",
+        Tool::GitCommitDiff { .. } => "git_commit_diff",
+        Tool::GitShow { .. } => "git_show",
         Tool::DescribeTool { .. } => "describe_tool",
         Tool::ListTools => "list_tools",
     }
@@ -430,12 +626,26 @@ pub fn tool_paths(tool: &Tool) -> Vec<&str> {
         }
         // Both sides of a path pair: a secret can be laundered by copying
         // it to an innocuous name, so the target is checked too.
-        Tool::MoveFile { from, to } | Tool::CopyFile { from, to } => vec![from.as_str(), to.as_str()],
+        Tool::MoveFile { from, to } | Tool::CopyFile { from, to } => {
+            vec![from.as_str(), to.as_str()]
+        }
         // A batch's paths are filtered individually at execution; the trace
         // carries the count instead (see `detail`).
         Tool::ReadManyFiles { .. }
         | Tool::RunCommand { .. }
+        | Tool::Grep { .. }
+        | Tool::Glob { .. }
         | Tool::GitStatus
+        | Tool::GitDiff { .. }
+        | Tool::GitLog { .. }
+        | Tool::GitAdd { .. }
+        | Tool::GitUnstage { .. }
+        | Tool::GitCommit { .. }
+        | Tool::GitBranches
+        | Tool::GitCreateBranch { .. }
+        | Tool::GitCheckout { .. }
+        | Tool::GitCommitDiff { .. }
+        | Tool::GitShow { .. }
         | Tool::DescribeTool { .. }
         | Tool::ListTools => vec![],
     }
@@ -466,14 +676,33 @@ pub fn detail(tool: &Tool) -> Option<String> {
         Tool::MultiEdit { path, edits } => Some(format!("{path} ({} edits)", edits.len())),
         Tool::ApplyPatch { path, patch } => Some(format!("{path} ({} bytes patch)", patch.len())),
         Tool::DeleteFile { path } => Some(path.clone()),
-        Tool::MoveFile { from, to } | Tool::CopyFile { from, to } => {
-            Some(format!("{from} → {to}"))
-        }
+        Tool::MoveFile { from, to } | Tool::CopyFile { from, to } => Some(format!("{from} → {to}")),
         Tool::CreateDirectory { path } => Some(path.clone()),
         Tool::ReadManyFiles { paths } => Some(format!("{} files", paths.len())),
+        Tool::Grep {
+            pattern,
+            path,
+            case_sensitive: _,
+        } => Some(match path {
+            Some(p) => format!("{pattern} in {p}"),
+            None => pattern.clone(),
+        }),
+        Tool::Glob { pattern, path } => Some(match path {
+            Some(p) => format!("{pattern} under {p}"),
+            None => pattern.clone(),
+        }),
         Tool::RunCommand { command } => Some(command.clone()),
         Tool::DescribeTool { name } => Some(name.clone()),
-        Tool::GitStatus | Tool::ListTools => None,
+        Tool::GitStatus | Tool::GitBranches | Tool::ListTools => None,
+        Tool::GitDiff { path } => Some(path.clone().unwrap_or_else(|| ".".to_string())),
+        Tool::GitLog { limit } => Some(format!("{} commits", limit.unwrap_or(20))),
+        Tool::GitAdd { path } => Some(path.clone()),
+        Tool::GitUnstage { path } => Some(path.clone()),
+        Tool::GitCommit { message } => Some(message.clone()),
+        Tool::GitCreateBranch { name } => Some(name.clone()),
+        Tool::GitCheckout { branch } => Some(branch.clone()),
+        Tool::GitCommitDiff { commit } => Some(commit.clone()),
+        Tool::GitShow { commit } => Some(commit.clone()),
     }
 }
 
@@ -920,12 +1149,7 @@ pub fn needs_approval(tool: &Tool) -> Option<String> {
 ///   launders a secret to a name the read gate doesn't stop at.
 /// - Every path resolves under the grant's prefix (via `resolve_path`, not
 ///   a raw `starts_with`, so a `..`-laden path can't widen the scope).
-pub fn grant_matches(
-    grant: &SessionGrant,
-    tool: &Tool,
-    source: &str,
-    root: Option<&Path>,
-) -> bool {
+pub fn grant_matches(grant: &SessionGrant, tool: &Tool, source: &str, root: Option<&Path>) -> bool {
     if grant.source != source {
         return false;
     }
@@ -1208,7 +1432,12 @@ fn read_text_file(p: &Path, rel: &str) -> Result<String, ToolResult> {
             ));
         }
         Ok(md) => md,
-        Err(e) => return Err(ToolResult::err_code(ErrorCode::FileNotFound, format!("{rel}: {e}"))),
+        Err(e) => {
+            return Err(ToolResult::err_code(
+                ErrorCode::FileNotFound,
+                format!("{rel}: {e}"),
+            ))
+        }
     };
     if md.len() > READ_CAP {
         return Err(ToolResult::err_code(
@@ -1237,7 +1466,12 @@ fn read_text_file(p: &Path, rel: &str) -> Result<String, ToolResult> {
 /// (it would match everywhere), a missing match is `StringNotFound`, and
 /// multiple matches without `replace_all` are `AmbiguousMatch` — the count
 /// is in the message so the AI can disambiguate on its next attempt.
-fn apply_str_edit(text: &str, old: &str, new: &str, replace_all: bool) -> Result<String, ToolError> {
+fn apply_str_edit(
+    text: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Result<String, ToolError> {
     if old.is_empty() {
         return Err(ToolError {
             code: ErrorCode::InvalidArguments,
@@ -1254,7 +1488,9 @@ fn apply_str_edit(text: &str, old: &str, new: &str, replace_all: bool) -> Result
         _ if replace_all => Ok(text.replace(old, new)),
         _ => Err(ToolError {
             code: ErrorCode::AmbiguousMatch,
-            message: format!("old_string matches {matches} times — extend it to be unique, or pass replace_all"),
+            message: format!(
+                "old_string matches {matches} times — extend it to be unique, or pass replace_all"
+            ),
         }),
     }
 }
@@ -1358,7 +1594,7 @@ fn apply_hunks(lines: &[String], hunks: &[Hunk]) -> Result<Vec<String>, ToolErro
     let mut consumed = 0usize; // lines of the old file already emitted/skipped
     for (i, hunk) in hunks.iter().enumerate() {
         let want = hunk.old_start.saturating_sub(1); // 0-based expected start
-        // Exact position first, then a drift search forward and backward.
+                                                     // Exact position first, then a drift search forward and backward.
         let mut found: Option<usize> = None;
         for delta in 0..=HUNK_DRIFT {
             for cand in [
@@ -1408,6 +1644,92 @@ const MANY_BYTES_BUDGET: usize = 20 * 1024;
 
 /// Execute a tool call locally. `root: None` → tool requires the root.
 /// `on_event` streams command events while a `run_command` executes.
+/// Open the repo at the project root, mapping failure to a `ToolResult`.
+fn git_repo(root: &Path) -> Result<git2::Repository, ToolResult> {
+    git::open_repo(root).map_err(|e| {
+        ToolResult::err_code(ErrorCode::ExecutionFailed, format!("not a git repo: {e}"))
+    })
+}
+
+/// A git index path must stay inside the project root. Git resolves relative
+/// paths against the working directory, so a `..` that pops past the root is
+/// rejected here before it reaches the index (mirrors `resolve_path`).
+fn valid_git_rel(rel: &str) -> Result<(), ToolResult> {
+    if rel.trim().is_empty() {
+        return Err(ToolResult::err_code(
+            ErrorCode::InvalidArguments,
+            "path is empty",
+        ));
+    }
+    let normalized = normalize_path(Path::new(rel));
+    if normalized.starts_with("..") {
+        return Err(ToolResult::err_code(
+            ErrorCode::PathEscapesRoot,
+            format!("path escapes project root: {rel}"),
+        ));
+    }
+    Ok(())
+}
+
+// ── Search tools (Phase 2): grep / glob ─────────────────────────────
+// Both walk the project tree and filter every result through
+// `is_sensitive_path`, so a search can never launder a secret that a direct
+// `read_file` would have gated (`grep ".env"` must not match `.env` itself).
+// Budgets keep an Auto-approved search from hanging or flooding the chat.
+
+const GREP_FILE_CAP: u64 = 4 * 1024 * 1024; // skip anything larger when scanning
+const GREP_MAX_FILES: usize = 2000;
+const GREP_MAX_HITS: usize = 300;
+const GREP_MAX_BYTES: usize = 200 * 1024;
+const GLOB_MAX_FILES: usize = 4000;
+
+/// Prune the walk: never descend into `.git`, dependency/vendor or build
+/// directories — they are huge, rarely what a search wants, and can blow the
+/// file budget before the AI sees anything useful. Files always pass.
+fn keep_search_entry(e: &walkdir::DirEntry) -> bool {
+    if e.depth() == 0 || !e.file_type().is_dir() {
+        return true;
+    }
+    let name = e.file_name().to_string_lossy().into_owned();
+    if name.starts_with('.') {
+        return false; // .git, .venv, .next, …
+    }
+    !matches!(
+        name.as_str(),
+        "node_modules" | "target" | "dist" | "build" | "vendor" | "__pycache__"
+    )
+}
+
+/// Grep one file, appending `rel:line: text` matches. Returns how many hits
+/// were added (so the caller can stop once the budget is spent).
+fn grep_file(abs: &Path, rel: &str, re: &regex::Regex, out: &mut String, hits: &mut usize) {
+    if is_sensitive_path(abs) {
+        return;
+    }
+    let Ok(md) = std::fs::metadata(abs) else {
+        return;
+    };
+    if !md.is_file() || md.len() > GREP_FILE_CAP {
+        return;
+    }
+    let Ok(bytes) = std::fs::read(abs) else {
+        return;
+    };
+    if bytes.contains(&0) {
+        return; // binary — matches on it would be noise
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    for (i, line) in text.lines().enumerate() {
+        if *hits >= GREP_MAX_HITS {
+            return;
+        }
+        if re.is_match(line) {
+            *hits += 1;
+            out.push_str(&format!("{rel}:{}: {}\n", i + 1, line.trim_end()));
+        }
+    }
+}
+
 pub fn execute(
     tool: &Tool,
     root: Option<&Path>,
@@ -1565,10 +1887,7 @@ pub fn execute(
                 }
             }
             match std::fs::write(&p, new_text.as_bytes()) {
-                Ok(()) => ToolResult::ok(format!(
-                    "applied {} edits to {path}",
-                    edits.len()
-                )),
+                Ok(()) => ToolResult::ok(format!("applied {} edits to {path}", edits.len())),
                 Err(e) => ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{path}: {e}")),
             }
         }
@@ -1595,10 +1914,7 @@ pub fn execute(
                 new_text.push('\n');
             }
             match std::fs::write(&p, new_text.as_bytes()) {
-                Ok(()) => ToolResult::ok(format!(
-                    "applied {} hunks to {path}",
-                    hunks.len()
-                )),
+                Ok(()) => ToolResult::ok(format!("applied {} hunks to {path}", hunks.len())),
                 Err(e) => ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{path}: {e}")),
             }
         }
@@ -1638,10 +1954,7 @@ pub fn execute(
             }
             if let Some(parent) = dst.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
-                    return ToolResult::err_code(
-                        ErrorCode::ExecutionFailed,
-                        format!("{to}: {e}"),
-                    );
+                    return ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{to}: {e}"));
                 }
             }
             // Overwrites the target — the approval card shows both paths.
@@ -1664,10 +1977,7 @@ pub fn execute(
             }
             if let Some(parent) = dst.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
-                    return ToolResult::err_code(
-                        ErrorCode::ExecutionFailed,
-                        format!("{to}: {e}"),
-                    );
+                    return ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{to}: {e}"));
                 }
             }
             match std::fs::copy(&src, &dst) {
@@ -1692,10 +2002,7 @@ pub fn execute(
             if paths.len() > MANY_FILES_MAX {
                 return ToolResult::err_code(
                     ErrorCode::InvalidArguments,
-                    format!(
-                        "{} paths — batch at most {MANY_FILES_MAX}",
-                        paths.len()
-                    ),
+                    format!("{} paths — batch at most {MANY_FILES_MAX}", paths.len()),
                 );
             }
             let mut out = String::new();
@@ -1743,10 +2050,7 @@ pub fn execute(
                 budget -= chunk.len();
                 shown += 1;
             }
-            out.push_str(&format!(
-                "\n[{shown} of {} files shown]\n",
-                paths.len()
-            ));
+            out.push_str(&format!("\n[{shown} of {} files shown]\n", paths.len()));
             ToolResult::ok(out)
         }
         Tool::RunCommand { command } => {
@@ -1851,6 +2155,125 @@ pub fn execute(
             out.push_str(&names.join("\n"));
             ToolResult::ok(out)
         }
+        Tool::Grep {
+            pattern,
+            path,
+            case_sensitive,
+        } => {
+            let root_abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+            let base = match path {
+                Some(p) => match resolve_tool_path(&root_abs, p) {
+                    Ok(b) => b,
+                    Err(r) => return r,
+                },
+                None => root_abs.clone(),
+            };
+            let re = match regex::RegexBuilder::new(pattern)
+                .case_insensitive(!case_sensitive.unwrap_or(false))
+                .build()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    return ToolResult::err_code(
+                        ErrorCode::InvalidArguments,
+                        format!("invalid regex /{pattern}/: {e}"),
+                    );
+                }
+            };
+            let mut out = String::new();
+            let mut files = 0usize;
+            let mut hits = 0usize;
+            for entry in walkdir::WalkDir::new(&base)
+                .into_iter()
+                .filter_entry(keep_search_entry)
+            {
+                let Ok(e) = entry else { continue };
+                if !e.file_type().is_file() {
+                    continue;
+                }
+                if files >= GREP_MAX_FILES {
+                    break;
+                }
+                files += 1;
+                let abs = e.path();
+                let rel = abs
+                    .strip_prefix(&root_abs)
+                    .unwrap_or(abs)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                grep_file(abs, &rel, &re, &mut out, &mut hits);
+                if hits >= GREP_MAX_HITS || out.len() >= GREP_MAX_BYTES {
+                    break;
+                }
+            }
+            if hits == 0 {
+                return ToolResult::ok(format!(
+                    "no matches for /{pattern}/ (scanned {files} files)"
+                ));
+            }
+            let mut head = format!("[{hits} matches in {files} file(s)]\n");
+            if hits >= GREP_MAX_HITS || out.len() >= GREP_MAX_BYTES {
+                head.push_str("[results truncated — narrow the pattern or pass a path]\n");
+            }
+            head.push_str(&out);
+            ToolResult::ok(head)
+        }
+        Tool::Glob { pattern, path } => {
+            let root_abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+            let base = match path {
+                Some(p) => match resolve_tool_path(&root_abs, p) {
+                    Ok(b) => b,
+                    Err(r) => return r,
+                },
+                None => root_abs.clone(),
+            };
+            let pat = match glob::Pattern::new(pattern) {
+                Ok(p) => p,
+                Err(e) => {
+                    return ToolResult::err_code(
+                        ErrorCode::InvalidArguments,
+                        format!("invalid glob /{pattern}/: {e}"),
+                    );
+                }
+            };
+            let mut out = String::new();
+            let mut count = 0usize;
+            for entry in walkdir::WalkDir::new(&base)
+                .into_iter()
+                .filter_entry(keep_search_entry)
+            {
+                let Ok(e) = entry else { continue };
+                if !e.file_type().is_file() {
+                    continue;
+                }
+                if count >= GLOB_MAX_FILES {
+                    break;
+                }
+                let abs = e.path();
+                if is_sensitive_path(abs) {
+                    continue;
+                }
+                let rel = abs
+                    .strip_prefix(&base)
+                    .unwrap_or(abs)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let fname = e.file_name().to_string_lossy();
+                if pat.matches(&rel) || pat.matches(fname.as_ref()) {
+                    out.push_str(&format!("{rel}\n"));
+                    count += 1;
+                }
+            }
+            if count == 0 {
+                return ToolResult::ok(format!("no files match /{pattern}/"));
+            }
+            let mut head = format!("[{count} file(s) matching /{pattern}/]\n");
+            if count >= GLOB_MAX_FILES {
+                head.push_str("[results truncated]\n");
+            }
+            head.push_str(&out);
+            ToolResult::ok(head)
+        }
         Tool::GitStatus => {
             let repo = match git::open_repo(root) {
                 Ok(r) => r,
@@ -1881,6 +2304,222 @@ pub fn execute(
                 ));
             }
             ToolResult::ok(out)
+        }
+        Tool::GitDiff { path } => {
+            let repo = match git_repo(root) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            let diffs = match git::diff_workdir(&repo) {
+                Ok(d) => d,
+                Err(e) => {
+                    return ToolResult::err_code(
+                        ErrorCode::ExecutionFailed,
+                        format!("git diff: {e}"),
+                    );
+                }
+            };
+            let diffs: Vec<_> = match path {
+                Some(p) if !p.is_empty() && p != "." => diffs
+                    .into_iter()
+                    .filter(|d| d.path == *p || d.path.contains(&format!("{p}/")))
+                    .collect(),
+                _ => diffs,
+            };
+            if diffs.is_empty() {
+                return ToolResult::ok("no changes".to_string());
+            }
+            let mut out = format!("[{} changed file(s)]\n", diffs.len());
+            for d in diffs {
+                out.push_str(&format!(
+                    "\n── {} [{} +{}/-{}]\n",
+                    d.path, d.status, d.added, d.deleted
+                ));
+                out.push_str(&d.patch);
+                if !d.patch.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            ToolResult::ok(out)
+        }
+        Tool::GitLog { limit } => {
+            let repo = match git_repo(root) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            let want = (limit.unwrap_or(20) as usize).clamp(1, 100);
+            let commits = match git::log(&repo, want) {
+                Ok(c) => c,
+                Err(e) => {
+                    return ToolResult::err_code(
+                        ErrorCode::ExecutionFailed,
+                        format!("git log: {e}"),
+                    );
+                }
+            };
+            if commits.is_empty() {
+                return ToolResult::ok("no commits yet".to_string());
+            }
+            let mut out = format!("[{}/{} commits]\n", commits.len(), want);
+            for c in commits {
+                let short = c.oid.chars().take(7).collect::<String>();
+                out.push_str(&format!("{short}  {}  {}\n", c.author, c.message));
+            }
+            ToolResult::ok(out)
+        }
+        Tool::GitAdd { path } => {
+            let repo = match git_repo(root) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            let all = matches!(path.as_str(), "all" | "." | "*");
+            if !all {
+                match valid_git_rel(path) {
+                    Ok(()) => {}
+                    Err(e) => return e,
+                }
+            }
+            let res = if all {
+                git::stage_all(&repo).map_err(|e| format!("git add: {e}"))
+            } else {
+                git::stage(&repo, path).map_err(|e| format!("git add {path}: {e}"))
+            };
+            match res {
+                Ok(()) => ToolResult::ok(if all {
+                    "staged all changes".to_string()
+                } else {
+                    format!("staged {path}")
+                }),
+                Err(e) => ToolResult::err_code(ErrorCode::ExecutionFailed, e),
+            }
+        }
+        Tool::GitUnstage { path } => {
+            let repo = match git_repo(root) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            match valid_git_rel(path) {
+                Ok(()) => {}
+                Err(e) => return e,
+            }
+            match git::unstage(&repo, path) {
+                Ok(()) => ToolResult::ok(format!("unstaged {path}")),
+                Err(e) => {
+                    ToolResult::err_code(ErrorCode::ExecutionFailed, format!("git unstage: {e}"))
+                }
+            }
+        }
+        Tool::GitCommit { message } => {
+            let repo = match git_repo(root) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            if message.trim().is_empty() {
+                return ToolResult::err_code(
+                    ErrorCode::InvalidArguments,
+                    "commit message is empty",
+                );
+            }
+            match git::has_staged_changes(&repo) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return ToolResult::err_code(
+                        ErrorCode::InvalidArguments,
+                        "nothing staged to commit — stage changes with git_add first",
+                    );
+                }
+                Err(e) => {
+                    return ToolResult::err_code(ErrorCode::ExecutionFailed, format!("git: {e}"));
+                }
+            }
+            match git::commit(&repo, message.trim()) {
+                Ok(oid) => ToolResult::ok(format!(
+                    "committed {}: {}",
+                    oid.to_string().chars().take(7).collect::<String>(),
+                    message.trim()
+                )),
+                Err(e) => {
+                    ToolResult::err_code(ErrorCode::ExecutionFailed, format!("git commit: {e}"))
+                }
+            }
+        }
+        Tool::GitBranches => {
+            let repo = match git_repo(root) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            let branches = match git::branches(&repo) {
+                Ok(b) => b,
+                Err(e) => {
+                    return ToolResult::err_code(
+                        ErrorCode::ExecutionFailed,
+                        format!("git branch: {e}"),
+                    );
+                }
+            };
+            if branches.is_empty() {
+                return ToolResult::ok("no branches".to_string());
+            }
+            let mut out = format!("[{} branches]\n", branches.len());
+            for b in branches {
+                let marker = if b.is_current { "*" } else { " " };
+                out.push_str(&format!("{marker} {}\n", b.name));
+            }
+            ToolResult::ok(out)
+        }
+        Tool::GitCreateBranch { name } => {
+            let repo = match git_repo(root) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            if name.trim().is_empty() {
+                return ToolResult::err_code(ErrorCode::InvalidArguments, "branch name is empty");
+            }
+            match git::create_branch(&repo, name.trim()) {
+                Ok(()) => ToolResult::ok(format!("created branch {name}")),
+                Err(e) => {
+                    ToolResult::err_code(ErrorCode::ExecutionFailed, format!("git branch: {e}"))
+                }
+            }
+        }
+        Tool::GitCheckout { branch } => {
+            let repo = match git_repo(root) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            match git::checkout(&repo, branch) {
+                Ok(()) => ToolResult::ok(format!("switched to branch {branch}")),
+                Err(e) => {
+                    ToolResult::err_code(ErrorCode::ExecutionFailed, format!("git checkout: {e}"))
+                }
+            }
+        }
+        Tool::GitCommitDiff { commit } => {
+            let repo = match git_repo(root) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            match git::commit_diff(&repo, commit) {
+                Ok(patch) if !patch.is_empty() => ToolResult::ok(patch),
+                Ok(_) => ToolResult::ok("commit has no diff".to_string()),
+                Err(e) => ToolResult::err_code(
+                    ErrorCode::ExecutionFailed,
+                    format!("git diff {commit}: {e}"),
+                ),
+            }
+        }
+        Tool::GitShow { commit } => {
+            let repo = match git_repo(root) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            match git::show(&repo, commit) {
+                Ok(text) => ToolResult::ok(text),
+                Err(e) => ToolResult::err_code(
+                    ErrorCode::ExecutionFailed,
+                    format!("git show {commit}: {e}"),
+                ),
+            }
         }
         // Handled above, before the project-root check.
         Tool::DescribeTool { .. } | Tool::ListTools => unreachable!(),
@@ -1966,7 +2605,10 @@ mod tests {
             patch: String::new(),
         })
         .is_some());
-        assert!(needs_approval(&Tool::DeleteFile { path: "a.ts".into() }).is_some());
+        assert!(needs_approval(&Tool::DeleteFile {
+            path: "a.ts".into()
+        })
+        .is_some());
         assert!(needs_approval(&Tool::MoveFile {
             from: "a".into(),
             to: "b".into()
@@ -1993,13 +2635,17 @@ mod tests {
             to: "secrets.txt".into(),
         };
         assert_eq!(tool_paths(&t), vec!["notes.txt", "secrets.txt"]);
-        assert!(tool_paths(&t).iter().any(|p| is_sensitive_path(Path::new(p))));
+        assert!(tool_paths(&t)
+            .iter()
+            .any(|p| is_sensitive_path(Path::new(p))));
 
         let t = Tool::MoveFile {
             from: ".env".into(),
             to: "notes.txt".into(),
         };
-        assert!(tool_paths(&t).iter().any(|p| is_sensitive_path(Path::new(p))));
+        assert!(tool_paths(&t)
+            .iter()
+            .any(|p| is_sensitive_path(Path::new(p))));
     }
 
     #[test]
@@ -2170,8 +2816,7 @@ mod tests {
             },
             Some(&dir),
             None,
-        )
-        ;
+        );
 
         let r = execute(
             &Tool::EditFile {
@@ -2216,8 +2861,7 @@ mod tests {
             },
             Some(&dir),
             None,
-        )
-        ;
+        );
         let r = execute(
             &Tool::EditFile {
                 path: "b.txt".into(),
@@ -2270,8 +2914,7 @@ mod tests {
             },
             Some(&dir),
             None,
-        )
-        ;
+        );
 
         // The second edit targets a string that does not exist — the batch
         // fails and the file must be exactly as it was (not half-edited).
@@ -2305,7 +2948,10 @@ mod tests {
             None,
         );
         let out = read.output.unwrap();
-        assert!(out.contains("two") && !out.contains("TWO"), "batch not atomic: {out}");
+        assert!(
+            out.contains("two") && !out.contains("TWO"),
+            "batch not atomic: {out}"
+        );
 
         // A valid sequential batch applies in order.
         let r = execute(
@@ -2364,8 +3010,7 @@ mod tests {
             },
             Some(&dir),
             None,
-        )
-        ;
+        );
 
         // A clean patch with headers and context.
         let patch =
@@ -2449,8 +3094,7 @@ mod tests {
             },
             Some(&dir),
             None,
-        )
-        ;
+        );
 
         // create_directory, parents included.
         let r = execute(
@@ -2483,8 +3127,7 @@ mod tests {
             },
             Some(&dir),
             None,
-        )
-        ;
+        );
         let r = execute(
             &Tool::MoveFile {
                 from: "x/y/b.txt".into(),
@@ -2541,8 +3184,7 @@ mod tests {
                 },
                 Some(&dir),
                 None,
-            )
-            ;
+            );
         }
 
         let r = execute(
@@ -2725,10 +3367,7 @@ mod tests {
             new_string: String::new(),
             replace_all: None,
         });
-        assert_eq!(
-            g,
-            Some((GrantScope::Editing, Some("src/deep".to_string())))
-        );
+        assert_eq!(g, Some((GrantScope::Editing, Some("src/deep".to_string()))));
         assert_eq!(
             grantable(&Tool::RunCommand {
                 command: "npm test".into()
@@ -2792,7 +3431,40 @@ mod tests {
                 command: "true".into(),
             },
             Tool::ListDirectory { path: ".".into() },
+            Tool::Grep {
+                pattern: "foo".into(),
+                path: None,
+                case_sensitive: None,
+            },
+            Tool::Glob {
+                pattern: "*.rs".into(),
+                path: None,
+            },
             Tool::GitStatus,
+            Tool::GitDiff { path: None },
+            Tool::GitLog { limit: None },
+            Tool::GitAdd {
+                path: "a.ts".into(),
+            },
+            Tool::GitUnstage {
+                path: "a.ts".into(),
+            },
+            Tool::GitCommit {
+                message: "wip".into(),
+            },
+            Tool::GitBranches,
+            Tool::GitCreateBranch {
+                name: "feat/x".into(),
+            },
+            Tool::GitCheckout {
+                branch: "main".into(),
+            },
+            Tool::GitCommitDiff {
+                commit: "abc123".into(),
+            },
+            Tool::GitShow {
+                commit: "abc123".into(),
+            },
             Tool::DescribeTool {
                 name: "read_file".into(),
             },
@@ -2813,7 +3485,19 @@ mod tests {
                 | Tool::ReadManyFiles { .. }
                 | Tool::RunCommand { .. }
                 | Tool::ListDirectory { .. }
+                | Tool::Grep { .. }
+                | Tool::Glob { .. }
                 | Tool::GitStatus
+                | Tool::GitDiff { .. }
+                | Tool::GitLog { .. }
+                | Tool::GitAdd { .. }
+                | Tool::GitUnstage { .. }
+                | Tool::GitCommit { .. }
+                | Tool::GitBranches
+                | Tool::GitCreateBranch { .. }
+                | Tool::GitCheckout { .. }
+                | Tool::GitCommitDiff { .. }
+                | Tool::GitShow { .. }
                 | Tool::DescribeTool { .. }
                 | Tool::ListTools => {}
             }
@@ -2883,7 +3567,7 @@ mod tests {
 
         let r = execute(
             &Tool::DescribeTool {
-                name: "grep".into(), // not implemented yet
+                name: "web_fetch".into(), // on the roadmap, not yet implemented
             },
             None,
             None,
@@ -2932,6 +3616,88 @@ mod tests {
         );
     }
 
+    // ── Phase 2 search: sensitive-path filtering is the whole point ──
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "lexsus-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn grep_filters_sensitive_files_and_prunes_vendored_dirs() {
+        let root = scratch_dir("grep");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        std::fs::write(root.join("src/a.txt"), "the secret is on the wire\n").unwrap();
+        std::fs::write(root.join(".env"), "DATABASE_SECRET=hidden\n").unwrap();
+        std::fs::write(root.join("node_modules/dep.txt"), "the secret too\n").unwrap();
+
+        let out = execute(
+            &Tool::Grep {
+                pattern: "secret".into(),
+                path: None,
+                case_sensitive: Some(true),
+            },
+            Some(&root),
+            None,
+        );
+        assert!(out.ok, "{:?}", out.error);
+        let text = out.output.unwrap();
+        // Found in the normal source file…
+        assert!(
+            text.contains("src/a.txt:1"),
+            "missing match in a.txt:\n{text}"
+        );
+        // …but NOT in the sensitive `.env`, nor in pruned node_modules.
+        assert!(!text.contains(".env"), "leaked sensitive path:\n{text}");
+        assert!(
+            !text.contains("node_modules"),
+            "scanned vendored dir:\n{text}"
+        );
+    }
+
+    #[test]
+    fn glob_filters_sensitive_files() {
+        let root = scratch_dir("glob");
+        std::fs::write(root.join("a.txt"), "x").unwrap();
+        std::fs::write(root.join(".env"), "x").unwrap();
+        let out = execute(
+            &Tool::Glob {
+                pattern: "*.env".into(),
+                path: None,
+            },
+            Some(&root),
+            None,
+        );
+        assert!(out.ok, "{:?}", out.error);
+        let text = out.output.unwrap();
+        // The pattern itself may echo in the header; assert no *match line*.
+        assert!(
+            !text.lines().any(|l| l.trim() == ".env"),
+            "glob surfaced a sensitive path:\n{text}"
+        );
+        assert!(text.contains("no files"), "expected no files, got:\n{text}");
+
+        let out = execute(
+            &Tool::Glob {
+                pattern: "*.txt".into(),
+                path: None,
+            },
+            Some(&root),
+            None,
+        );
+        assert!(out.ok, "{:?}", out.error);
+        assert!(out.output.unwrap().contains("a.txt"));
+    }
+
     #[test]
     fn manifest_and_describe_are_not_call_syntax() {
         // `list_tools` and `describe_tool` auto-insert into the chat, so the AI
@@ -2967,7 +3733,9 @@ mod tests {
 
     #[test]
     fn large_file_pages_and_names_the_next_call() {
-        let text = (1..=1000).map(|i| format!("line {i}\n")).collect::<String>();
+        let text = (1..=1000)
+            .map(|i| format!("line {i}\n"))
+            .collect::<String>();
 
         let first = chunk_text("big.txt", &text, None, None);
         assert!(first.starts_with("   1| line 1\n"), "{first:.40}");

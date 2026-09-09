@@ -189,7 +189,24 @@ fn tool_meta(tool: &crate::bridge::Tool) -> serde_json::Value {
         Tool::RunCommand { command } => {
             meta["command"] = json!(command);
         }
-        Tool::GitStatus | Tool::DescribeTool { .. } | Tool::ListTools => {}
+        Tool::Grep { path: Some(p), .. } | Tool::Glob { path: Some(p), .. } => {
+            meta["path"] = json!(p);
+        }
+        Tool::Grep { .. }
+        | Tool::Glob { .. }
+        | Tool::GitStatus
+        | Tool::GitDiff { .. }
+        | Tool::GitLog { .. }
+        | Tool::GitAdd { .. }
+        | Tool::GitUnstage { .. }
+        | Tool::GitCommit { .. }
+        | Tool::GitBranches
+        | Tool::GitCreateBranch { .. }
+        | Tool::GitCheckout { .. }
+        | Tool::GitCommitDiff { .. }
+        | Tool::GitShow { .. }
+        | Tool::DescribeTool { .. }
+        | Tool::ListTools => {}
     }
     if let Some(detail) = crate::bridge::detail(tool) {
         meta["detail"] = json!(detail);
@@ -269,13 +286,13 @@ fn parse_tool_call_v2(
                 .ok_or("an edit is missing 'new_string'")?
                 .to_string();
             let replace_all = item["replace_all"].as_bool().or_else(|| {
-                item["replace_all"]
-                    .as_str()
-                    .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+                item["replace_all"].as_str().and_then(|s| {
+                    match s.trim().to_ascii_lowercase().as_str() {
                         "true" | "1" | "yes" => Some(true),
                         "false" | "0" | "no" => Some(false),
                         _ => None,
-                    })
+                    }
+                })
             });
             edits.push(crate::bridge::Edit {
                 old_string,
@@ -333,7 +350,44 @@ fn parse_tool_call_v2(
         "list_directory" => Ok(crate::bridge::Tool::ListDirectory {
             path: str_arg("path")?,
         }),
+        "grep" => Ok(crate::bridge::Tool::Grep {
+            pattern: str_arg_any(&["pattern", "regex", "query", "text"])?,
+            path: args["path"].as_str().map(str::to_string),
+            case_sensitive: bool_arg("case_sensitive"),
+        }),
+        "glob" => Ok(crate::bridge::Tool::Glob {
+            pattern: str_arg_any(&["pattern", "glob", "path"])?,
+            path: args["path"].as_str().map(str::to_string),
+        }),
         "git_status" => Ok(crate::bridge::Tool::GitStatus),
+        "git_diff" => Ok(crate::bridge::Tool::GitDiff {
+            path: args["path"].as_str().map(str::to_string),
+        }),
+        "git_log" => Ok(crate::bridge::Tool::GitLog {
+            limit: u32_arg("limit"),
+        }),
+        "git_add" => Ok(crate::bridge::Tool::GitAdd {
+            path: str_arg_any(&["path", "file"])?,
+        }),
+        "git_unstage" => Ok(crate::bridge::Tool::GitUnstage {
+            path: str_arg_any(&["path", "file"])?,
+        }),
+        "git_commit" => Ok(crate::bridge::Tool::GitCommit {
+            message: str_arg_any(&["message", "msg"])?,
+        }),
+        "git_branches" => Ok(crate::bridge::Tool::GitBranches),
+        "git_create_branch" => Ok(crate::bridge::Tool::GitCreateBranch {
+            name: str_arg_any(&["name", "branch"])?,
+        }),
+        "git_checkout" => Ok(crate::bridge::Tool::GitCheckout {
+            branch: str_arg_any(&["branch", "name"])?,
+        }),
+        "git_commit_diff" => Ok(crate::bridge::Tool::GitCommitDiff {
+            commit: str_arg_any(&["commit", "oid"])?,
+        }),
+        "git_show" => Ok(crate::bridge::Tool::GitShow {
+            commit: str_arg_any(&["commit", "oid"])?,
+        }),
         "describe_tool" => Ok(crate::bridge::Tool::DescribeTool {
             name: str_arg("name")?,
         }),
@@ -342,6 +396,7 @@ fn parse_tool_call_v2(
     }
 }
 
+#[allow(clippy::result_large_err)] // the tungstenite handshake Result; not worth boxing
 fn handle_conn(app: AppHandle, stream: std::net::TcpStream) {
     stream
         .set_read_timeout(Some(Duration::from_millis(100)))
@@ -349,21 +404,18 @@ fn handle_conn(app: AppHandle, stream: std::net::TcpStream) {
     // accept_hdr lives at the crate root (tungstenite re-exports it from the
     // private `server` module), while the Request/Response types come from
     // `handshake::server` — hence the two different paths below.
-    let ws = match tungstenite::accept_hdr(
-        stream,
-        |req: &Request, resp: Response| {
-            if origin_allowed(req) {
-                Ok(resp)
-            } else {
-                eprintln!("[ws] handshake rejected: origin not allowed");
-                // A statically-valid 403 can't fail to build; unwrap is safe.
-                Err(tungstenite::http::Response::builder()
-                    .status(403)
-                    .body(Some("origin not allowed".into()))
-                    .unwrap())
-            }
-        },
-    ) {
+    let ws = match tungstenite::accept_hdr(stream, |req: &Request, resp: Response| {
+        if origin_allowed(req) {
+            Ok(resp)
+        } else {
+            eprintln!("[ws] handshake rejected: origin not allowed");
+            // A statically-valid 403 can't fail to build; unwrap is safe.
+            Err(tungstenite::http::Response::builder()
+                .status(403)
+                .body(Some("origin not allowed".into()))
+                .unwrap())
+        }
+    }) {
         Ok(ws) => ws,
         Err(e) => {
             eprintln!("[ws] handshake failed: {e}");
@@ -459,8 +511,7 @@ fn handle_conn(app: AppHandle, stream: std::net::TcpStream) {
                     // determined brute force outright.
                     let fails = PAIR_FAILURES.fetch_add(1, Ordering::SeqCst) + 1;
                     if fails >= MAX_PAIR_FAILURES {
-                        *PAIR_LOCKED_UNTIL.lock().unwrap() =
-                            Some(Instant::now() + PAIR_LOCKOUT);
+                        *PAIR_LOCKED_UNTIL.lock().unwrap() = Some(Instant::now() + PAIR_LOCKOUT);
                         PAIR_FAILURES.store(0, Ordering::SeqCst);
                         eprintln!("[ws] pairing locked for {PAIR_LOCKOUT:?} after {fails} failed attempts");
                     }

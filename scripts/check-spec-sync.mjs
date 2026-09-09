@@ -4,10 +4,14 @@
 //
 //   node scripts/check-spec-sync.mjs
 import { readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+import { resolve } from "node:path";
 
 const ROOT = process.argv[2] || ".";
 const rust = readFileSync(`${ROOT}/src-tauri/src/bridge.rs`, "utf8");
-await import(`${process.cwd()}/${ROOT}/extension/tool-spec.js`);
+// Dynamic import of a path with no file extension needs a file:// URL; a raw
+// absolute path only loads on POSIX. Both platforms load via pathToFileURL.
+await import(pathToFileURL(resolve(`${ROOT}/extension/tool-spec.js`)).href);
 const S = globalThis.ACBToolSpec;
 
 const APPROVAL = {
