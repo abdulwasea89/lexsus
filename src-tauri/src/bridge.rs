@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 /// One replacement inside a `multi_edit` batch.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Edit {
     pub old_string: String,
     pub new_string: String,
@@ -25,7 +25,7 @@ pub struct Edit {
 }
 
 /// A web-AI tool call (serde: externally-tagged, mirrors `types.ts`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Tool {
     ReadFile {
         path: String,
@@ -411,6 +411,303 @@ fn describe_spec(s: &ToolSpec) -> String {
         out.push_str(&format!("  Also accepted as: {}\n", s.aliases.join(", ")));
     }
     out
+}
+
+/// Parse a wire tool call into a [`Tool`]. The name is resolved through the
+/// spec table's aliases first, because a web AI (or MCP connector) emits
+/// whatever name it happens to remember (`Read`, `bash`,
+/// `default_api.read_file`). Coercions are permissive on purpose: line
+/// offsets arrive as JSON numbers from our own parser but as quoted strings
+/// from a model writing raw JSON, and a single path often stands in where a
+/// `paths` array belongs.
+///
+/// This is the shared entry point for every transport — the extension loopback
+/// (via `ws.rs`), and later the MCP connector — so all paths parse a given
+/// tool call identically.
+pub fn parse_tool_call(tool_name: &str, args: &serde_json::Value) -> Result<Tool, String> {
+    let spec = spec_by_name(tool_name).ok_or_else(|| format!("unknown tool: {tool_name}"))?;
+    let str_arg = |key: &str| -> Result<String, String> {
+        args[key]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| format!("missing '{key}' argument"))
+    };
+    // First present key wins — a model guesses argument names the way it
+    // guesses tool names (`from`/`src`, `old_string`/`old_str`/`find`).
+    let str_arg_any = |keys: &[&str]| -> Result<String, String> {
+        for k in keys {
+            if let Some(s) = args[*k].as_str() {
+                return Ok(s.to_string());
+            }
+        }
+        Err(format!("missing '{}' argument", keys[0]))
+    };
+    // Line numbers arrive as a JSON number from our own parser, but a web AI
+    // writing raw JSON often quotes them.
+    let u32_arg = |key: &str| -> Option<u32> {
+        args[key]
+            .as_u64()
+            .or_else(|| args[key].as_str().and_then(|s| s.trim().parse().ok()))
+            .map(|n| n.min(u32::MAX as u64) as u32)
+    };
+    // Bools get the same quoting treatment as offsets.
+    let bool_arg = |key: &str| -> Option<bool> {
+        args[key].as_bool().or_else(|| {
+            args[key]
+                .as_str()
+                .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+                    "true" | "1" | "yes" => Some(true),
+                    "false" | "0" | "no" => Some(false),
+                    _ => None,
+                })
+        })
+    };
+    // A model will send one path where an array belongs.
+    let string_array_arg = |key: &str| -> Option<Vec<String>> {
+        match args.get(key)? {
+            serde_json::Value::Array(items) => items
+                .iter()
+                .map(|v| v.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>(),
+            serde_json::Value::String(s) => Some(vec![s.clone()]),
+            _ => None,
+        }
+    };
+    let edits_arg = |key: &str| -> Result<Vec<Edit>, String> {
+        let items = match args.get(key) {
+            Some(serde_json::Value::Array(items)) => items.clone(),
+            _ => return Err(format!("missing '{key}' argument")),
+        };
+        let mut edits = Vec::with_capacity(items.len());
+        for item in &items {
+            let old_string = item["old_string"]
+                .as_str()
+                .ok_or("an edit is missing 'old_string'")?
+                .to_string();
+            let new_string = item["new_string"]
+                .as_str()
+                .ok_or("an edit is missing 'new_string'")?
+                .to_string();
+            let replace_all = item["replace_all"].as_bool().or_else(|| {
+                item["replace_all"].as_str().and_then(|s| {
+                    match s.trim().to_ascii_lowercase().as_str() {
+                        "true" | "1" | "yes" => Some(true),
+                        "false" | "0" | "no" => Some(false),
+                        _ => None,
+                    }
+                })
+            });
+            edits.push(Edit {
+                old_string,
+                new_string,
+                replace_all,
+            });
+        }
+        Ok(edits)
+    };
+    match spec.name {
+        "read_file" => Ok(Tool::ReadFile {
+            path: str_arg("path")?,
+            offset: u32_arg("offset"),
+            limit: u32_arg("limit"),
+        }),
+        "write_file" => Ok(Tool::WriteFile {
+            path: str_arg("path")?,
+            content: str_arg("content")?,
+        }),
+        "edit_file" => Ok(Tool::EditFile {
+            path: str_arg_any(&["path", "file"])?,
+            old_string: str_arg_any(&["old_string", "old_str", "find"])?,
+            new_string: str_arg_any(&["new_string", "new_str", "replace", "replace_with"])?,
+            replace_all: bool_arg("replace_all"),
+        }),
+        "multi_edit" => Ok(Tool::MultiEdit {
+            path: str_arg("path")?,
+            edits: edits_arg("edits")?,
+        }),
+        "apply_patch" => Ok(Tool::ApplyPatch {
+            path: str_arg("path")?,
+            patch: str_arg("patch")?,
+        }),
+        "delete_file" => Ok(Tool::DeleteFile {
+            path: str_arg("path")?,
+        }),
+        "move_file" => Ok(Tool::MoveFile {
+            from: str_arg_any(&["from", "src", "source"])?,
+            to: str_arg_any(&["to", "dest", "destination"])?,
+        }),
+        "copy_file" => Ok(Tool::CopyFile {
+            from: str_arg_any(&["from", "src", "source"])?,
+            to: str_arg_any(&["to", "dest", "destination"])?,
+        }),
+        "create_directory" => Ok(Tool::CreateDirectory {
+            path: str_arg("path")?,
+        }),
+        "read_many_files" => Ok(Tool::ReadManyFiles {
+            paths: string_array_arg("paths")
+                .ok_or_else(|| "missing 'paths' argument".to_string())?,
+        }),
+        "run_command" => Ok(Tool::RunCommand {
+            command: str_arg("command")?,
+        }),
+        "list_directory" => Ok(Tool::ListDirectory {
+            path: str_arg("path")?,
+        }),
+        "git_status" => Ok(Tool::GitStatus),
+        "describe_tool" => Ok(Tool::DescribeTool {
+            name: str_arg("name")?,
+        }),
+        "list_tools" => Ok(Tool::ListTools),
+        other => Err(format!("tool not implemented: {other}")),
+    }
+}
+
+/// JSON Schema (object form) for one tool's arguments — the source for the
+/// MCP connector's `tools/list` `inputSchema`. Only the *canonical* argument
+/// names appear: the parser still tolerates aliases on the wire, but a
+/// connector should advertise the primary names so model output stays
+/// predictable. Mirrors [`parse_tool_call`]; the drift-guard tests below
+/// keep the two honest to each other. Returns `None` for an unknown tool.
+pub fn tool_input_schema(tool_name: &str) -> Option<serde_json::Value> {
+    let spec = spec_by_name(tool_name)?;
+    let schema = match spec.name {
+        "read_file" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File to read, relative to the workspace" },
+                "offset": { "type": "integer", "minimum": 1, "description": "1-based first line (default 1)" },
+                "limit": { "type": "integer", "minimum": 1, "description": "Max lines (default CHUNK_LINES)" }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        "list_directory" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Directory to list, relative to the workspace" }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        "write_file" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File to overwrite" },
+                "content": { "type": "string", "description": "Full new contents" }
+            },
+            "required": ["path", "content"],
+            "additionalProperties": false
+        }),
+        "edit_file" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File to edit" },
+                "old_string": { "type": "string", "description": "Exact text to replace" },
+                "new_string": { "type": "string", "description": "Replacement text" },
+                "replace_all": { "type": "boolean", "description": "Replace every occurrence (default false)" }
+            },
+            "required": ["path", "old_string", "new_string"],
+            "additionalProperties": false
+        }),
+        "multi_edit" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File to edit" },
+                "edits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": { "type": "string" },
+                            "new_string": { "type": "string" },
+                            "replace_all": { "type": "boolean" }
+                        },
+                        "required": ["old_string", "new_string"],
+                        "additionalProperties": false
+                    },
+                    "description": "Exact-string edits, applied atomically together"
+                }
+            },
+            "required": ["path", "edits"],
+            "additionalProperties": false
+        }),
+        "apply_patch" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File the patch applies to" },
+                "patch": { "type": "string", "description": "Single-file unified diff with context lines" }
+            },
+            "required": ["path", "patch"],
+            "additionalProperties": false
+        }),
+        "delete_file" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File to delete (not directories)" }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        "move_file" | "copy_file" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "from": { "type": "string", "description": "Source path" },
+                "to": { "type": "string", "description": "Destination path" }
+            },
+            "required": ["from", "to"],
+            "additionalProperties": false
+        }),
+        "create_directory" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Directory to create, including parents" }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        "read_many_files" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Files to read; a single path string is also accepted"
+                }
+            },
+            "required": ["paths"],
+            "additionalProperties": false
+        }),
+        "run_command" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string", "description": "Shell command, run in the project root" }
+            },
+            "required": ["command"],
+            "additionalProperties": false
+        }),
+        "git_status" => serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+        "describe_tool" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Tool whose full argument schema to show" }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        }),
+        "list_tools" => serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+        _ => return None,
+    };
+    Some(schema)
 }
 
 /// Filesystem paths a call touches, for the sensitive-path policy. Tools
@@ -3016,5 +3313,170 @@ mod tests {
         assert!(out.contains("  14| line 14\n"));
         assert!(!out.contains("line 15"));
         assert!(out.contains(r#"read_file("a.txt", 15)"#));
+    }
+
+    // ── parse_tool_call / tool_input_schema drift guards ────────────────
+    // The MCP connector advertises `tool_input_schema` and feeds MCP args
+    // through `parse_tool_call`. These tests pin the two together: every
+    // SPECS tool has a schema, schemas only exist for SPECS tools, and a
+    // canonical args object shaped exactly like the schema actually parses —
+    // so a name/type mismatch between schema and parser cannot slip through.
+
+    /// A schema-shaped, valid args object per canonical tool. No aliases —
+    /// only the canonical keys the schema advertises.
+    fn sample_args(name: &str) -> serde_json::Value {
+        match name {
+            "read_file" => serde_json::json!({"path": "a.txt", "offset": 1, "limit": 5}),
+            "list_directory" => serde_json::json!({"path": "."}),
+            "write_file" => serde_json::json!({"path": "a.txt", "content": "x"}),
+            "edit_file" => {
+                serde_json::json!({"path": "a.txt", "old_string": "a", "new_string": "b"})
+            }
+            "multi_edit" => serde_json::json!({
+                "path": "a.txt",
+                "edits": [{"old_string": "a", "new_string": "b"}]
+            }),
+            "apply_patch" => serde_json::json!({"path": "a.txt", "patch": "@@ -1 +1 @@\n-a\n+b"}),
+            "delete_file" => serde_json::json!({"path": "a.txt"}),
+            "move_file" => serde_json::json!({"from": "a", "to": "b"}),
+            "copy_file" => serde_json::json!({"from": "a", "to": "b"}),
+            "create_directory" => serde_json::json!({"path": "d"}),
+            "read_many_files" => serde_json::json!({"paths": ["a.txt", "b.txt"]}),
+            "run_command" => serde_json::json!({"command": "echo hi"}),
+            "git_status" => serde_json::json!({}),
+            "describe_tool" => serde_json::json!({"name": "read_file"}),
+            "list_tools" => serde_json::json!({}),
+            other => panic!("sample_args missing tool: {other}"),
+        }
+    }
+
+    #[test]
+    fn every_spec_row_has_a_schema_and_schema_advertises_only_spec_tools() {
+        for spec in SPECS {
+            let s = tool_input_schema(spec.name)
+                .unwrap_or_else(|| panic!("no schema for tool {}", spec.name));
+            assert_eq!(s["type"], "object", "{}", spec.name);
+            let props = s["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("schema for {} lacks properties", spec.name));
+            let required = s["required"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|v| v.as_str().expect("required entries are strings"))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for r in &required {
+                assert!(
+                    props.contains_key(*r),
+                    "{}: required '{r}' not in properties",
+                    spec.name
+                );
+            }
+        }
+        // Unknown / unmapped names resolve to no schema (guards against a
+        // stray arm naming a tool outside SPECS).
+        for unknown in ["nope", "read_fil", "readfile", "definitely_not_a_tool"] {
+            assert!(tool_input_schema(unknown).is_none(), "{unknown}");
+        }
+    }
+
+    #[test]
+    fn alias_lookup_resolves_to_canonical_schema() {
+        // spec_by_name resolves aliases; the schema must land on the same
+        // canonical row whether asked by alias or canonical name.
+        for alias in ["Read", "view_file", "cat", "default_api.read_file"] {
+            assert_eq!(
+                tool_input_schema(alias),
+                tool_input_schema("read_file"),
+                "alias {alias} should map to read_file's schema"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_shaped_args_parse_to_the_same_tool() {
+        for spec in SPECS {
+            let args = sample_args(spec.name);
+            let tool =
+                parse_tool_call(spec.name, &args).unwrap_or_else(|e| panic!("{}: {e}", spec.name));
+            assert_eq!(
+                tool_name(&tool),
+                spec.name,
+                "schema-shaped args for {} parsed to the wrong tool",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_schema_required_arg_is_truly_required_by_the_parser() {
+        for spec in SPECS {
+            let s = tool_input_schema(spec.name).expect("schema");
+            let required: Vec<&str> = s["required"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            for key in required {
+                let mut args = sample_args(spec.name);
+                args.as_object_mut().unwrap().remove(key);
+                let err = parse_tool_call(spec.name, &args)
+                    .expect_err(&format!("{} should require '{key}'", spec.name));
+                assert!(
+                    err.contains(&format!("missing '{key}'")) || err.contains("missing"),
+                    "{} without '{key}': unexpected error: {err}",
+                    spec.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parser_coercions_survive_the_lift() {
+        // Behaviour guarantees that Path A (extension over ws.rs) has always
+        // relied on and that MCP args must share.
+        // Single string stands in for a paths array.
+        let t = parse_tool_call("read_many_files", &serde_json::json!({"paths": "a.txt"}))
+            .expect("single-string paths");
+        assert_eq!(
+            t,
+            Tool::ReadManyFiles {
+                paths: vec!["a.txt".into()]
+            }
+        );
+        // Quoted numbers coerce for offsets.
+        let t = parse_tool_call(
+            "read_file",
+            &serde_json::json!({"path": "a", "offset": "12"}),
+        )
+        .expect("quoted offset");
+        assert_eq!(
+            t,
+            Tool::ReadFile {
+                path: "a".into(),
+                offset: Some(12),
+                limit: None
+            }
+        );
+        // Alias argument names are tolerated.
+        let t = parse_tool_call(
+            "edit_file",
+            &serde_json::json!({
+                "file": "a.txt", "find": "x", "replace": "y"
+            }),
+        )
+        .expect("alias arg names");
+        assert_eq!(
+            t,
+            Tool::EditFile {
+                path: "a.txt".into(),
+                old_string: "x".into(),
+                new_string: "y".into(),
+                replace_all: None
+            }
+        );
+        // Unknown tool name errors, matching the old ws.rs behaviour.
+        assert!(parse_tool_call("no_such_tool", &serde_json::json!({})).is_err());
     }
 }
