@@ -269,13 +269,13 @@ fn parse_tool_call_v2(
                 .ok_or("an edit is missing 'new_string'")?
                 .to_string();
             let replace_all = item["replace_all"].as_bool().or_else(|| {
-                item["replace_all"]
-                    .as_str()
-                    .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+                item["replace_all"].as_str().and_then(|s| {
+                    match s.trim().to_ascii_lowercase().as_str() {
                         "true" | "1" | "yes" => Some(true),
                         "false" | "0" | "no" => Some(false),
                         _ => None,
-                    })
+                    }
+                })
             });
             edits.push(crate::bridge::Edit {
                 old_string,
@@ -342,6 +342,12 @@ fn parse_tool_call_v2(
     }
 }
 
+// The `accept_hdr` callback must return Result<Response, ErrorResponse> where
+// ErrorResponse is tungstenite's fixed `HttpResponse<Option<String>>` (pinned by
+// its `Callback` trait, not by this code), so clippy's result_large_err can't be
+// satisfied by shrinking the type. The rejection response is only built on the
+// cold origin-deny path, so an allow is the honest fix here.
+#[allow(clippy::result_large_err)]
 fn handle_conn(app: AppHandle, stream: std::net::TcpStream) {
     stream
         .set_read_timeout(Some(Duration::from_millis(100)))
@@ -349,21 +355,18 @@ fn handle_conn(app: AppHandle, stream: std::net::TcpStream) {
     // accept_hdr lives at the crate root (tungstenite re-exports it from the
     // private `server` module), while the Request/Response types come from
     // `handshake::server` — hence the two different paths below.
-    let ws = match tungstenite::accept_hdr(
-        stream,
-        |req: &Request, resp: Response| {
-            if origin_allowed(req) {
-                Ok(resp)
-            } else {
-                eprintln!("[ws] handshake rejected: origin not allowed");
-                // A statically-valid 403 can't fail to build; unwrap is safe.
-                Err(tungstenite::http::Response::builder()
-                    .status(403)
-                    .body(Some("origin not allowed".into()))
-                    .unwrap())
-            }
-        },
-    ) {
+    let ws = match tungstenite::accept_hdr(stream, |req: &Request, resp: Response| {
+        if origin_allowed(req) {
+            Ok(resp)
+        } else {
+            eprintln!("[ws] handshake rejected: origin not allowed");
+            // A statically-valid 403 can't fail to build; unwrap is safe.
+            Err(tungstenite::http::Response::builder()
+                .status(403)
+                .body(Some("origin not allowed".into()))
+                .unwrap())
+        }
+    }) {
         Ok(ws) => ws,
         Err(e) => {
             eprintln!("[ws] handshake failed: {e}");
@@ -459,8 +462,7 @@ fn handle_conn(app: AppHandle, stream: std::net::TcpStream) {
                     // determined brute force outright.
                     let fails = PAIR_FAILURES.fetch_add(1, Ordering::SeqCst) + 1;
                     if fails >= MAX_PAIR_FAILURES {
-                        *PAIR_LOCKED_UNTIL.lock().unwrap() =
-                            Some(Instant::now() + PAIR_LOCKOUT);
+                        *PAIR_LOCKED_UNTIL.lock().unwrap() = Some(Instant::now() + PAIR_LOCKOUT);
                         PAIR_FAILURES.store(0, Ordering::SeqCst);
                         eprintln!("[ws] pairing locked for {PAIR_LOCKOUT:?} after {fails} failed attempts");
                     }

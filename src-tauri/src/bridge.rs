@@ -430,7 +430,9 @@ pub fn tool_paths(tool: &Tool) -> Vec<&str> {
         }
         // Both sides of a path pair: a secret can be laundered by copying
         // it to an innocuous name, so the target is checked too.
-        Tool::MoveFile { from, to } | Tool::CopyFile { from, to } => vec![from.as_str(), to.as_str()],
+        Tool::MoveFile { from, to } | Tool::CopyFile { from, to } => {
+            vec![from.as_str(), to.as_str()]
+        }
         // A batch's paths are filtered individually at execution; the trace
         // carries the count instead (see `detail`).
         Tool::ReadManyFiles { .. }
@@ -466,9 +468,7 @@ pub fn detail(tool: &Tool) -> Option<String> {
         Tool::MultiEdit { path, edits } => Some(format!("{path} ({} edits)", edits.len())),
         Tool::ApplyPatch { path, patch } => Some(format!("{path} ({} bytes patch)", patch.len())),
         Tool::DeleteFile { path } => Some(path.clone()),
-        Tool::MoveFile { from, to } | Tool::CopyFile { from, to } => {
-            Some(format!("{from} → {to}"))
-        }
+        Tool::MoveFile { from, to } | Tool::CopyFile { from, to } => Some(format!("{from} → {to}")),
         Tool::CreateDirectory { path } => Some(path.clone()),
         Tool::ReadManyFiles { paths } => Some(format!("{} files", paths.len())),
         Tool::RunCommand { command } => Some(command.clone()),
@@ -920,12 +920,7 @@ pub fn needs_approval(tool: &Tool) -> Option<String> {
 ///   launders a secret to a name the read gate doesn't stop at.
 /// - Every path resolves under the grant's prefix (via `resolve_path`, not
 ///   a raw `starts_with`, so a `..`-laden path can't widen the scope).
-pub fn grant_matches(
-    grant: &SessionGrant,
-    tool: &Tool,
-    source: &str,
-    root: Option<&Path>,
-) -> bool {
+pub fn grant_matches(grant: &SessionGrant, tool: &Tool, source: &str, root: Option<&Path>) -> bool {
     if grant.source != source {
         return false;
     }
@@ -1208,7 +1203,12 @@ fn read_text_file(p: &Path, rel: &str) -> Result<String, ToolResult> {
             ));
         }
         Ok(md) => md,
-        Err(e) => return Err(ToolResult::err_code(ErrorCode::FileNotFound, format!("{rel}: {e}"))),
+        Err(e) => {
+            return Err(ToolResult::err_code(
+                ErrorCode::FileNotFound,
+                format!("{rel}: {e}"),
+            ))
+        }
     };
     if md.len() > READ_CAP {
         return Err(ToolResult::err_code(
@@ -1237,7 +1237,12 @@ fn read_text_file(p: &Path, rel: &str) -> Result<String, ToolResult> {
 /// (it would match everywhere), a missing match is `StringNotFound`, and
 /// multiple matches without `replace_all` are `AmbiguousMatch` — the count
 /// is in the message so the AI can disambiguate on its next attempt.
-fn apply_str_edit(text: &str, old: &str, new: &str, replace_all: bool) -> Result<String, ToolError> {
+fn apply_str_edit(
+    text: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Result<String, ToolError> {
     if old.is_empty() {
         return Err(ToolError {
             code: ErrorCode::InvalidArguments,
@@ -1254,7 +1259,9 @@ fn apply_str_edit(text: &str, old: &str, new: &str, replace_all: bool) -> Result
         _ if replace_all => Ok(text.replace(old, new)),
         _ => Err(ToolError {
             code: ErrorCode::AmbiguousMatch,
-            message: format!("old_string matches {matches} times — extend it to be unique, or pass replace_all"),
+            message: format!(
+                "old_string matches {matches} times — extend it to be unique, or pass replace_all"
+            ),
         }),
     }
 }
@@ -1358,7 +1365,7 @@ fn apply_hunks(lines: &[String], hunks: &[Hunk]) -> Result<Vec<String>, ToolErro
     let mut consumed = 0usize; // lines of the old file already emitted/skipped
     for (i, hunk) in hunks.iter().enumerate() {
         let want = hunk.old_start.saturating_sub(1); // 0-based expected start
-        // Exact position first, then a drift search forward and backward.
+                                                     // Exact position first, then a drift search forward and backward.
         let mut found: Option<usize> = None;
         for delta in 0..=HUNK_DRIFT {
             for cand in [
@@ -1565,10 +1572,7 @@ pub fn execute(
                 }
             }
             match std::fs::write(&p, new_text.as_bytes()) {
-                Ok(()) => ToolResult::ok(format!(
-                    "applied {} edits to {path}",
-                    edits.len()
-                )),
+                Ok(()) => ToolResult::ok(format!("applied {} edits to {path}", edits.len())),
                 Err(e) => ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{path}: {e}")),
             }
         }
@@ -1595,10 +1599,7 @@ pub fn execute(
                 new_text.push('\n');
             }
             match std::fs::write(&p, new_text.as_bytes()) {
-                Ok(()) => ToolResult::ok(format!(
-                    "applied {} hunks to {path}",
-                    hunks.len()
-                )),
+                Ok(()) => ToolResult::ok(format!("applied {} hunks to {path}", hunks.len())),
                 Err(e) => ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{path}: {e}")),
             }
         }
@@ -1638,10 +1639,7 @@ pub fn execute(
             }
             if let Some(parent) = dst.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
-                    return ToolResult::err_code(
-                        ErrorCode::ExecutionFailed,
-                        format!("{to}: {e}"),
-                    );
+                    return ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{to}: {e}"));
                 }
             }
             // Overwrites the target — the approval card shows both paths.
@@ -1664,10 +1662,7 @@ pub fn execute(
             }
             if let Some(parent) = dst.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
-                    return ToolResult::err_code(
-                        ErrorCode::ExecutionFailed,
-                        format!("{to}: {e}"),
-                    );
+                    return ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{to}: {e}"));
                 }
             }
             match std::fs::copy(&src, &dst) {
@@ -1692,10 +1687,7 @@ pub fn execute(
             if paths.len() > MANY_FILES_MAX {
                 return ToolResult::err_code(
                     ErrorCode::InvalidArguments,
-                    format!(
-                        "{} paths — batch at most {MANY_FILES_MAX}",
-                        paths.len()
-                    ),
+                    format!("{} paths — batch at most {MANY_FILES_MAX}", paths.len()),
                 );
             }
             let mut out = String::new();
@@ -1743,10 +1735,7 @@ pub fn execute(
                 budget -= chunk.len();
                 shown += 1;
             }
-            out.push_str(&format!(
-                "\n[{shown} of {} files shown]\n",
-                paths.len()
-            ));
+            out.push_str(&format!("\n[{shown} of {} files shown]\n", paths.len()));
             ToolResult::ok(out)
         }
         Tool::RunCommand { command } => {
@@ -1966,7 +1955,10 @@ mod tests {
             patch: String::new(),
         })
         .is_some());
-        assert!(needs_approval(&Tool::DeleteFile { path: "a.ts".into() }).is_some());
+        assert!(needs_approval(&Tool::DeleteFile {
+            path: "a.ts".into()
+        })
+        .is_some());
         assert!(needs_approval(&Tool::MoveFile {
             from: "a".into(),
             to: "b".into()
@@ -1993,13 +1985,17 @@ mod tests {
             to: "secrets.txt".into(),
         };
         assert_eq!(tool_paths(&t), vec!["notes.txt", "secrets.txt"]);
-        assert!(tool_paths(&t).iter().any(|p| is_sensitive_path(Path::new(p))));
+        assert!(tool_paths(&t)
+            .iter()
+            .any(|p| is_sensitive_path(Path::new(p))));
 
         let t = Tool::MoveFile {
             from: ".env".into(),
             to: "notes.txt".into(),
         };
-        assert!(tool_paths(&t).iter().any(|p| is_sensitive_path(Path::new(p))));
+        assert!(tool_paths(&t)
+            .iter()
+            .any(|p| is_sensitive_path(Path::new(p))));
     }
 
     #[test]
@@ -2170,8 +2166,7 @@ mod tests {
             },
             Some(&dir),
             None,
-        )
-        ;
+        );
 
         let r = execute(
             &Tool::EditFile {
@@ -2216,8 +2211,7 @@ mod tests {
             },
             Some(&dir),
             None,
-        )
-        ;
+        );
         let r = execute(
             &Tool::EditFile {
                 path: "b.txt".into(),
@@ -2270,8 +2264,7 @@ mod tests {
             },
             Some(&dir),
             None,
-        )
-        ;
+        );
 
         // The second edit targets a string that does not exist — the batch
         // fails and the file must be exactly as it was (not half-edited).
@@ -2305,7 +2298,10 @@ mod tests {
             None,
         );
         let out = read.output.unwrap();
-        assert!(out.contains("two") && !out.contains("TWO"), "batch not atomic: {out}");
+        assert!(
+            out.contains("two") && !out.contains("TWO"),
+            "batch not atomic: {out}"
+        );
 
         // A valid sequential batch applies in order.
         let r = execute(
@@ -2364,8 +2360,7 @@ mod tests {
             },
             Some(&dir),
             None,
-        )
-        ;
+        );
 
         // A clean patch with headers and context.
         let patch =
@@ -2449,8 +2444,7 @@ mod tests {
             },
             Some(&dir),
             None,
-        )
-        ;
+        );
 
         // create_directory, parents included.
         let r = execute(
@@ -2483,8 +2477,7 @@ mod tests {
             },
             Some(&dir),
             None,
-        )
-        ;
+        );
         let r = execute(
             &Tool::MoveFile {
                 from: "x/y/b.txt".into(),
@@ -2541,8 +2534,7 @@ mod tests {
                 },
                 Some(&dir),
                 None,
-            )
-            ;
+            );
         }
 
         let r = execute(
@@ -2725,10 +2717,7 @@ mod tests {
             new_string: String::new(),
             replace_all: None,
         });
-        assert_eq!(
-            g,
-            Some((GrantScope::Editing, Some("src/deep".to_string())))
-        );
+        assert_eq!(g, Some((GrantScope::Editing, Some("src/deep".to_string()))));
         assert_eq!(
             grantable(&Tool::RunCommand {
                 command: "npm test".into()
@@ -2967,7 +2956,9 @@ mod tests {
 
     #[test]
     fn large_file_pages_and_names_the_next_call() {
-        let text = (1..=1000).map(|i| format!("line {i}\n")).collect::<String>();
+        let text = (1..=1000)
+            .map(|i| format!("line {i}\n"))
+            .collect::<String>();
 
         let first = chunk_text("big.txt", &text, None, None);
         assert!(first.starts_with("   1| line 1\n"), "{first:.40}");

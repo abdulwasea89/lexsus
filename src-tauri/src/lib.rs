@@ -275,11 +275,12 @@ pub(crate) fn command_stream(app: &AppHandle) -> impl FnMut(bridge::CommandEvent
 pub(crate) fn tool_call(app: &AppHandle, tool: bridge::Tool, source: &str) -> bridge::ToolResult {
     let state = app.state::<AppState>();
     let root = state.project_root.lock().unwrap().clone();
-    let (result, approval_id, authorized_by) = state
-        .bridge
-        .lock()
-        .unwrap()
-        .submit_with_audit(tool.clone(), source, root.as_deref());
+    let (result, approval_id, authorized_by) =
+        state
+            .bridge
+            .lock()
+            .unwrap()
+            .submit_with_audit(tool.clone(), source, root.as_deref());
     let Some(id) = approval_id else {
         // Auto-approved (or covered by a session grant): audit and trace.
         let _ = db::record_audit(
@@ -432,11 +433,11 @@ fn bridge_approve(
     }
     if allow {
         if let Some(g) = &grant {
-            state.bridge.lock().unwrap().grant_add(
-                g.scope,
-                g.path_prefix.clone(),
-                &req.source,
-            );
+            state
+                .bridge
+                .lock()
+                .unwrap()
+                .grant_add(g.scope, g.path_prefix.clone(), &req.source);
             let _ = app.emit("bridge://grants-changed", grant_state(&state));
         }
     }
@@ -455,7 +456,11 @@ fn bridge_grant_state(state: State<'_, AppState>) -> GrantState {
 
 /// Revoke one session grant by id.
 #[tauri::command]
-fn bridge_grant_revoke(state: State<'_, AppState>, app: tauri::AppHandle, id: u64) -> Result<bool, String> {
+fn bridge_grant_revoke(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    id: u64,
+) -> Result<bool, String> {
     let revoked = state.bridge.lock().unwrap().grant_revoke(id);
     let _ = app.emit("bridge://grants-changed", grant_state(&state));
     Ok(revoked)

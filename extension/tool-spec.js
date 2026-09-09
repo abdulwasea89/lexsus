@@ -184,7 +184,7 @@
       name: "read_many_files",
       variant: "ReadManyFiles",
       aliases: ["read_files", "read_many"],
-      args: [{ name: "paths", hint: "paths[]", required: true, multiline: true }],
+      args: [{ name: "paths", hint: "paths[]", required: true, multiline: true, type: "string[]" }],
       summary: "Read several files in one call, first chunk of each",
       group: "Reading",
       approval: "auto",
@@ -395,6 +395,14 @@
         if (s === "true" || s === "1" || s === "yes") return true;
         if (s === "false" || s === "0" || s === "no") return false;
       }
+      return undefined;
+    }
+    // Array-of-strings: the Rust core (`string_array_arg`) accepts a single
+    // string where an array belongs, so the JS parser must too — otherwise a
+    // call that runs fine through the core fails to parse in the extension.
+    if (arg && arg.type === "string[]") {
+      if (typeof raw === "string") return [raw];
+      if (Array.isArray(raw) && raw.every((v) => typeof v === "string")) return raw;
       return undefined;
     }
     if (Array.isArray(raw)) return raw;
