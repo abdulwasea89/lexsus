@@ -1,10 +1,14 @@
 # Product Architecture
 
-The system connects your local coding work to **web AIs** (ChatGPT, Claude.ai, Gemini). It captures real project state while you work locally, and when your local agent is interrupted, it turns a web AI into a **working coding agent** on your machine — with real read, write, and terminal access.
+Lexsus connects your local coding work to **MCP-capable web AIs** (Claude.ai first, any MCP host in general). It captures real project state while you work locally, and when your local agent is interrupted, it turns a web AI into a **working coding agent** on your machine — with real read, write, and terminal access.
 
-There are two bridges:
-- **Bridge A — Local Agent Capture:** gathers real project state for the handoff (git, filesystem watcher, web-AI tool activity). The developer's own terminal (Claude Code) is not hosted or mirrored by the app.
-- **Bridge B — Web AI Coding-Agent Bridge:** lets a web AI act on your local machine through a browser extension + local IPC tool relay. Its `run_command` output streams live into the app's single read-only terminal.
+There is one transport, and four layers behind it.
+
+- **The transport — the native MCP connector.** A desktop-local MCP server (`src-tauri/src/mcp.rs`) bound to loopback on `http://127.0.0.1:45147/mcp`. The web AI calls Lexsus tools through its **own native tool channel**; Lexsus never touches the provider's page.
+- **Bridge A — Local Agent Capture.** Gathers real project state for the handoff (git, filesystem watcher, Claude Code transcripts, web-AI tool activity). The developer's own terminal (Claude Code) is not hosted or mirrored by the app.
+- **Bridge B — Web AI Coding-Agent Bridge.** The connector above. Its `run_command` output streams live into the app's single read-only terminal.
+
+> **History.** Earlier iterations reached the browser through a Chrome MV3 extension: a loopback WebSocket on `ws://127.0.0.1:45241` with 6-digit pairing, a DOM watcher on the provider page, and composer injection. That path has been **removed entirely** (`ws.rs`, `extension/`, the `tungstenite`/`getrandom` dependencies, and the `pair_*`/`handoff_send`/`failover_deliver` commands are gone). The provider-native MCP connector replaced it: a native tool channel beats DOM scraping, which was always the highest platform risk in this project. See [protocol-v2.md](protocol-v2.md) for the wire detail.
 
 ## The Four Layers (State Capture → Delivery)
 
@@ -27,18 +31,54 @@ The archive is interpreted into structured facts — the objective, decisions, f
 
 ### 3. Context Compression
 
-The structured state is summarized by an LLM into a snapshot sized to fit a fresh web AI's context window, so a web AI can pick up the work without reading the full session history.
+The structured state is summarized by an LLM into a snapshot sized to fit a fresh web AI's context window, so a web AI can pick up the work without reading the full session history. The FastAPI service exists but `/compress` is still a stub — today's handoff is formatted from uncompressed structured facts.
 
 ### 4. Handoff Engine
 
-The compressed snapshot is formatted into a web-AI-specific handoff prompt and, via the browser extension, delivered as the opening context. The bridge then relays the web AI's tool calls (read/write/run) to the local Rust core for execution, and returns results back into the web chat.
+The compressed snapshot is formatted into a web-AI-specific handoff prompt. The connector then gives that AI real tools (read/write/run) against the local Rust core and returns results through its native tool channel.
+
+**Delivery is pull-based.** MCP gives a server no way to push a message into a chat, so the old "inject the handoff into the composer" behaviour is gone with the extension. Today the Handoff view builds the text and copies it to your clipboard (failover interruptions additionally surface in-app). A `get_handoff` connector **tool** — so the AI fetches the handoff itself — is the planned replacement and is not built yet.
 
 ## Data Flow
 
 1. You work on the project in your own terminal (e.g. Claude Code); the app watches the project folder.
-2. On interruption, you open the app and build a handoff from the objective plus git/fs-watcher/trace state (Layer 3 compresses it; the compression service remains future work).
-3. Layer 4 formats it for the chosen web AI and, via the extension, starts a session with the handoff as opening context.
+2. On interruption, you open the app and build a handoff from the objective plus git/fs-watcher/trace state (Layer 3 compresses it; the compression service remains future work) and paste it into the web AI's chat.
+3. The web AI connects to Lexsus through its native MCP connector and sees the tool surface.
 4. The web AI acts as a coding agent through local tool execution (`read_file`, `write_file`, `run_command`). Every `run_command` streams live into the app's single terminal pane; every action is recorded in the live activity trace and grounded against the real local project.
+
+## The Connector
+
+The connector is deliberately thin. Everything that makes Lexsus safe — approvals, sensitive paths, session grants, the kill switch, path containment — lives below it in `bridge.rs`, unchanged and transport-independent. Any caller, whatever its source, goes through the same policy engine.
+
+```
+      web AI (Claude.ai, or any MCP host)
+                    │  native tool channel
+                    ▼
+   ┌────────────────────────────────────────────┐
+   │ mcp.rs — rmcp Streamable HTTP              │
+   │ 127.0.0.1:45147/mcp · loopback only        │
+   │ tools/list gated by the write flag         │
+   │ tools/call → parse → tool_call("mcp")      │
+   └────────────────────────────────────────────┘
+                    │
+                    ▼
+   ┌────────────────────────────────────────────┐
+   │ bridge.rs — the policy engine              │
+   │ approvals · sensitive paths · grants ·     │
+   │ kill switch · containment · audit          │
+   └────────────────────────────────────────────┘
+                    │
+                    ▼
+            user-approved local workspace
+```
+
+**Read-only first.** `mcp_allow_write` is an in-memory flag, default off. While it is off, `tools/list` simply does not advertise the write and command tools; flipping it hides or re-exposes them at runtime with no rebuild and no reconnect. It is seeded from `LEXSUS_MCP_ALLOW_WRITE` and toggled live from the Web-AI connector view (`mcp_set_allow_write`). The `mcp_status` command reports `{listening, endpoint, allow_write, workspace}` to the UI.
+
+**Loopback, and only loopback, by default.** rmcp's DNS-rebinding guard rejects requests whose `Host` it doesn't recognise, and Lexsus accepts loopback hosts out of the box. Because a cloud-hosted provider connects from *its* infrastructure rather than your machine, reaching it requires an explicit HTTPS tunnel — and that tunnel's host must be opted in via `LEXSUS_MCP_ALLOWED_HOSTS` (comma-separated). Nothing beyond loopback is ever hardcoded.
+
+A free byproduct of binding to loopback: any local MCP host — Claude Code, Claude Desktop, the MCP Inspector — can point at the same endpoint with no tunnel at all.
+
+**The desktop is the only approval authority.** No provider exposes an approval primitive we can rely on, so gated calls block inside `tools/call` while the desktop banner decides, for at most 120 s — comfortably under provider connector timeouts. Results are capped at 140,000 characters so a connector result can't blow up a chat's context.
 
 ## The Technical Opportunity
 

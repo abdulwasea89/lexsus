@@ -4,6 +4,12 @@
 > **Branch:** `developing`
 > **M0 Definition of Done:** Tauri app launches · Rust core modules compile & run · SQLite schema migrates · compression-service `/health` responds · lint/typecheck/build pass · `ongoing/` doc written.
 
+> **Historical record.** This document was written while Lexsus still used a
+> Chrome-extension / loopback-WebSocket transport; that transport was later removed
+> for a desktop-local native MCP connector (see `2026-09-10-mcp-native-architecture.md`
+> in this directory). Any setup step or architecture description below that refers to
+> the extension, pairing codes, or `ws://127.0.0.1:45241` is preserved and no longer applies.
+
 This document explains everything built in Phase 0, how it works, how it was verified, and how to extend it in Phase 1.
 
 ---

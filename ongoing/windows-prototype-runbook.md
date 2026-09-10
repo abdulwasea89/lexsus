@@ -3,6 +3,12 @@
 > **Goal:** a working end-to-end prototype on your Windows machine: work locally in Claude Code, hand off to ChatGPT in Chrome, and let it read / write / run commands on this PC through the bridge.
 > **Everything is already built** (`src-tauri` core + `extension/`). This is a launch + live-test guide. Expected total time: ~30–45 min.
 
+> **Historical record — do not follow these steps as written.** This runbook was
+> written while Lexsus still used a Chrome-extension / loopback-WebSocket transport;
+> that transport was later removed for a desktop-local native MCP connector (see
+> `2026-09-10-mcp-native-architecture.md` in this directory). Every step below —
+> the extension, the pairing code, `ws://127.0.0.1:45241` — is superseded and no longer applies to today's build.
+
 ---
 
 ## 1. Prerequisites (one-time)

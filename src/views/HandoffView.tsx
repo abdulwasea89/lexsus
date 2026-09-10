@@ -11,7 +11,7 @@ import {
   MessageCircleIcon,
   RotateCcwIcon,
 } from "lucide-react";
-import { buildHandoff, handoffSend, setObjective } from "../lib/bridge";
+import { buildHandoff, setObjective } from "../lib/bridge";
 import type { Handoff } from "../lib/types";
 import { Button } from "../components/ui/button";
 import { Input } from "../components/ui/input";
@@ -20,9 +20,9 @@ import { Separator } from "../components/ui/separator";
 import { toast } from "../components/ui/toast";
 import { ViewShell } from "./ViewShell";
 
-/** Handoff view: build real state → "Continue with ChatGPT". Sends the
- *  payload to the paired extension (which renders it on chatgpt.com);
- *  falls back to clipboard copy. */
+/** Handoff view: build real state → copy it into the web AI's chat. The
+ *  connector is pull-based, so the payload is handed over explicitly
+ *  (clipboard today; a `get_handoff` connector tool is the next step). */
 export default function HandoffView() {
   const [handoff, setHandoff] = useState<Handoff | null>(null);
   const [objective, setObj] = useState("");
@@ -36,19 +36,18 @@ export default function HandoffView() {
     setBuilt(true);
   }
 
-  async function continueWithChatGPT() {
+  async function continueWith() {
     if (!handoff) return;
     await setObjective(objective).catch(() => {});
-    // handoffSend() rebuilds the payload from *current* state (the edited
-    // objective, refreshed trace) and returns it — copy that, not the
-    // `handoff` snapshot from the last build(), which is stale by the time
-    // the user edits the objective and clicks send.
-    const sent = await handoffSend();
-    await navigator.clipboard.writeText(handoffText(sent)).catch(() => {});
-    setStatus("handoff sent to the extension (also copied to clipboard)");
+    // Rebuild from *current* state (the edited objective, refreshed trace):
+    // the `handoff` snapshot is stale by the time the user edits the
+    // objective and clicks.
+    const fresh = await buildHandoff();
+    await navigator.clipboard.writeText(handoffText(fresh)).catch(() => {});
+    setStatus("handoff copied — paste it as the opening message");
     toast.add({
-      title: "Handoff sent",
-      description: "Open chatgpt.com in the paired browser to continue.",
+      title: "Handoff copied",
+      description: "Paste it into the web AI's chat to continue.",
       type: "success",
     });
   }
@@ -76,7 +75,7 @@ export default function HandoffView() {
       h.files.length > 0 ? `Files involved: ${h.files.join(", ")}` : "",
       factBlock ? `\n${factBlock}\n` : "",
       ``,
-      `You are now the coding agent for the local project at the paired machine.`,
+      `You are now the coding agent for the local project on this machine.`,
       `You may request file reads, file writes, and command runs; the bridge executes them locally and returns real results.`,
     ]
       .filter(Boolean)
@@ -90,7 +89,7 @@ export default function HandoffView() {
   return (
     <ViewShell
       icon={MessageCircleIcon}
-      title="Handoff → ChatGPT"
+      title="Handoff"
       description="built from real trace + watcher state"
       actions={
         handoff && (
@@ -221,8 +220,8 @@ export default function HandoffView() {
           <Separator />
 
           <div className="flex flex-wrap gap-2">
-            <Button onClick={() => void continueWithChatGPT()}>
-              <MessageCircleIcon /> Continue with ChatGPT
+            <Button onClick={() => void continueWith()}>
+              <MessageCircleIcon /> Continue in your web AI
             </Button>
             <Button variant="ghost" onClick={() => void build()}>
               <RotateCcwIcon /> Rebuild

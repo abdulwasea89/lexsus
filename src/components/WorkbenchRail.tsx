@@ -12,6 +12,7 @@ import {
   SunIcon,
 } from "lucide-react";
 import { toggleTheme, useTheme } from "../hooks/useTheme";
+import type { McpStatus } from "../lib/types";
 import { cn } from "../lib/utils";
 
 export type View = "trace" | "git" | "handoff" | "memory" | "bridge";
@@ -23,13 +24,13 @@ const NAV: { view: View; label: string; icon: typeof ActivityIcon }[] = [
   { view: "git", label: "Git", icon: GitBranchIcon },
   { view: "handoff", label: "Handoff", icon: MessageCircleIcon },
   { view: "memory", label: "Project memory", icon: BrainIcon },
-  { view: "bridge", label: "Web-AI bridge", icon: GlobeIcon },
+  { view: "bridge", label: "Web-AI connector", icon: GlobeIcon },
 ];
 
 interface WorkbenchRailProps {
   view: View;
   onViewChange: (view: View) => void;
-  paired: boolean;
+  connector: McpStatus | null;
   onOpenProject: () => void;
 }
 
@@ -43,7 +44,7 @@ interface WorkbenchRailProps {
 export default function WorkbenchRail({
   view,
   onViewChange,
-  paired,
+  connector,
   onOpenProject,
 }: WorkbenchRailProps) {
   const [open, setOpen] = useState(
@@ -174,26 +175,38 @@ export default function WorkbenchRail({
 
         {renderRow({
           key: "project",
-          label: "Project & pairing",
+          label: "Project & connector",
           icon: FolderOpenIcon,
           onClick: onOpenProject,
         })}
 
         <span
-          aria-label={paired ? "Extension paired" : "No extension paired"}
+          aria-label={
+            connector?.listening
+              ? "MCP connector listening"
+              : "MCP connector offline"
+          }
           className="relative flex h-9 w-full items-center text-xs text-muted-foreground"
         >
           <span className={iconSlot}>
             <span
               className={cn(
                 "size-2 rounded-full",
-                paired ? "bg-success" : "bg-muted-foreground/40",
+                connector?.listening
+                  ? connector.allow_write
+                    ? "bg-warning"
+                    : "bg-success"
+                  : "bg-muted-foreground/40",
               )}
             />
           </span>
           <span className={cn(reveal, "relative z-10 font-normal")}>
             <span className={revealInner}>
-              {paired ? "Extension paired" : "Not paired"}
+              {connector?.listening
+                ? connector.allow_write
+                  ? "Connector · read/write"
+                  : "Connector · read-only"
+                : "Connector offline"}
             </span>
           </span>
         </span>

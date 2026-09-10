@@ -194,7 +194,7 @@ pub fn applied_versions(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     rows.collect()
 }
 
-/// Persisted key/value settings (project root, pairing code, ...).
+/// Persisted key/value settings (project root, ...).
 pub fn set_setting(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO settings (key, value) VALUES (?1, ?2)
@@ -213,7 +213,8 @@ pub fn get_setting(conn: &Connection, key: &str) -> rusqlite::Result<Option<Stri
     }
 }
 
-/// Remove a setting entirely (pairing codes must not linger in the DB).
+/// Remove a setting entirely (used at startup to drop the old extension's
+/// `pair_code` so no stale credential lingers in the DB).
 pub fn delete_setting(conn: &Connection, key: &str) -> rusqlite::Result<()> {
     conn.execute("DELETE FROM settings WHERE key = ?1", [key])?;
     Ok(())

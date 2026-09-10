@@ -1,33 +1,49 @@
 # UI Design — The Desktop Control Center
 
-The desktop app is the **control center** — one place where you see everything happening to your work. It combines a live activity trace, a single command terminal (the web AI's), and a full git workflow, all correlated in a single timeline.
+The desktop app is the **control center** — one place where you see everything happening to your work. It combines a live activity trace, a single command terminal (the web AI's), and a full git workflow, all correlated in a single timeline, with the connector's state and every approval gate in the same window.
 
 ## Control Center Layout
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│  SIDEBAR      │  MAIN PANEL                                │
-│               │  ┌──────────────────────────────────────┐  │
-│  Projects     │  │  LIVE ACTIVITY TRACE                 │  │
-│   • myapp  ▸  │  │  ▾ Refactor auth (web AI)            │  │
-│               │  │      Reading auth.ts                 │  │
-│  Sessions     │  │      ✏ Editing auth.ts [3 lines]     │  │
-│   • #12 ▸     │  │      ▾ Running: npm test             │  │
-│   • #11 ▸     │  └──────────────────────────────────────┘  │
-│               │  ┌──────────────────────────────────────┐  │
-│  Git          │  │  COMMAND TERMINAL (web AI)           │  │
-│   • status    │  │  $ npm test                          │  │
-│   • diff      │  │  PASS auth.test.ts                   │  │
-│   • branch    │  └──────────────────────────────────────┘  │
-│   • commit    │                                            │
-│               │  STATUS BAR: ● bridge online               │
-└───────────────┴────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  RAIL          │  MAIN PANEL                                      │
+│                │  ┌──────────────────────┬──────────────────────┐  │
+│  Activity      │  │  COMMAND TERMINAL    │  LIVE ACTIVITY TRACE │  │
+│  Git           │  │  $ npm test          │  ▾ Refactor auth     │  │
+│  Handoff       │  │  PASS auth.test.ts   │      Reading auth.ts │  │
+│  Memory        │  │                      │      Editing auth.ts │  │
+│  Connector     │  │                      │      ▾ npm test      │  │
+│                │  └──────────────────────┴──────────────────────┘  │
+│  ────────────  │  ┌─────────────────────────────────────────────┐  │
+│  Project &     │  │  APPROVAL BANNER (only when a call waits)   │  │
+│   connector    │  │  source · summary · Allow / Deny · grant    │  │
+│  Connector ·   │  └─────────────────────────────────────────────┘  │
+│   read-only    │                                                  │
+│                │  STATUS BAR: myapp · local working · web working │
+│                │              · connector · ro · terminal idle    │
+└────────────────┴──────────────────────────────────────────────────┘
 ```
 
-- **Sidebar:** Projects, Git, Pairing.
+- **Rail:** the app's navigation — Live activity trace, Git, Handoff, Project memory, Web-AI connector — plus **Project & connector** (folder picker + endpoint) at the bottom. Collapsible to icons only.
 - **Live Activity Trace:** real-time tree of every web-AI action.
 - **Command Terminal:** the single terminal in the app — a read-only live view of every command the web AI runs.
-- **Status Bar:** pairing/bridge state.
+- **Approval Banner:** the gate. It appears above the panes only when a call is waiting on you.
+- **Status Bar:** project, failover states, connector state, terminal state.
+
+## Project & Connector
+
+The rail's **Project & connector** entry opens one dialog that does two related things, because they are one decision:
+
+- **Bind the workspace** — pick the folder the web AI works on. This is the connector's entire blast radius: every tool path is resolved against it (`resolve_path`), and nothing outside it is reachable.
+- **Point a connector at it** — the dialog shows the live endpoint and whether the server is **Listening** or **Offline**, with the copy-paste instructions for adding a remote-MCP connector (Claude.ai → Customize → Connectors → *Add custom connector*). There is nothing to pair and no code to type: the address is the whole configuration.
+
+The same state is mirrored in the **Web-AI connector** view, which is also the diagnostics surface (tool sandbox + audit trail). Its connector block shows:
+
+| Row | Shows |
+|---|---|
+| **Endpoint** | `http://127.0.0.1:45147/mcp` — the live MCP endpoint, from `mcp_status` |
+| **Workspace** | the bound project root, or `no project bound` |
+| **Allow writes & commands** | the `mcp_allow_write` switch — off means the read-only six-tool surface; on exposes the nine write/command tools. Flipped live via `mcp_set_allow_write`: no rebuild, no reconnect, and every write still needs the desktop's approval |
 
 ## Live Activity Trace
 
@@ -83,10 +99,10 @@ The app has exactly **one terminal** — the read-only live view of the commands
 
 ## Web AI Activity View
 
-When a web AI is acting as a coding agent (via the bridge), the control center shows what it is doing *with your machine* — like ChatGPT's `> thinking` view, but grounded to real operations:
+When a web AI is acting as a coding agent (attached through the MCP connector), the control center shows what it is doing *with your machine* — like ChatGPT's `> thinking` view, but grounded to real operations:
 
 - "ChatGPT read auth.ts"
 - "ChatGPT wrote auth.ts"
 - "ChatGPT ran npm test → 2 failing"
 
-These appear in the activity trace, the real output appears in the terminal pane, and the resulting changes appear in the git panel — where you can commit them from the app.
+These appear in the activity trace, the real output appears in the terminal pane, and the resulting changes appear in the git panel — where you can commit them from the app. The connector is pull-based, so the app never tries to reach back into the chat: the handoff is surfaced here (and copied to the clipboard from the Handoff view) instead of being injected into a conversation.

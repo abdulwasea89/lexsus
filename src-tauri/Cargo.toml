@@ -27,6 +27,7 @@ portable-pty = "0.8"
 notify = "6"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+<<<<<<< HEAD
 # Search tools (Phase 2): grep uses `regex`, glob uses `glob`; `walkdir`
 # drives both over the project tree. All three are already transitive deps
 # (vendored), so adding them here needs no new downloads.
@@ -39,6 +40,16 @@ walkdir = "2.5"
 tungstenite = "0.24"
 # Pairing codes come from the OS CSPRNG (clock-derived codes were guessable).
 getrandom = "0.2"
+=======
+# The tool engine's single remote transport: rmcp serves a Streamable-HTTP MCP
+# endpoint over loopback (axum drives its tower Service). Every call funnels
+# through the same bridge policy engine — approvals, sensitive paths,
+# source-scoped grants, kill switch, audit — as the desktop sandbox.
+rmcp = { version = "3.2", features = ["transport-streamable-http-server"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync"] }
+tokio-util = "0.7"
+>>>>>>> 15b86747d260d728cb108d11ca09c9706c5c764b
 # Signal the process *group* when cancelling a running command (unix only).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

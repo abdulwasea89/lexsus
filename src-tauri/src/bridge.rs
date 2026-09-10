@@ -1,10 +1,10 @@
 //! The web-AI coding-agent bridge (M2).
 //!
-//! Tool calls arrive from the browser extension (over the local
-//! WebSocket), from the desktop tool sandbox, or from the frontend's
-//! handoff flow. Every call is policy-checked: reads are auto-approved
-//! (except sensitive paths), writes and command execution always require
-//! an explicit user approval. All calls are audited to SQLite.
+//! Tool calls arrive from the native MCP server (`mcp.rs`), from the desktop
+//! tool sandbox, or from the frontend's handoff flow. Every call is
+//! policy-checked: reads are auto-approved (except sensitive paths), writes
+//! and command execution always require an explicit user approval. All calls
+//! are audited to SQLite.
 
 use crate::{git, pty, shell::Shell};
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 /// One replacement inside a `multi_edit` batch.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Edit {
     pub old_string: String,
     pub new_string: String,
@@ -25,7 +25,7 @@ pub struct Edit {
 }
 
 /// A web-AI tool call (serde: externally-tagged, mirrors `types.ts`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Tool {
     ReadFile {
         path: String,
@@ -75,9 +75,9 @@ pub enum Tool {
     CreateDirectory {
         path: String,
     },
-    /// Read several files in one round-trip. Each browser→WS→core→browser
-    /// hop costs real latency, so batching is a win even before approval
-    /// queuing.
+    /// Read several files in one round-trip. Each call costs a full trip
+    /// through the connector and the approval queue, so batching several
+    /// files into one call is a win.
     ReadManyFiles {
         paths: Vec<String>,
     },
@@ -165,8 +165,7 @@ pub enum Approval {
 /// Static, per-tool metadata. This is the single source of truth: the
 /// approval policy, trace kind, timeout, auto-insert behaviour and the
 /// AI-facing manifest are all derived from here rather than repeated in
-/// separate `match` arms across `bridge.rs`, `ws.rs`, `lib.rs` and the
-/// browser extension.
+/// separate `match` arms across `bridge.rs`, `lib.rs` and `mcp.rs`.
 #[derive(Debug, Clone)]
 pub struct ToolSpec {
     pub name: &'static str,
@@ -182,7 +181,9 @@ pub struct ToolSpec {
     /// Activity-trace kind, or `None` for calls not worth tracing.
     pub trace_kind: Option<&'static str>,
     pub timeout_ms: u32,
-    /// Read-only result the extension can paste straight into the chat.
+    /// Read-only result: true for the read-only/meta tools, false for every
+    /// tool that writes or runs a command. SPECS metadata only — no transport
+    /// consumes it since the extension relay was removed.
     pub auto_insert: bool,
     /// Manifest grouping; must appear in [`GROUPS`].
     pub group: &'static str,
@@ -192,6 +193,12 @@ pub struct ToolSpec {
 pub const GROUPS: &[&str] = &[
     "Reading", "Editing", "Commands", "Search", "Git", "Planning", "Meta",
 ];
+
+/// Caller/transport labels. Recorded in audits and grants, and compared so a
+/// session grant stays scoped to the path that earned it (a desktop grant
+/// never auto-approves an `mcp` call, and vice versa).
+pub const SOURCE_DESKTOP: &str = "desktop"; // in-app sandbox / UI
+pub const SOURCE_MCP: &str = "mcp"; // the connector's remote caller (mcp.rs)
 
 /// Every tool the bridge can execute.
 pub const SPECS: &[ToolSpec] = &[
@@ -565,10 +572,9 @@ pub fn spec_by_name(name: &str) -> Option<&'static ToolSpec> {
 /// project context, so the AI calls `describe_tool` for detail on demand.
 ///
 /// Rendered as an aligned table, **never** as `name(args)`. This is the body
-/// of `list_tools`, which auto-inserts into the chat, so the AI echoes it
-/// back — and the extension's line parser matched the call form, executing
-/// the whole tool surface at once. `run_command`'s pattern treats the quote
-/// as optional, so even `run_command(shell command)` fired. Keep it inert.
+/// of `list_tools`, which is handed straight to the model, and text in call
+/// syntax reads as a burst of tool calls when the model echoes it back. Keep
+/// it inert.
 pub fn tool_manifest() -> String {
     let mut out = String::new();
     for group in GROUPS {
@@ -586,8 +592,8 @@ pub fn tool_manifest() -> String {
     out
 }
 
-/// Full detail for one tool, for `describe_tool`. Also auto-inserted into the
-/// chat, so it avoids call syntax for the same reason as `tool_manifest`.
+/// Full detail for one tool, for `describe_tool`. Also handed straight to the
+/// model, so it avoids call syntax for the same reason as `tool_manifest`.
 fn describe_spec(s: &ToolSpec) -> String {
     let approval = match s.approval {
         Approval::Auto => "runs immediately",
@@ -607,6 +613,303 @@ fn describe_spec(s: &ToolSpec) -> String {
         out.push_str(&format!("  Also accepted as: {}\n", s.aliases.join(", ")));
     }
     out
+}
+
+/// Parse a wire tool call into a [`Tool`]. The name is resolved through the
+/// spec table's aliases first, because a web AI (or MCP connector) emits
+/// whatever name it happens to remember (`Read`, `bash`,
+/// `default_api.read_file`). Coercions are permissive on purpose: line
+/// offsets arrive as JSON numbers from our own parser but as quoted strings
+/// from a model writing raw JSON, and a single path often stands in where a
+/// `paths` array belongs.
+///
+/// This is the shared entry point for every caller — the native MCP server
+/// (`mcp.rs`), and the desktop/in-app path (`bridge_tool`) — so all paths
+/// parse a given tool call identically.
+pub fn parse_tool_call(tool_name: &str, args: &serde_json::Value) -> Result<Tool, String> {
+    let spec = spec_by_name(tool_name).ok_or_else(|| format!("unknown tool: {tool_name}"))?;
+    let str_arg = |key: &str| -> Result<String, String> {
+        args[key]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| format!("missing '{key}' argument"))
+    };
+    // First present key wins — a model guesses argument names the way it
+    // guesses tool names (`from`/`src`, `old_string`/`old_str`/`find`).
+    let str_arg_any = |keys: &[&str]| -> Result<String, String> {
+        for k in keys {
+            if let Some(s) = args[*k].as_str() {
+                return Ok(s.to_string());
+            }
+        }
+        Err(format!("missing '{}' argument", keys[0]))
+    };
+    // Line numbers arrive as a JSON number from our own parser, but a web AI
+    // writing raw JSON often quotes them.
+    let u32_arg = |key: &str| -> Option<u32> {
+        args[key]
+            .as_u64()
+            .or_else(|| args[key].as_str().and_then(|s| s.trim().parse().ok()))
+            .map(|n| n.min(u32::MAX as u64) as u32)
+    };
+    // Bools get the same quoting treatment as offsets.
+    let bool_arg = |key: &str| -> Option<bool> {
+        args[key].as_bool().or_else(|| {
+            args[key]
+                .as_str()
+                .and_then(|s| match s.trim().to_ascii_lowercase().as_str() {
+                    "true" | "1" | "yes" => Some(true),
+                    "false" | "0" | "no" => Some(false),
+                    _ => None,
+                })
+        })
+    };
+    // A model will send one path where an array belongs.
+    let string_array_arg = |key: &str| -> Option<Vec<String>> {
+        match args.get(key)? {
+            serde_json::Value::Array(items) => items
+                .iter()
+                .map(|v| v.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>(),
+            serde_json::Value::String(s) => Some(vec![s.clone()]),
+            _ => None,
+        }
+    };
+    let edits_arg = |key: &str| -> Result<Vec<Edit>, String> {
+        let items = match args.get(key) {
+            Some(serde_json::Value::Array(items)) => items.clone(),
+            _ => return Err(format!("missing '{key}' argument")),
+        };
+        let mut edits = Vec::with_capacity(items.len());
+        for item in &items {
+            let old_string = item["old_string"]
+                .as_str()
+                .ok_or("an edit is missing 'old_string'")?
+                .to_string();
+            let new_string = item["new_string"]
+                .as_str()
+                .ok_or("an edit is missing 'new_string'")?
+                .to_string();
+            let replace_all = item["replace_all"].as_bool().or_else(|| {
+                item["replace_all"].as_str().and_then(|s| {
+                    match s.trim().to_ascii_lowercase().as_str() {
+                        "true" | "1" | "yes" => Some(true),
+                        "false" | "0" | "no" => Some(false),
+                        _ => None,
+                    }
+                })
+            });
+            edits.push(Edit {
+                old_string,
+                new_string,
+                replace_all,
+            });
+        }
+        Ok(edits)
+    };
+    match spec.name {
+        "read_file" => Ok(Tool::ReadFile {
+            path: str_arg("path")?,
+            offset: u32_arg("offset"),
+            limit: u32_arg("limit"),
+        }),
+        "write_file" => Ok(Tool::WriteFile {
+            path: str_arg("path")?,
+            content: str_arg("content")?,
+        }),
+        "edit_file" => Ok(Tool::EditFile {
+            path: str_arg_any(&["path", "file"])?,
+            old_string: str_arg_any(&["old_string", "old_str", "find"])?,
+            new_string: str_arg_any(&["new_string", "new_str", "replace", "replace_with"])?,
+            replace_all: bool_arg("replace_all"),
+        }),
+        "multi_edit" => Ok(Tool::MultiEdit {
+            path: str_arg("path")?,
+            edits: edits_arg("edits")?,
+        }),
+        "apply_patch" => Ok(Tool::ApplyPatch {
+            path: str_arg("path")?,
+            patch: str_arg("patch")?,
+        }),
+        "delete_file" => Ok(Tool::DeleteFile {
+            path: str_arg("path")?,
+        }),
+        "move_file" => Ok(Tool::MoveFile {
+            from: str_arg_any(&["from", "src", "source"])?,
+            to: str_arg_any(&["to", "dest", "destination"])?,
+        }),
+        "copy_file" => Ok(Tool::CopyFile {
+            from: str_arg_any(&["from", "src", "source"])?,
+            to: str_arg_any(&["to", "dest", "destination"])?,
+        }),
+        "create_directory" => Ok(Tool::CreateDirectory {
+            path: str_arg("path")?,
+        }),
+        "read_many_files" => Ok(Tool::ReadManyFiles {
+            paths: string_array_arg("paths")
+                .ok_or_else(|| "missing 'paths' argument".to_string())?,
+        }),
+        "run_command" => Ok(Tool::RunCommand {
+            command: str_arg("command")?,
+        }),
+        "list_directory" => Ok(Tool::ListDirectory {
+            path: str_arg("path")?,
+        }),
+        "git_status" => Ok(Tool::GitStatus),
+        "describe_tool" => Ok(Tool::DescribeTool {
+            name: str_arg("name")?,
+        }),
+        "list_tools" => Ok(Tool::ListTools),
+        other => Err(format!("tool not implemented: {other}")),
+    }
+}
+
+/// JSON Schema (object form) for one tool's arguments — the source for the
+/// MCP connector's `tools/list` `inputSchema`. Only the *canonical* argument
+/// names appear: the parser still tolerates aliases on the wire, but a
+/// connector should advertise the primary names so model output stays
+/// predictable. Mirrors [`parse_tool_call`]; the drift-guard tests below
+/// keep the two honest to each other. Returns `None` for an unknown tool.
+pub fn tool_input_schema(tool_name: &str) -> Option<serde_json::Value> {
+    let spec = spec_by_name(tool_name)?;
+    let schema = match spec.name {
+        "read_file" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File to read, relative to the workspace" },
+                "offset": { "type": "integer", "minimum": 1, "description": "1-based first line (default 1)" },
+                "limit": { "type": "integer", "minimum": 1, "description": "Max lines (default CHUNK_LINES)" }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        "list_directory" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Directory to list, relative to the workspace" }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        "write_file" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File to overwrite" },
+                "content": { "type": "string", "description": "Full new contents" }
+            },
+            "required": ["path", "content"],
+            "additionalProperties": false
+        }),
+        "edit_file" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File to edit" },
+                "old_string": { "type": "string", "description": "Exact text to replace" },
+                "new_string": { "type": "string", "description": "Replacement text" },
+                "replace_all": { "type": "boolean", "description": "Replace every occurrence (default false)" }
+            },
+            "required": ["path", "old_string", "new_string"],
+            "additionalProperties": false
+        }),
+        "multi_edit" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File to edit" },
+                "edits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": { "type": "string" },
+                            "new_string": { "type": "string" },
+                            "replace_all": { "type": "boolean" }
+                        },
+                        "required": ["old_string", "new_string"],
+                        "additionalProperties": false
+                    },
+                    "description": "Exact-string edits, applied atomically together"
+                }
+            },
+            "required": ["path", "edits"],
+            "additionalProperties": false
+        }),
+        "apply_patch" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File the patch applies to" },
+                "patch": { "type": "string", "description": "Single-file unified diff with context lines" }
+            },
+            "required": ["path", "patch"],
+            "additionalProperties": false
+        }),
+        "delete_file" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File to delete (not directories)" }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        "move_file" | "copy_file" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "from": { "type": "string", "description": "Source path" },
+                "to": { "type": "string", "description": "Destination path" }
+            },
+            "required": ["from", "to"],
+            "additionalProperties": false
+        }),
+        "create_directory" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Directory to create, including parents" }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        "read_many_files" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Files to read; a single path string is also accepted"
+                }
+            },
+            "required": ["paths"],
+            "additionalProperties": false
+        }),
+        "run_command" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string", "description": "Shell command, run in the project root" }
+            },
+            "required": ["command"],
+            "additionalProperties": false
+        }),
+        "git_status" => serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+        "describe_tool" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Tool whose full argument schema to show" }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        }),
+        "list_tools" => serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+        _ => return None,
+    };
+    Some(schema)
 }
 
 /// Filesystem paths a call touches, for the sensitive-path policy. Tools
@@ -739,11 +1042,8 @@ pub enum ErrorCode {
     AmbiguousMatch,
     PatchDoesNotApply,
     BridgePaused,
-    MalformedJson,
     ExecutionFailed,
     CommandTimeout,
-    ConnectionLost,
-    NotPaired,
     UnknownTool,
     InternalError,
     Denied,
@@ -763,11 +1063,8 @@ impl std::fmt::Display for ErrorCode {
             ErrorCode::AmbiguousMatch => write!(f, "AMBIGUOUS_MATCH"),
             ErrorCode::PatchDoesNotApply => write!(f, "PATCH_DOES_NOT_APPLY"),
             ErrorCode::BridgePaused => write!(f, "BRIDGE_PAUSED"),
-            ErrorCode::MalformedJson => write!(f, "MALFORMED_JSON"),
             ErrorCode::ExecutionFailed => write!(f, "EXECUTION_FAILED"),
             ErrorCode::CommandTimeout => write!(f, "COMMAND_TIMEOUT"),
-            ErrorCode::ConnectionLost => write!(f, "CONNECTION_LOST"),
-            ErrorCode::NotPaired => write!(f, "NOT_PAIRED"),
             ErrorCode::UnknownTool => write!(f, "UNKNOWN_TOOL"),
             ErrorCode::InternalError => write!(f, "INTERNAL_ERROR"),
             ErrorCode::Denied => write!(f, "DENIED"),
@@ -875,8 +1172,8 @@ pub struct SessionGrant {
     /// project. Commands have no path, so their grants carry `None`.
     pub path_prefix: Option<String>,
     /// Who created it ("web" | "desktop"); it only auto-approves calls from
-    /// the same source, so a desktop grant never silently covers a paired
-    /// extension's calls.
+    /// the same source, so a desktop grant never silently covers an MCP
+    /// connector's calls.
     pub source: String,
 }
 
@@ -887,11 +1184,11 @@ pub struct ApprovalRequest {
     pub tool: Tool,
     pub summary: String,
     pub source: String, // web | desktop
-    /// The WS request id that asked for this tool, when it came from the
-    /// extension. A gated `run_command` executes on the desktop's
-    /// `bridge_approve` thread, not the WS thread — carrying the owner here
-    /// is what lets the spawned PTY still be attributed to (and cancellable
-    /// by) the original request.
+    /// The request id that asked for this tool, when the caller carried one
+    /// (nothing sets one today — see `process::execution_owner`). A gated
+    /// `run_command` executes on the desktop's `bridge_approve` thread, not
+    /// the caller's — carrying the owner here is what lets the spawned PTY
+    /// still be attributed to (and cancellable by) the original request.
     pub owner: Option<String>,
 }
 
@@ -899,7 +1196,7 @@ pub struct ApprovalRequest {
 #[derive(Default)]
 pub struct Bridge {
     pub pending: Mutex<Vec<ApprovalRequest>>,
-    /// WS callers waiting for approval resolution, keyed by request id.
+    /// Remote callers waiting for approval resolution, keyed by request id.
     pub channels: Mutex<HashMap<u64, SyncSender<ToolResult>>>,
     /// Active session grants (the Phase 6 approval-engine slice).
     pub grants: Mutex<Vec<SessionGrant>>,
@@ -977,7 +1274,7 @@ impl Bridge {
     }
 
     /// Resolve a pending approval. Executes the tool when allowed,
-    /// delivers the result to any waiting WS caller, and returns the
+    /// delivers the result to any waiting remote caller, and returns the
     /// result plus the resolved request (for auditing). `on_event`
     /// receives command stream events while a `run_command` executes.
     pub fn resolve(
@@ -993,7 +1290,7 @@ impl Bridge {
         drop(pending);
 
         let result = if allow {
-            // Execute attributed to the original WS request (see
+            // Execute attributed to the original request (see
             // `ApprovalRequest::owner`), so a cancel for that request can
             // kill a `run_command` spawned here on the desktop's thread.
             let prev = crate::process::execution_owner();
@@ -1015,7 +1312,7 @@ impl Bridge {
     }
 
     /// Remove a still-pending approval without executing it — used when the
-    /// waiting caller (the paired web AI) gave up before the user decided
+    /// waiting caller (the MCP connector) gave up before the user decided
     /// (approval timed out). Drops the request's channel too, and returns the
     /// removed request so the caller can audit it and dismiss the card. A
     /// later [`resolve`](Self::resolve) on the same id finds nothing and so
@@ -1240,11 +1537,13 @@ pub fn describe_for_approval(tool: &Tool, root: Option<&Path>) -> String {
 /// sanity limit on what we will scan, not on what the AI can read.
 const READ_CAP: u64 = 16 * 1024 * 1024;
 
-/// One chunk's budget. Sized to land well inside the extension's 24KB
-/// composer cap (`COMPOSER_CAP` in `tool-spec.js`) once line numbers and the
-/// footer are added, because a single oversized insert froze the host page.
-/// A single line longer than this is still returned whole — the composer cap
-/// is the backstop for that case.
+/// One chunk's budget. Bounds a single read to `CHUNK_LINES` lines and
+/// `CHUNK_BYTES` of content, so one call returns a readable page rather than
+/// an unbounded dump. The 24KB chat-composer cap this was originally sized to
+/// fit belonged to the deleted browser extension; the only hard ceiling left
+/// is the connector's `RESULT_CHAR_CAP` (140,000 chars, `mcp.rs`), which this
+/// sits far inside. A single line longer than `CHUNK_BYTES` is still returned
+/// whole — chunking must always make progress, and that cap is the backstop.
 const CHUNK_LINES: usize = 400;
 const CHUNK_BYTES: usize = 16 * 1024;
 
@@ -1276,9 +1575,10 @@ fn chunk_bounds(lines: &[&str], want: usize) -> Vec<(usize, usize)> {
 /// Render one chunk of a file as `cat -n` style numbered lines, with a footer
 /// naming the exact call that returns the next chunk.
 ///
-/// Files are paged rather than truncated. Pushing a whole large file into the
-/// chat composer at once pegged the CPU and froze the page, and silently
-/// cutting the tail meant the AI could never see the rest of the file.
+/// Files are paged rather than truncated. Silently cutting the tail would
+/// leave the AI unable to see the rest of the file, and returning the whole
+/// thing (up to `READ_CAP`) would swamp both the model's context and the
+/// connector's result cap.
 fn chunk_text(path: &str, text: &str, offset: Option<u32>, limit: Option<u32>) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let total = lines.len();
@@ -1635,10 +1935,11 @@ fn apply_hunks(lines: &[String], hunks: &[Hunk]) -> Result<Vec<String>, ToolErro
 }
 
 /// How many files a `read_many_files` call may batch, and the batch's total
-/// byte budget. The budget keeps the whole auto-inserted result inside the
-/// extension's 24KB composer cap: a rendered 400-line chunk is ~16KB of
-/// content plus ~2.5KB of line numbers and a footer, so 20KB admits one
-/// full chunk with headroom for headers.
+/// byte budget. The budget keeps one batch to a single readable page: a
+/// rendered 400-line chunk is ~16KB of content plus ~2.5KB of line numbers and
+/// a footer, so 20KB admits one full chunk with headroom for headers. The
+/// figure was originally chosen to fit the browser extension's 24KB chat
+/// composer cap; that cap is gone, but the sizing still holds.
 const MANY_FILES_MAX: usize = 20;
 const MANY_BYTES_BUDGET: usize = 20 * 1024;
 
@@ -2067,8 +2368,8 @@ pub fn execute(
                 };
                 // Register the PTY child so a `cancel` for the owning
                 // request can kill the whole process group mid-run — the
-                // registry owner is the WS request id set by the ws.rs
-                // handler (desktop calls register with no owner).
+                // registry owner is the request id around execution
+                // (calls with no owner register with none).
                 let mut reg_id = None;
                 let mut on_spawn = |pid: u32| {
                     reg_id = Some(crate::process::registry().register(
@@ -2526,7 +2827,7 @@ pub fn execute(
     }
 }
 
-/// Create a channel a WS caller can wait on for approval resolution.
+/// Create a channel a remote caller can wait on for approval resolution.
 pub fn wait_channel() -> (SyncSender<ToolResult>, Receiver<ToolResult>) {
     sync_channel(1)
 }
@@ -3700,10 +4001,10 @@ mod tests {
 
     #[test]
     fn manifest_and_describe_are_not_call_syntax() {
-        // `list_tools` and `describe_tool` auto-insert into the chat, so the AI
-        // echoes their output back and the extension's line parser sees it. In
-        // call syntax every row was a live tool call: echoing the manifest ran
-        // the whole surface, approval cards and all, and froze the page.
+        // `list_tools` and `describe_tool` output goes straight into a model's
+        // context, and the model may echo it back. In call syntax every row
+        // was a live tool call: echoing the manifest ran the whole surface,
+        // approval cards and all. Keep the text inert.
         let mut text = tool_manifest();
         for s in SPECS {
             text.push_str(&describe_spec(s));
@@ -3758,7 +4059,7 @@ mod tests {
     #[test]
     fn chunk_is_bounded_by_bytes_not_just_lines() {
         // 100 lines of 1KB each: the line budget is 400, so bytes must be what
-        // stops it, or one chunk would blow past the composer cap.
+        // stops it, or one chunk would blow past CHUNK_BYTES.
         let text = (0..100)
             .map(|_| format!("{}\n", "x".repeat(1024)))
             .collect::<String>();
@@ -3793,5 +4094,170 @@ mod tests {
         assert!(out.contains("  14| line 14\n"));
         assert!(!out.contains("line 15"));
         assert!(out.contains(r#"read_file("a.txt", 15)"#));
+    }
+
+    // ── parse_tool_call / tool_input_schema drift guards ────────────────
+    // The MCP connector advertises `tool_input_schema` and feeds MCP args
+    // through `parse_tool_call`. These tests pin the two together: every
+    // SPECS tool has a schema, schemas only exist for SPECS tools, and a
+    // canonical args object shaped exactly like the schema actually parses —
+    // so a name/type mismatch between schema and parser cannot slip through.
+
+    /// A schema-shaped, valid args object per canonical tool. No aliases —
+    /// only the canonical keys the schema advertises.
+    fn sample_args(name: &str) -> serde_json::Value {
+        match name {
+            "read_file" => serde_json::json!({"path": "a.txt", "offset": 1, "limit": 5}),
+            "list_directory" => serde_json::json!({"path": "."}),
+            "write_file" => serde_json::json!({"path": "a.txt", "content": "x"}),
+            "edit_file" => {
+                serde_json::json!({"path": "a.txt", "old_string": "a", "new_string": "b"})
+            }
+            "multi_edit" => serde_json::json!({
+                "path": "a.txt",
+                "edits": [{"old_string": "a", "new_string": "b"}]
+            }),
+            "apply_patch" => serde_json::json!({"path": "a.txt", "patch": "@@ -1 +1 @@\n-a\n+b"}),
+            "delete_file" => serde_json::json!({"path": "a.txt"}),
+            "move_file" => serde_json::json!({"from": "a", "to": "b"}),
+            "copy_file" => serde_json::json!({"from": "a", "to": "b"}),
+            "create_directory" => serde_json::json!({"path": "d"}),
+            "read_many_files" => serde_json::json!({"paths": ["a.txt", "b.txt"]}),
+            "run_command" => serde_json::json!({"command": "echo hi"}),
+            "git_status" => serde_json::json!({}),
+            "describe_tool" => serde_json::json!({"name": "read_file"}),
+            "list_tools" => serde_json::json!({}),
+            other => panic!("sample_args missing tool: {other}"),
+        }
+    }
+
+    #[test]
+    fn every_spec_row_has_a_schema_and_schema_advertises_only_spec_tools() {
+        for spec in SPECS {
+            let s = tool_input_schema(spec.name)
+                .unwrap_or_else(|| panic!("no schema for tool {}", spec.name));
+            assert_eq!(s["type"], "object", "{}", spec.name);
+            let props = s["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("schema for {} lacks properties", spec.name));
+            let required = s["required"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|v| v.as_str().expect("required entries are strings"))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for r in &required {
+                assert!(
+                    props.contains_key(*r),
+                    "{}: required '{r}' not in properties",
+                    spec.name
+                );
+            }
+        }
+        // Unknown / unmapped names resolve to no schema (guards against a
+        // stray arm naming a tool outside SPECS).
+        for unknown in ["nope", "read_fil", "readfile", "definitely_not_a_tool"] {
+            assert!(tool_input_schema(unknown).is_none(), "{unknown}");
+        }
+    }
+
+    #[test]
+    fn alias_lookup_resolves_to_canonical_schema() {
+        // spec_by_name resolves aliases; the schema must land on the same
+        // canonical row whether asked by alias or canonical name.
+        for alias in ["Read", "view_file", "cat", "default_api.read_file"] {
+            assert_eq!(
+                tool_input_schema(alias),
+                tool_input_schema("read_file"),
+                "alias {alias} should map to read_file's schema"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_shaped_args_parse_to_the_same_tool() {
+        for spec in SPECS {
+            let args = sample_args(spec.name);
+            let tool =
+                parse_tool_call(spec.name, &args).unwrap_or_else(|e| panic!("{}: {e}", spec.name));
+            assert_eq!(
+                tool_name(&tool),
+                spec.name,
+                "schema-shaped args for {} parsed to the wrong tool",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_schema_required_arg_is_truly_required_by_the_parser() {
+        for spec in SPECS {
+            let s = tool_input_schema(spec.name).expect("schema");
+            let required: Vec<&str> = s["required"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            for key in required {
+                let mut args = sample_args(spec.name);
+                args.as_object_mut().unwrap().remove(key);
+                let err = parse_tool_call(spec.name, &args)
+                    .expect_err(&format!("{} should require '{key}'", spec.name));
+                assert!(
+                    err.contains(&format!("missing '{key}'")) || err.contains("missing"),
+                    "{} without '{key}': unexpected error: {err}",
+                    spec.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parser_coercions_survive_the_lift() {
+        // Behaviour guarantees a loose, model-written args object has always
+        // relied on, and that MCP args must share.
+        // Single string stands in for a paths array.
+        let t = parse_tool_call("read_many_files", &serde_json::json!({"paths": "a.txt"}))
+            .expect("single-string paths");
+        assert_eq!(
+            t,
+            Tool::ReadManyFiles {
+                paths: vec!["a.txt".into()]
+            }
+        );
+        // Quoted numbers coerce for offsets.
+        let t = parse_tool_call(
+            "read_file",
+            &serde_json::json!({"path": "a", "offset": "12"}),
+        )
+        .expect("quoted offset");
+        assert_eq!(
+            t,
+            Tool::ReadFile {
+                path: "a".into(),
+                offset: Some(12),
+                limit: None
+            }
+        );
+        // Alias argument names are tolerated.
+        let t = parse_tool_call(
+            "edit_file",
+            &serde_json::json!({
+                "file": "a.txt", "find": "x", "replace": "y"
+            }),
+        )
+        .expect("alias arg names");
+        assert_eq!(
+            t,
+            Tool::EditFile {
+                path: "a.txt".into(),
+                old_string: "x".into(),
+                new_string: "y".into(),
+                replace_all: None
+            }
+        );
+        // Unknown tool name is an error, not a panic.
+        assert!(parse_tool_call("no_such_tool", &serde_json::json!({})).is_err());
     }
 }

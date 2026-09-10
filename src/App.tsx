@@ -1,14 +1,13 @@
 import { useEffect, useState } from "react";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { CircleAlertIcon, SquareTerminalIcon } from "lucide-react";
 import {
   getProjectRoot,
-  pairGetCode,
-  pairStatus,
+  mcpStatus,
   setProjectRoot,
   startWatch,
 } from "./lib/bridge";
+import type { McpStatus } from "./lib/types";
 import ApprovalBanner from "./components/ApprovalBanner";
 import GrantsBar from "./components/GrantsBar";
 import BridgeView from "./views/BridgeView";
@@ -53,7 +52,7 @@ function loadView(): View {
 }
 
 /**
- * Workbench shell: icon rail (views + project/pairing), a persistent
+ * Workbench shell: icon rail (views + project/connector), a persistent
  * terminal on the left, the active view on the right, global approval
  * and failover banners on top, and a statusbar heartbeat below.
  */
@@ -61,8 +60,7 @@ export default function App() {
   const [projectRoot, setRootInput] = useState("");
   const [restored, setRestored] = useState(false);
   const [error, setError] = useState("");
-  const [pairCode, setPairCode] = useState("");
-  const [paired, setPaired] = useState(false);
+  const [mcp, setMcp] = useState<McpStatus | null>(null);
   const [recents, setRecents] = useState<string[]>([]);
   const [view, setView] = useState<View>(loadView);
   const [projectOpen, setProjectOpen] = useState(false);
@@ -77,13 +75,11 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    let unlistens: UnlistenFn[] = [];
     void (async () => {
       try {
-        const [saved, code, isPaired] = await Promise.all([
+        const [saved, connector] = await Promise.all([
           getProjectRoot(),
-          pairGetCode().catch(() => ""),
-          pairStatus().catch(() => false),
+          mcpStatus().catch(() => null),
         ]);
         if (saved) {
           setRootInput(saved);
@@ -93,27 +89,21 @@ export default function App() {
         } else {
           setProjectOpen(true);
         }
-        setPairCode(code);
-        setPaired(isPaired);
-        unlistens = [
-          await listen<string>("pair://code", (e) => setPairCode(e.payload)),
-          await listen<boolean>("pair://status", (e) => setPaired(e.payload)),
-        ];
+        setMcp(connector);
       } catch (e) {
         setError(String(e));
       } finally {
         setRestored(true);
       }
     })();
-    return () => {
-      for (const u of unlistens) u();
-    };
   }, []);
 
   async function applyProject(path: string) {
     try {
       await setProjectRoot(path);
       await startWatch();
+      // The connector's blast radius follows the bound workspace.
+      setMcp(await mcpStatus().catch(() => null));
       setError("");
       saveRecent(path);
       setRecents(loadRecents());
@@ -151,7 +141,7 @@ export default function App() {
         <WorkbenchRail
           view={view}
           onViewChange={setView}
-          paired={paired}
+          connector={mcp}
           onOpenProject={() => setProjectOpen(true)}
         />
 
@@ -217,7 +207,7 @@ export default function App() {
           </div>
         )}
 
-        <Statusbar projectRoot={projectRoot} paired={paired} />
+        <Statusbar projectRoot={projectRoot} connector={mcp} />
       </main>
 
       <ProjectDialog
@@ -225,8 +215,7 @@ export default function App() {
         onOpenChange={setProjectOpen}
         projectRoot={projectRoot}
         recents={recents}
-        pairCode={pairCode}
-        paired={paired}
+        connector={mcp}
         onPick={onPickProject}
         onBrowse={() => void onBrowse()}
       />

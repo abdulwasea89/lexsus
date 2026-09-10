@@ -6,7 +6,11 @@ import {
   SquareTerminalIcon,
 } from "lucide-react";
 import { failoverStatus } from "../lib/bridge";
-import type { FailoverStatus, TerminalRunEvent } from "../lib/types";
+import type {
+  FailoverStatus,
+  McpStatus,
+  TerminalRunEvent,
+} from "../lib/types";
 import { cn } from "../lib/utils";
 
 function stateColor(state: string): string {
@@ -24,14 +28,15 @@ function stateColor(state: string): string {
 
 interface StatusbarProps {
   projectRoot: string;
-  paired: boolean;
+  connector: McpStatus | null;
 }
 
 /**
- * Workbench statusbar: project path, failover state machines, pairing
- * and the live terminal indicator — the app's quiet heartbeat.
+ * Workbench statusbar: project path, failover state machines, the MCP
+ * connector endpoint and the live terminal indicator — the app's quiet
+ * heartbeat.
  */
-export default function Statusbar({ projectRoot, paired }: StatusbarProps) {
+export default function Statusbar({ projectRoot, connector }: StatusbarProps) {
   const [status, setStatus] = useState<FailoverStatus | null>(null);
   const [running, setRunning] = useState(false);
 
@@ -79,10 +84,14 @@ export default function Statusbar({ projectRoot, paired }: StatusbarProps) {
         <span
           className={cn(
             "size-1.5 rounded-full",
-            paired ? "bg-success" : "bg-muted-foreground/40",
+            connector?.listening ? "bg-success" : "bg-muted-foreground/40",
           )}
         />
-        {paired ? "paired" : "unpaired"}
+        {connector?.listening
+          ? connector.allow_write
+            ? "connector · rw"
+            : "connector · ro"
+          : "connector offline"}
       </span>
       <span className="flex items-center gap-1.5">
         <SquareTerminalIcon className="size-3" />

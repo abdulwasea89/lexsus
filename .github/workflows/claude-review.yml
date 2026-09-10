@@ -58,13 +58,14 @@ jobs:
             - Correctness and bugs
             - Code quality and maintainability
             - Security implications
-            - This repo's standing invariants: every tool is registered in
-              three places that must not drift (SPECS in src-tauri/src/bridge.rs,
-              TOOLS in extension/tool-spec.js, parse_tool_call_v2 in
-              src-tauri/src/ws.rs), and `node scripts/check-spec-sync.mjs`
-              must stay green. Output must never parse as a tool call.
-            - Cross-language consistency (Rust core, browser extension,
-              frontend, compression-service).
+            - This repo's standing invariants: every tool is registered once in
+              SPECS (src-tauri/src/bridge.rs) with a matching JSON Schema in
+              tool_input_schema() and matching coercion in parse_tool_call();
+              the bridge.rs/mcp.rs unit tests are the drift guard. Anything that
+              writes, deletes, moves or runs a command must stay hidden from the
+              connector's tools/list while the `mcp_allow_write` read-only gate
+              is off. Tool output must never parse as a tool call.
+            - Cross-language consistency (Rust core, frontend, compression-service).
 
             Post a top-level summary with `gh pr comment`. Use
             `mcp__github_inline_comment__create_inline_comment` (with

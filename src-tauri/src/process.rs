@@ -5,14 +5,14 @@
 //! questions the runtime cannot answer otherwise:
 //!
 //!   * what is running right now (`list`),
-//!   * who owns it (`ProcessEntry.owner` — the WS request id),
+//!   * who owns it (`ProcessEntry.owner` — the request id that spawned it),
 //!   * how to stop it safely (`kill` — SIGTERM first, SIGKILL only after a
 //!     grace period, and to the whole process *group* so a shell's children
 //!     don't survive it).
 //!
-//! Before this existed, cancelling meant dropping the WebSocket connection:
-//! the running command kept going until its own timeout, and `child.kill()`
-//! on timeout killed only the shell process, not the pipeline it spawned.
+//! Before this existed there was no way to stop a running command: it kept
+//! going until its own timeout, and `child.kill()` on timeout killed only the
+//! shell process, not the pipeline it spawned.
 //!
 //! Safety rules baked in here, not at call sites:
 //!   * never signal a pid that was not registered by this process;
@@ -52,7 +52,7 @@ pub struct ProcessEntry {
     pub pid: u32,
     pub kind: ProcessKind,
     pub label: String,
-    /// The WS request id that spawned it, if any (desktop calls have none).
+    /// The request id that spawned it, if any (calls with no owner carry none).
     pub owner: Option<String>,
     pub started_at: String,
 }
@@ -145,7 +145,8 @@ impl ProcessRegistry {
         true
     }
 
-    /// Stop everything owned by a request (used by the `cancel` frame).
+    /// Stop everything owned by a request (used by the `cancel_request`
+    /// command).
     pub fn kill_owner(&self, owner: &str, grace: Duration) -> usize {
         let ids = self.by_owner(owner);
         let n = ids.len();
@@ -177,16 +178,17 @@ fn now_string() -> String {
 // --- execution ownership -----------------------------------------------------
 
 thread_local! {
-    /// The WS request id whose tool call is executing on *this* thread, if
-    /// any. Set by the ws.rs handler around `tool_call` so the PTY spawned
-    /// deep inside `bridge::execute` can be attributed to the request without
-    /// threading the id through every layer.
+    /// The request id whose tool call is executing on *this* thread, if any.
+    /// Set around execution so the PTY spawned deep inside `bridge::execute`
+    /// can be attributed to the request without threading the id through every
+    /// layer. No caller supplies a non-`None` id today, so in practice this is
+    /// always unset.
     static EXECUTION_OWNER: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-/// Attribute everything spawned on this thread to `owner` (a WS request id).
-/// The ws.rs handler sets it before executing a tool call and clears it
-/// after; desktop-originated calls leave it unset.
+/// Attribute everything spawned on this thread to `owner` (a request id).
+/// Set before executing a tool call and cleared after; callers with no id
+/// leave it unset.
 pub fn set_execution_owner(owner: Option<String>) {
     EXECUTION_OWNER.with(|o| *o.borrow_mut() = owner);
 }

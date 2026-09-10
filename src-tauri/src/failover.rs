@@ -6,9 +6,9 @@
 //! * **Local direction** — the developer's own terminal stopped touching
 //!   the project (no fs events). `inactive → working → stalled →
 //!   interrupted`. Any new activity vetoes the escalation.
-//! * **Web direction** — the paired web AI died mid-work (extension WS
-//!   dropped, or it stopped making tool calls). `working → stalled →
-//!   interrupted`.
+//! * **Web direction** — the remote caller went quiet mid-work. There is no
+//!   persistent socket left to observe, so this fires on inactivity alone.
+//!   `working → stalled → interrupted`.
 //!
 //! Pure logic + unit tests; the app wiring (ticker thread, events, handoff
 //! delivery) lives in `lib.rs`.
@@ -48,8 +48,10 @@ pub struct Thresholds {
     pub local_interrupt_after: Duration,
     /// Web: idle after web work before "stalled".
     pub web_stall_after: Duration,
-    /// Web: idle after "stalled" (or an extension WS drop at any point)
-    /// before "interrupted".
+    /// Web: idle after "stalled" before "interrupted". `check` still
+    /// interrupts immediately on `ws_connected == false`, but the app wiring
+    /// no longer passes `false` for the web direction, so inactivity is the
+    /// only trigger in practice.
     pub web_interrupt_after: Duration,
 }
 
@@ -149,8 +151,10 @@ impl ActivityMonitor {
         s.fired = false;
     }
 
-    /// Advance the state machine for `agent`. `ws_connected` reflects the
-    /// extension WebSocket (web direction only).
+    /// Advance the state machine for `agent`. `ws_connected` is the web
+    /// direction's "remote still attached" flag; the app wiring now passes
+    /// `true` unconditionally (there is no socket to drop), so only the idle
+    /// windows drive an interruption.
     pub fn check(&mut self, agent: Agent, ws_connected: bool, now: Instant) -> Check {
         let s = match agent {
             Agent::Local => &mut self.local,
@@ -282,11 +286,11 @@ mod tests {
     fn web_connected_idle_stalls_then_interrupts() {
         let mut m = ActivityMonitor::with_thresholds(fast_thresholds());
         m.record_activity(Agent::Web, "pair");
-        // WS alive: a short idle stalls, it doesn't fire yet.
+        // Remote still attached: a short idle stalls, it doesn't fire yet.
         let now = idle(&mut m, Agent::Web, 40);
         assert_eq!(m.check(Agent::Web, true, now), Check::Stalled);
-        // But silence outliving the interrupt window is a dead web AI,
-        // even with the extension still connected.
+        // But silence outliving the interrupt window is a dead remote caller,
+        // even with the transport still attached.
         let now = idle(&mut m, Agent::Web, 90);
         assert_eq!(m.check(Agent::Web, true, now), Check::Interrupted);
         assert_eq!(m.state(Agent::Web), State::Interrupted);
@@ -296,7 +300,7 @@ mod tests {
     fn web_ws_drop_triggers_interrupted() {
         let mut m = ActivityMonitor::with_thresholds(fast_thresholds());
         m.record_activity(Agent::Web, "tool");
-        // WS drops while still in working → immediate interruption.
+        // The remote detaches while still in working → immediate interruption.
         let now = idle(&mut m, Agent::Web, 40);
         assert_eq!(m.check(Agent::Web, false, now), Check::Interrupted);
         assert_eq!(m.state(Agent::Web), State::Interrupted);
@@ -308,7 +312,7 @@ mod tests {
         m.record_activity(Agent::Web, "tool");
         let now = idle(&mut m, Agent::Web, 40);
         assert_eq!(m.check(Agent::Web, true, now), Check::Stalled);
-        // ws drop while stalled is decisive...
+        // a detach while stalled is decisive...
         let now = idle(&mut m, Agent::Web, 45);
         assert_eq!(m.check(Agent::Web, false, now), Check::Interrupted);
 

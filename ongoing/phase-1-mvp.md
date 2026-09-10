@@ -4,6 +4,12 @@
 > **Branch:** `developing`
 > **M1 Definition of Done:** web-AI tool-call capture + live activity trace · single read-only command terminal streaming `run_command` · git panel from app · browser extension paired to desktop app · handoff card → Continue with ChatGPT · web-AI tool access (read_file/write_file/run_command with local execution + result relay) · exit gate = real interrupted task continued by ChatGPT with real tool access, validated with 5–10 devs (metric: successful continuation rate).
 
+> **Historical record.** This document was written while Lexsus still used a
+> Chrome-extension / loopback-WebSocket transport; that transport was later removed
+> for a desktop-local native MCP connector (see `2026-09-10-mcp-native-architecture.md`
+> in this directory). Any setup step or architecture description below that refers to
+> the extension, pairing codes, or `ws://127.0.0.1:45241` is preserved and no longer applies.
+
 This document explains everything built in Phase 1, how it works, how it was verified, and what remains.
 
 ---

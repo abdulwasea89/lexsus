@@ -9,30 +9,29 @@ import {
   DialogTitle,
 } from "./ui/dialog";
 import { Separator } from "./ui/separator";
+import type { McpStatus } from "../lib/types";
 
 interface ProjectDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   projectRoot: string;
   recents: string[];
-  pairCode: string;
-  paired: boolean;
+  connector: McpStatus | null;
   onPick: (path: string) => void;
   onBrowse: () => void;
 }
 
 /**
- * Project & pairing setup, moved off the old sidebar into one dialog:
- * recent folders, browse, and the 6-digit code the extension popup asks
- * for. Opened from the workbench rail.
+ * Project & connector setup, moved off the old sidebar into one dialog:
+ * recent folders, browse, and the loopback MCP endpoint a web AI's
+ * connector points at. Opened from the workbench rail.
  */
 export default function ProjectDialog({
   open,
   onOpenChange,
   projectRoot,
   recents,
-  pairCode,
-  paired,
+  connector,
   onPick,
   onBrowse,
 }: ProjectDialogProps) {
@@ -40,10 +39,10 @@ export default function ProjectDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>Project &amp; pairing</DialogTitle>
+          <DialogTitle>Project &amp; connector</DialogTitle>
           <DialogDescription>
-            Pick the folder the web AI works on, then pair the browser
-            extension with the code below.
+            Pick the folder the web AI works on, then point a connector at
+            the local endpoint below.
           </DialogDescription>
         </DialogHeader>
 
@@ -98,28 +97,33 @@ export default function ProjectDialog({
           <Separator />
 
           <div className="flex flex-col gap-2">
-            <p className="app-eyebrow text-muted-foreground">Pairing</p>
+            <p className="app-eyebrow text-muted-foreground">Connector</p>
             <div className="flex items-center justify-between gap-2">
               <Chip
-                color={paired ? "success" : "default"}
+                color={connector?.listening ? "success" : "default"}
                 variant="soft"
                 size="sm"
               >
-                {paired ? "Paired" : "Unpaired"}
+                {connector?.listening ? "Listening" : "Offline"}
               </Chip>
-              {pairCode ? (
-                <code className="rounded-md border border-border bg-muted/40 px-2.5 py-1 font-mono text-lg tracking-[0.35em] text-foreground">
-                  {pairCode}
+              {connector ? (
+                <code
+                  className="truncate rounded-md border border-border bg-muted/40 px-2.5 py-1 font-mono text-xs"
+                  title={connector.endpoint}
+                >
+                  {connector.endpoint}
                 </code>
               ) : (
                 <span className="text-xs text-muted-foreground">
-                  code appears after the server starts
+                  endpoint appears after the server starts
                 </span>
               )}
             </div>
             <p className="text-[11px] leading-relaxed text-muted-foreground">
-              Open the extension popup on chatgpt.com / claude.ai / gemini /
-              grok and enter this code — everything stays on 127.0.0.1.
+              Point a remote-MCP connector (Claude.ai → Customize →
+              Connectors) or a local MCP host at this URL. It binds loopback
+              only — a hosted AI reaches it through a tunnel you run. The
+              surface is read-only until you enable writes in the bridge view.
             </p>
           </div>
         </div>

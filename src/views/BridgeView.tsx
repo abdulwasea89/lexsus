@@ -1,7 +1,17 @@
 import { useEffect, useState } from "react";
 import { ChevronDownIcon, GlobeIcon } from "lucide-react";
-import { bridgeAudit, bridgeTool } from "../lib/bridge";
-import type { AuditEntry, BridgeTool, ToolResult } from "../lib/types";
+import {
+  bridgeAudit,
+  bridgeTool,
+  mcpSetAllowWrite,
+  mcpStatus,
+} from "../lib/bridge";
+import type {
+  AuditEntry,
+  BridgeTool,
+  McpStatus,
+  ToolResult,
+} from "../lib/types";
 import { cn } from "../lib/utils";
 import { Button } from "../components/ui/button";
 import {
@@ -12,15 +22,18 @@ import {
 import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
 import { ScrollArea } from "../components/ui/scroll-area";
+import { Switch } from "../components/ui/switch";
 import { ViewShell } from "./ViewShell";
 
 /**
- * Web-AI bridge view: a tool sandbox for testing read/write/run locally
- * and the audit trail. Approval requests live in the global banner —
- * this view is diagnostics only.
+ * Web-AI bridge view: the connector's live state (endpoint, bound
+ * workspace, the read-only/write switch), a tool sandbox for testing
+ * read/write/run locally, and the audit trail. Approval requests live in
+ * the global banner — this view is diagnostics only.
  */
 export default function BridgeView() {
   const [audit, setAudit] = useState<AuditEntry[]>([]);
+  const [connector, setConnector] = useState<McpStatus | null>(null);
   const [readPath, setReadPath] = useState("src/App.tsx");
   const [writePath, setWritePath] = useState("");
   const [writeContent, setWriteContent] = useState("");
@@ -31,6 +44,9 @@ export default function BridgeView() {
     void bridgeAudit(20)
       .then(setAudit)
       .catch(() => []);
+    void mcpStatus()
+      .then(setConnector)
+      .catch(() => null);
   }, []);
 
   async function sandboxRun(tool: BridgeTool) {
@@ -44,10 +60,61 @@ export default function BridgeView() {
   return (
     <ViewShell
       icon={GlobeIcon}
-      title="Web-AI bridge"
-      description={`tool sandbox · audit trail (last ${audit.length})`}
+      title="Web-AI connector"
+      description={`MCP endpoint · tool sandbox · audit trail (last ${audit.length})`}
     >
       <div className="flex flex-col gap-3">
+        <Collapsible className="flex flex-col gap-2" defaultOpen>
+          <CollapsibleTrigger className={sectionClass}>
+            MCP connector
+            <ChevronDownIcon className="size-4" />
+          </CollapsibleTrigger>
+          <CollapsibleContent>
+            <div className="flex flex-col gap-3 rounded-lg border border-border/60 bg-surface-2/50 p-3">
+              <div className="flex items-center justify-between gap-3">
+                <span className="shrink-0 text-[11px] text-muted-foreground">
+                  Endpoint
+                </span>
+                <code
+                  className="truncate font-mono text-xs"
+                  title={connector?.endpoint}
+                >
+                  {connector?.endpoint ?? "—"}
+                </code>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="shrink-0 text-[11px] text-muted-foreground">
+                  Workspace
+                </span>
+                <span
+                  className="truncate font-mono text-xs"
+                  title={connector?.workspace ?? ""}
+                >
+                  {connector?.workspace ?? "no project bound"}
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex min-w-0 flex-col">
+                  <span className="text-xs font-medium">
+                    Allow writes &amp; commands
+                  </span>
+                  <span className="text-[11px] leading-relaxed text-muted-foreground">
+                    Off = read-only surface. Every write still needs your
+                    approval here, on the desktop.
+                  </span>
+                </div>
+                <Switch
+                  size="sm"
+                  checked={connector?.allow_write ?? false}
+                  onCheckedChange={(checked) => {
+                    void mcpSetAllowWrite(checked).then(setConnector);
+                  }}
+                />
+              </div>
+            </div>
+          </CollapsibleContent>
+        </Collapsible>
+
         <Collapsible className="flex flex-col gap-2">
           <CollapsibleTrigger className={sectionClass}>
             Tool sandbox (test read / write / run locally)

@@ -4,6 +4,12 @@
 > **Scope:** completes **F2 — Session Archive** and **F3 — Fact Extraction** (Layer 1 + Layer 2 of the architecture), which had been partial since Phase 0.
 > **Branch:** `developing`
 
+> **Historical record.** This document was written while Lexsus still used a
+> Chrome-extension / loopback-WebSocket transport; that transport was later removed
+> for a desktop-local native MCP connector (see `2026-09-10-mcp-native-architecture.md`
+> in this directory). Any setup step or architecture description below that refers to
+> the extension, pairing codes, or `ws://127.0.0.1:45241` is preserved and no longer applies.
+
 ---
 
 ## What this delivers
