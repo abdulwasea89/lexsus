@@ -12,6 +12,7 @@ import type {
   GitFileStatus,
   GrantState,
   Handoff,
+  McpStatus,
   SessionEvent,
   SessionSummary,
   ToolResult,
@@ -116,12 +117,14 @@ export function bridgePause(paused: boolean): Promise<void> {
   return invoke("bridge_pause", { paused });
 }
 
-export function pairGetCode(): Promise<string> {
-  return invoke("pair_get_code");
+/** The connector's live state (endpoint, workspace, write surface). */
+export function mcpStatus(): Promise<McpStatus> {
+  return invoke("mcp_status");
 }
 
-export function pairStatus(): Promise<boolean> {
-  return invoke("pair_status");
+/** Open or close the connector's write surface at runtime. */
+export function mcpSetAllowWrite(enabled: boolean): Promise<McpStatus> {
+  return invoke("mcp_set_allow_write", { enabled });
 }
 
 export function setObjective(text: string): Promise<void> {
@@ -132,10 +135,6 @@ export function buildHandoff(): Promise<Handoff> {
   return invoke("build_handoff");
 }
 
-export function handoffSend(): Promise<Handoff> {
-  return invoke("handoff_send");
-}
-
 // --- automatic failover ------------------------------------------------------
 
 export function failoverStatus(): Promise<FailoverStatus> {
@@ -144,12 +143,6 @@ export function failoverStatus(): Promise<FailoverStatus> {
 
 export function failoverReset(agent: "local" | "web"): Promise<void> {
   return invoke("failover_reset", { agent });
-}
-
-export function failoverDeliver(
-  target: "chatgpt" | "claudeai" | "gemini" | "grok" | "local",
-): Promise<Handoff> {
-  return invoke("failover_deliver", { target });
 }
 
 export function failoverLog(limit?: number): Promise<FailoverLogEntry[]> {

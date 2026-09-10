@@ -53,7 +53,7 @@ export default function ApprovalBanner({
               <span
                 className={`font-semibold ${a.destructive ? "text-danger" : "text-warning"}`}
               >
-                {a.source === "web" ? "Web AI" : "Desktop"} requests:
+                {a.source === "mcp" ? "Web AI" : "Desktop"} requests:
               </span>{" "}
               <span className="font-mono text-xs">
                 {a.summary}

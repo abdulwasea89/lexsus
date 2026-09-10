@@ -179,6 +179,19 @@ export interface FactsSnapshot {
   facts: ProjectFacts;
 }
 
+// --- MCP connector -----------------------------------------------------------
+
+/** Live connector state, mirroring the Rust `McpStatus`. */
+export interface McpStatus {
+  /** True once the loopback endpoint actually bound. */
+  listening: boolean;
+  endpoint: string;
+  /** Read-only-first: writes stay hidden until this is flipped. */
+  allow_write: boolean;
+  /** The bound workspace — the connector's whole blast radius. */
+  workspace: string | null;
+}
+
 // --- failover ----------------------------------------------------------------
 
 /** Failover state machines for both directions (local → web, web AI). */

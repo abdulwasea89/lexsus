@@ -27,15 +27,10 @@ portable-pty = "0.8"
 notify = "6"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
-# Local WebSocket server for the browser extension (M2) — loopback only,
-# plain ws:// on 127.0.0.1, no TLS needed.
-tungstenite = "0.24"
-# Pairing codes come from the OS CSPRNG (clock-derived codes were guessable).
-getrandom = "0.2"
-# Desktop-local MCP server (Path B, additive): rmcp serves a Streamable-HTTP
-# MCP endpoint over loopback (axum drives its tower Service). Reuses the same
-# bridge tool engine and approval system as the extension path — nothing here
-# replaces or alters Path A.
+# The tool engine's single remote transport: rmcp serves a Streamable-HTTP MCP
+# endpoint over loopback (axum drives its tower Service). Every call funnels
+# through the same bridge policy engine — approvals, sensitive paths,
+# source-scoped grants, kill switch, audit — as the desktop sandbox.
 rmcp = { version = "3.2", features = ["transport-streamable-http-server"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync"] }

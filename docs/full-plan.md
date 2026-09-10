@@ -1,5 +1,11 @@
 # AI Continuity Bridge — Full Project Plan
 
+> **Historical record.** This document captures the plan as it stood when the
+> project was scaffolded. The browser-extension / loopback-WebSocket connection
+> path it describes was later removed in favour of a native MCP connector (see
+> `docs/architecture.md` and `docs/protocol-v2.md`). The phase history below is
+> preserved as-is; read it for provenance, not for current architecture.
+
 > **"Your AI can change. Your work doesn't."**
 
 > **Current model (single-terminal):** the app hosts exactly one terminal — the read-only live view of the web AI's `run_command` executions. The developer runs their local agent (Claude Code) in their **own** terminal; the app does not embed or mirror it. Sections below that describe an embedded interactive terminal / Claude Code pane / PTY session capture refer to the earlier design and are superseded by this.

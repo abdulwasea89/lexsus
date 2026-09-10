@@ -9,8 +9,8 @@
 5. **Live activity trace UI** with headroom-collapsing behavior.
 6. **Single command terminal** — every web-AI `run_command` streams live (read-only, no embedded shell).
 7. **Git panel (full workflow)** — status, diff, stage/unstage, branch, history, and **commit from the app**.
-8. **Browser extension** paired with the desktop app.
-9. **Manual interruption → handoff card → "Continue with ChatGPT"** with the web AI able to **read files, write files, and run commands** locally.
+8. **Native MCP connector** — a desktop-local MCP server on loopback, read-only first (write/command tools gated off by default).
+9. **Manual interruption → handoff card → continue in a web AI over the MCP connector** with the web AI able to **read files, write files, and run commands** locally.
 
 ## Out of Scope (for MVP)
 
@@ -18,7 +18,7 @@
 - Multiple web AIs (start with one, e.g. ChatGPT).
 - Team / enterprise features.
 - Automatic failover.
-- Browser automation / DOM scraping (web AI integration via extension only).
+- Browser automation / DOM scraping — the connector uses the provider's native tool channel instead.
 
 ## Success Criterion
 

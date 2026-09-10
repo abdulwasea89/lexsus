@@ -1,10 +1,10 @@
 //! The web-AI coding-agent bridge (M2).
 //!
-//! Tool calls arrive from the browser extension (over the local
-//! WebSocket), from the desktop tool sandbox, or from the frontend's
-//! handoff flow. Every call is policy-checked: reads are auto-approved
-//! (except sensitive paths), writes and command execution always require
-//! an explicit user approval. All calls are audited to SQLite.
+//! Tool calls arrive from the native MCP server (`mcp.rs`), from the desktop
+//! tool sandbox, or from the frontend's handoff flow. Every call is
+//! policy-checked: reads are auto-approved (except sensitive paths), writes
+//! and command execution always require an explicit user approval. All calls
+//! are audited to SQLite.
 
 use crate::{git, pty, shell::Shell};
 use serde::{Deserialize, Serialize};
@@ -75,9 +75,9 @@ pub enum Tool {
     CreateDirectory {
         path: String,
     },
-    /// Read several files in one round-trip. Each browser→WS→core→browser
-    /// hop costs real latency, so batching is a win even before approval
-    /// queuing.
+    /// Read several files in one round-trip. Each call costs a full trip
+    /// through the connector and the approval queue, so batching several
+    /// files into one call is a win.
     ReadManyFiles {
         paths: Vec<String>,
     },
@@ -113,8 +113,7 @@ pub enum Approval {
 /// Static, per-tool metadata. This is the single source of truth: the
 /// approval policy, trace kind, timeout, auto-insert behaviour and the
 /// AI-facing manifest are all derived from here rather than repeated in
-/// separate `match` arms across `bridge.rs`, `ws.rs`, `lib.rs` and the
-/// browser extension.
+/// separate `match` arms across `bridge.rs`, `lib.rs` and `mcp.rs`.
 #[derive(Debug, Clone)]
 pub struct ToolSpec {
     pub name: &'static str,
@@ -130,7 +129,9 @@ pub struct ToolSpec {
     /// Activity-trace kind, or `None` for calls not worth tracing.
     pub trace_kind: Option<&'static str>,
     pub timeout_ms: u32,
-    /// Read-only result the extension can paste straight into the chat.
+    /// Read-only result: true for the read-only/meta tools, false for every
+    /// tool that writes or runs a command. SPECS metadata only — no transport
+    /// consumes it since the extension relay was removed.
     pub auto_insert: bool,
     /// Manifest grouping; must appear in [`GROUPS`].
     pub group: &'static str,
@@ -142,11 +143,10 @@ pub const GROUPS: &[&str] = &[
 ];
 
 /// Caller/transport labels. Recorded in audits and grants, and compared so a
-/// session grant stays scoped to the path that earned it ("web" grants never
-/// auto-approve an "mcp" call, and vice versa).
+/// session grant stays scoped to the path that earned it (a desktop grant
+/// never auto-approves an `mcp` call, and vice versa).
 pub const SOURCE_DESKTOP: &str = "desktop"; // in-app sandbox / UI
-pub const SOURCE_WEB: &str = "web"; // browser-extension loopback (ws.rs)
-pub const SOURCE_MCP: &str = "mcp"; // native-MCP connector (mcp.rs)
+pub const SOURCE_MCP: &str = "mcp"; // the connector's remote caller (mcp.rs)
 
 /// Every tool the bridge can execute.
 pub const SPECS: &[ToolSpec] = &[
@@ -376,10 +376,9 @@ pub fn spec_by_name(name: &str) -> Option<&'static ToolSpec> {
 /// project context, so the AI calls `describe_tool` for detail on demand.
 ///
 /// Rendered as an aligned table, **never** as `name(args)`. This is the body
-/// of `list_tools`, which auto-inserts into the chat, so the AI echoes it
-/// back — and the extension's line parser matched the call form, executing
-/// the whole tool surface at once. `run_command`'s pattern treats the quote
-/// as optional, so even `run_command(shell command)` fired. Keep it inert.
+/// of `list_tools`, which is handed straight to the model, and text in call
+/// syntax reads as a burst of tool calls when the model echoes it back. Keep
+/// it inert.
 pub fn tool_manifest() -> String {
     let mut out = String::new();
     for group in GROUPS {
@@ -397,8 +396,8 @@ pub fn tool_manifest() -> String {
     out
 }
 
-/// Full detail for one tool, for `describe_tool`. Also auto-inserted into the
-/// chat, so it avoids call syntax for the same reason as `tool_manifest`.
+/// Full detail for one tool, for `describe_tool`. Also handed straight to the
+/// model, so it avoids call syntax for the same reason as `tool_manifest`.
 fn describe_spec(s: &ToolSpec) -> String {
     let approval = match s.approval {
         Approval::Auto => "runs immediately",
@@ -428,9 +427,9 @@ fn describe_spec(s: &ToolSpec) -> String {
 /// from a model writing raw JSON, and a single path often stands in where a
 /// `paths` array belongs.
 ///
-/// This is the shared entry point for every transport — the extension loopback
-/// (via `ws.rs`), and later the MCP connector — so all paths parse a given
-/// tool call identically.
+/// This is the shared entry point for every caller — the native MCP server
+/// (`mcp.rs`), and the desktop/in-app path (`bridge_tool`) — so all paths
+/// parse a given tool call identically.
 pub fn parse_tool_call(tool_name: &str, args: &serde_json::Value) -> Result<Tool, String> {
     let spec = spec_by_name(tool_name).ok_or_else(|| format!("unknown tool: {tool_name}"))?;
     let str_arg = |key: &str| -> Result<String, String> {
@@ -814,11 +813,8 @@ pub enum ErrorCode {
     AmbiguousMatch,
     PatchDoesNotApply,
     BridgePaused,
-    MalformedJson,
     ExecutionFailed,
     CommandTimeout,
-    ConnectionLost,
-    NotPaired,
     UnknownTool,
     InternalError,
     Denied,
@@ -838,11 +834,8 @@ impl std::fmt::Display for ErrorCode {
             ErrorCode::AmbiguousMatch => write!(f, "AMBIGUOUS_MATCH"),
             ErrorCode::PatchDoesNotApply => write!(f, "PATCH_DOES_NOT_APPLY"),
             ErrorCode::BridgePaused => write!(f, "BRIDGE_PAUSED"),
-            ErrorCode::MalformedJson => write!(f, "MALFORMED_JSON"),
             ErrorCode::ExecutionFailed => write!(f, "EXECUTION_FAILED"),
             ErrorCode::CommandTimeout => write!(f, "COMMAND_TIMEOUT"),
-            ErrorCode::ConnectionLost => write!(f, "CONNECTION_LOST"),
-            ErrorCode::NotPaired => write!(f, "NOT_PAIRED"),
             ErrorCode::UnknownTool => write!(f, "UNKNOWN_TOOL"),
             ErrorCode::InternalError => write!(f, "INTERNAL_ERROR"),
             ErrorCode::Denied => write!(f, "DENIED"),
@@ -950,8 +943,8 @@ pub struct SessionGrant {
     /// project. Commands have no path, so their grants carry `None`.
     pub path_prefix: Option<String>,
     /// Who created it ("web" | "desktop"); it only auto-approves calls from
-    /// the same source, so a desktop grant never silently covers a paired
-    /// extension's calls.
+    /// the same source, so a desktop grant never silently covers an MCP
+    /// connector's calls.
     pub source: String,
 }
 
@@ -962,11 +955,11 @@ pub struct ApprovalRequest {
     pub tool: Tool,
     pub summary: String,
     pub source: String, // web | desktop
-    /// The WS request id that asked for this tool, when it came from the
-    /// extension. A gated `run_command` executes on the desktop's
-    /// `bridge_approve` thread, not the WS thread — carrying the owner here
-    /// is what lets the spawned PTY still be attributed to (and cancellable
-    /// by) the original request.
+    /// The request id that asked for this tool, when the caller carried one
+    /// (nothing sets one today — see `process::execution_owner`). A gated
+    /// `run_command` executes on the desktop's `bridge_approve` thread, not
+    /// the caller's — carrying the owner here is what lets the spawned PTY
+    /// still be attributed to (and cancellable by) the original request.
     pub owner: Option<String>,
 }
 
@@ -974,7 +967,7 @@ pub struct ApprovalRequest {
 #[derive(Default)]
 pub struct Bridge {
     pub pending: Mutex<Vec<ApprovalRequest>>,
-    /// WS callers waiting for approval resolution, keyed by request id.
+    /// Remote callers waiting for approval resolution, keyed by request id.
     pub channels: Mutex<HashMap<u64, SyncSender<ToolResult>>>,
     /// Active session grants (the Phase 6 approval-engine slice).
     pub grants: Mutex<Vec<SessionGrant>>,
@@ -1052,7 +1045,7 @@ impl Bridge {
     }
 
     /// Resolve a pending approval. Executes the tool when allowed,
-    /// delivers the result to any waiting WS caller, and returns the
+    /// delivers the result to any waiting remote caller, and returns the
     /// result plus the resolved request (for auditing). `on_event`
     /// receives command stream events while a `run_command` executes.
     pub fn resolve(
@@ -1068,7 +1061,7 @@ impl Bridge {
         drop(pending);
 
         let result = if allow {
-            // Execute attributed to the original WS request (see
+            // Execute attributed to the original request (see
             // `ApprovalRequest::owner`), so a cancel for that request can
             // kill a `run_command` spawned here on the desktop's thread.
             let prev = crate::process::execution_owner();
@@ -1090,7 +1083,7 @@ impl Bridge {
     }
 
     /// Remove a still-pending approval without executing it — used when the
-    /// waiting caller (the paired web AI) gave up before the user decided
+    /// waiting caller (the MCP connector) gave up before the user decided
     /// (approval timed out). Drops the request's channel too, and returns the
     /// removed request so the caller can audit it and dismiss the card. A
     /// later [`resolve`](Self::resolve) on the same id finds nothing and so
@@ -1315,11 +1308,13 @@ pub fn describe_for_approval(tool: &Tool, root: Option<&Path>) -> String {
 /// sanity limit on what we will scan, not on what the AI can read.
 const READ_CAP: u64 = 16 * 1024 * 1024;
 
-/// One chunk's budget. Sized to land well inside the extension's 24KB
-/// composer cap (`COMPOSER_CAP` in `tool-spec.js`) once line numbers and the
-/// footer are added, because a single oversized insert froze the host page.
-/// A single line longer than this is still returned whole — the composer cap
-/// is the backstop for that case.
+/// One chunk's budget. Bounds a single read to `CHUNK_LINES` lines and
+/// `CHUNK_BYTES` of content, so one call returns a readable page rather than
+/// an unbounded dump. The 24KB chat-composer cap this was originally sized to
+/// fit belonged to the deleted browser extension; the only hard ceiling left
+/// is the connector's `RESULT_CHAR_CAP` (140,000 chars, `mcp.rs`), which this
+/// sits far inside. A single line longer than `CHUNK_BYTES` is still returned
+/// whole — chunking must always make progress, and that cap is the backstop.
 const CHUNK_LINES: usize = 400;
 const CHUNK_BYTES: usize = 16 * 1024;
 
@@ -1351,9 +1346,10 @@ fn chunk_bounds(lines: &[&str], want: usize) -> Vec<(usize, usize)> {
 /// Render one chunk of a file as `cat -n` style numbered lines, with a footer
 /// naming the exact call that returns the next chunk.
 ///
-/// Files are paged rather than truncated. Pushing a whole large file into the
-/// chat composer at once pegged the CPU and froze the page, and silently
-/// cutting the tail meant the AI could never see the rest of the file.
+/// Files are paged rather than truncated. Silently cutting the tail would
+/// leave the AI unable to see the rest of the file, and returning the whole
+/// thing (up to `READ_CAP`) would swamp both the model's context and the
+/// connector's result cap.
 fn chunk_text(path: &str, text: &str, offset: Option<u32>, limit: Option<u32>) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let total = lines.len();
@@ -1710,10 +1706,11 @@ fn apply_hunks(lines: &[String], hunks: &[Hunk]) -> Result<Vec<String>, ToolErro
 }
 
 /// How many files a `read_many_files` call may batch, and the batch's total
-/// byte budget. The budget keeps the whole auto-inserted result inside the
-/// extension's 24KB composer cap: a rendered 400-line chunk is ~16KB of
-/// content plus ~2.5KB of line numbers and a footer, so 20KB admits one
-/// full chunk with headroom for headers.
+/// byte budget. The budget keeps one batch to a single readable page: a
+/// rendered 400-line chunk is ~16KB of content plus ~2.5KB of line numbers and
+/// a footer, so 20KB admits one full chunk with headroom for headers. The
+/// figure was originally chosen to fit the browser extension's 24KB chat
+/// composer cap; that cap is gone, but the sizing still holds.
 const MANY_FILES_MAX: usize = 20;
 const MANY_BYTES_BUDGET: usize = 20 * 1024;
 
@@ -2056,8 +2053,8 @@ pub fn execute(
                 };
                 // Register the PTY child so a `cancel` for the owning
                 // request can kill the whole process group mid-run — the
-                // registry owner is the WS request id set by the ws.rs
-                // handler (desktop calls register with no owner).
+                // registry owner is the request id around execution
+                // (calls with no owner register with none).
                 let mut reg_id = None;
                 let mut on_spawn = |pid: u32| {
                     reg_id = Some(crate::process::registry().register(
@@ -2180,7 +2177,7 @@ pub fn execute(
     }
 }
 
-/// Create a channel a WS caller can wait on for approval resolution.
+/// Create a channel a remote caller can wait on for approval resolution.
 pub fn wait_channel() -> (SyncSender<ToolResult>, Receiver<ToolResult>) {
     sync_channel(1)
 }
@@ -3227,10 +3224,10 @@ mod tests {
 
     #[test]
     fn manifest_and_describe_are_not_call_syntax() {
-        // `list_tools` and `describe_tool` auto-insert into the chat, so the AI
-        // echoes their output back and the extension's line parser sees it. In
-        // call syntax every row was a live tool call: echoing the manifest ran
-        // the whole surface, approval cards and all, and froze the page.
+        // `list_tools` and `describe_tool` output goes straight into a model's
+        // context, and the model may echo it back. In call syntax every row
+        // was a live tool call: echoing the manifest ran the whole surface,
+        // approval cards and all. Keep the text inert.
         let mut text = tool_manifest();
         for s in SPECS {
             text.push_str(&describe_spec(s));
@@ -3285,7 +3282,7 @@ mod tests {
     #[test]
     fn chunk_is_bounded_by_bytes_not_just_lines() {
         // 100 lines of 1KB each: the line budget is 400, so bytes must be what
-        // stops it, or one chunk would blow past the composer cap.
+        // stops it, or one chunk would blow past CHUNK_BYTES.
         let text = (0..100)
             .map(|_| format!("{}\n", "x".repeat(1024)))
             .collect::<String>();
@@ -3441,8 +3438,8 @@ mod tests {
 
     #[test]
     fn parser_coercions_survive_the_lift() {
-        // Behaviour guarantees that Path A (extension over ws.rs) has always
-        // relied on and that MCP args must share.
+        // Behaviour guarantees a loose, model-written args object has always
+        // relied on, and that MCP args must share.
         // Single string stands in for a paths array.
         let t = parse_tool_call("read_many_files", &serde_json::json!({"paths": "a.txt"}))
             .expect("single-string paths");
@@ -3483,7 +3480,7 @@ mod tests {
                 replace_all: None
             }
         );
-        // Unknown tool name errors, matching the old ws.rs behaviour.
+        // Unknown tool name is an error, not a panic.
         assert!(parse_tool_call("no_such_tool", &serde_json::json!({})).is_err());
     }
 }

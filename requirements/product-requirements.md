@@ -24,13 +24,13 @@ A local-first desktop app that lets a developer continue an interrupted AI codin
 
 ### 4. Handoff
 - FR-4.1: Format compressed state into a web-AI-specific handoff prompt (Layer 4).
-- FR-4.2: Deliver the handoff to the chosen web AI (ChatGPT / Claude.ai / Gemini) via the browser extension.
+- FR-4.2: Deliver the handoff to the chosen web AI (ChatGPT / Claude.ai / Gemini) over the native MCP connector, and surface it in-app (copyable to the clipboard from the Handoff view). A `get_handoff` connector pull tool is the planned replacement for the manual copy.
 
 ### 5. Web AI Coding-Agent Tools
 - FR-5.1: Let the web AI read local files (`read_file`).
 - FR-5.2: Let the web AI write/edit local files (`write_file`).
 - FR-5.3: Let the web AI run terminal commands locally (`run_command`).
-- FR-5.4: Relay tool-call results back to the web AI via the extension.
+- FR-5.4: Return tool-call results back to the web AI through the connector's native tool channel.
 
 ### 6. Live Activity Trace
 - FR-6.1: Render observed actions (reads, writes, commands) as a live, collapsible step tree.
@@ -54,7 +54,7 @@ A local-first desktop app that lets a developer continue an interrupted AI codin
 ## Constraints
 
 - Desktop app must support macOS, Windows, and Linux.
-- Browser extension (Chrome/Firefox) for web-AI integration.
+- Native MCP connector for web-AI integration: a desktop-local MCP server bound to loopback, reached by the provider's own connector support (Claude.ai custom connectors first; any MCP-capable host, including Claude Code or Claude Desktop, can point straight at the loopback URL).
 - Web-AI targets: ChatGPT, Claude.ai, Gemini.
 - Local source agent: Claude Code (optionally Codex CLI) — run by the developer in their own terminal; the app does not host it.
 - OS-native file watchers: fsevents / inotify / ReadDirectoryChangesW.

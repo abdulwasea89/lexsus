@@ -22,13 +22,11 @@ pub mod transcript;
 
 pub mod watcher;
 
-pub mod ws;
-
 use std::collections::VecDeque;
 
 use std::path::PathBuf;
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use std::sync::{Arc, Mutex};
 
@@ -39,7 +37,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 /// App-managed shared state: the SQLite connection, the watched project
-/// root, the extension WebSocket, and the approval queue.
+/// root, the MCP connector's live policy, and the approval queue.
 pub(crate) struct AppState {
     pub(crate) conn: Mutex<rusqlite::Connection>,
     pub(crate) project_root: Mutex<Option<PathBuf>>,
@@ -47,19 +45,21 @@ pub(crate) struct AppState {
     /// Replaced — never stacked — on each `start_watch`, so a stale watcher
     /// from an earlier root cannot keep vetoing the local failover idle timer.
     pub(crate) fs_watcher: Mutex<Option<notify::RecommendedWatcher>>,
-    pub(crate) pair_code: Mutex<String>,
-    pub(crate) ws_connected: AtomicBool,
-    pub(crate) ws_tx: Mutex<Option<Arc<Mutex<tungstenite::WebSocket<std::net::TcpStream>>>>>,
     pub(crate) bridge: Mutex<bridge::Bridge>,
     pub(crate) objective: Mutex<Option<String>>,
     /// Recent "editing X" steps, for watcher cross-correlation.
     pub(crate) recent_edits: Mutex<VecDeque<(String, Instant)>>,
     /// Automatic-failover state machines (local + web directions).
     pub(crate) failover: Mutex<failover::ActivityMonitor>,
-    /// Live read-only/write gate for the native-MCP connector (Path B). Off
-    /// by default: the connector surface is read-only until this is flipped,
-    /// which then also re-exposes the write/command tools.
+    /// Live read-only/write gate for the native-MCP connector. Off by
+    /// default: the connector surface is read-only until this is flipped,
+    /// which then also re-exposes the write/command tools. Toggled at runtime
+    /// from the desktop — no rebuild, no reconnect.
     pub(crate) mcp_allow_write: Arc<AtomicBool>,
+    /// Whether the connector actually bound its loopback socket. Set by
+    /// [`mcp::spawn_server`] once the listener is up, so the UI can tell
+    /// "endpoint live" from "endpoint failed to bind".
+    pub(crate) mcp_listening: Arc<AtomicBool>,
 }
 
 /// A trace step emitted to the UI (mirrors `TraceStep` in the frontend).
@@ -277,7 +277,7 @@ pub(crate) fn command_stream(app: &AppHandle) -> impl FnMut(bridge::CommandEvent
 }
 
 /// Route a tool call through the approval policy. Shared by the
-/// `bridge_tool` command (desktop) and the WebSocket handler (web).
+/// `bridge_tool` command (desktop) and the native MCP server (`mcp.rs`).
 pub(crate) fn tool_call(app: &AppHandle, tool: bridge::Tool, source: &str) -> bridge::ToolResult {
     let state = app.state::<AppState>();
     let root = state.project_root.lock().unwrap().clone();
@@ -323,11 +323,10 @@ pub(crate) fn tool_call(app: &AppHandle, tool: bridge::Tool, source: &str) -> br
             "grantable": grantable,
         }),
     );
-    // Remote callers (extension loopback, MCP connector) wait here for the
-    // user's decision on the desktop. The desktop itself never blocks: it
-    // resolves the same request through `bridge_approve`.
+    // Remote callers (the MCP connector) wait here for the user's decision
+    // on the desktop. The desktop itself never blocks: it resolves the same
+    // request through `bridge_approve`.
     let timeout = match source {
-        bridge::SOURCE_WEB => Duration::from_secs(300),
         bridge::SOURCE_MCP => Duration::from_secs(crate::mcp::APPROVAL_WAIT_SECS),
         // Desktop sandbox / anything else: return the queued marker; the UI
         // resolves via bridge_approve and gets the executed result there.
@@ -377,7 +376,8 @@ pub(crate) fn tool_call(app: &AppHandle, tool: bridge::Tool, source: &str) -> br
     }
 }
 
-/// Desktop tool sandbox / extension relay entry.
+/// Desktop tool sandbox entry — the in-app caller path (the only other
+/// transport is the native MCP server).
 #[tauri::command]
 fn bridge_tool(
     state: State<'_, AppState>,
@@ -502,9 +502,9 @@ fn bridge_audit(
 }
 
 /// Cancel a running tool call: kill every process its `run_command` spawned
-/// (SIGTERM to the process group, SIGKILL after a grace period). `owner` is
-/// the WS request id the extension got back with its tool_result, or the
-/// id shown on the approval card.
+/// (SIGTERM to the process group, SIGKILL after a grace period). `owner` must
+/// match the id the process registered under (`process::ProcessEntry.owner`);
+/// a process registered with no owner is not reachable this way.
 #[tauri::command]
 fn cancel_request(owner: String) -> Result<usize, String> {
     Ok(process::registry().kill_owner(&owner, Duration::from_millis(500)))
@@ -551,7 +551,7 @@ pub(crate) fn record_tool_trace(state: &AppState, app: &AppHandle, tool: &bridge
             ts: now_millis(),
         },
     );
-    // Web activity: the paired web AI is making real tool calls.
+    // Web-direction activity: the remote caller is making real tool calls.
     state
         .failover
         .lock()
@@ -575,24 +575,46 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-// --- pairing + handoff -------------------------------------------------------
+// --- MCP connector -----------------------------------------------------------
 
-/// Get (or generate) the 6-digit pairing code for the extension.
-/// Session-scoped: never persisted — see the bootstrap note in `run()`.
-#[tauri::command]
-fn pair_get_code(state: State<'_, AppState>, app: tauri::AppHandle) -> Result<String, String> {
-    let mut code = state.pair_code.lock().unwrap();
-    if code.is_empty() {
-        *code = ws::new_pair_code();
-        let _ = app.emit("pair://code", code.clone());
-    }
-    Ok(code.clone())
+/// The connector's live state as the desktop renders it: where the endpoint
+/// is, whether it bound, what workspace it can reach, and whether the write
+/// surface is currently exposed.
+#[derive(Clone, serde::Serialize)]
+struct McpStatus {
+    listening: bool,
+    endpoint: String,
+    allow_write: bool,
+    workspace: Option<String>,
 }
 
-/// Is an extension currently paired?
+fn mcp_status_of(state: &AppState) -> McpStatus {
+    McpStatus {
+        listening: state.mcp_listening.load(Ordering::SeqCst),
+        endpoint: format!("http://{}{}", mcp::ADDR, mcp::MCP_PATH),
+        allow_write: state.mcp_allow_write.load(Ordering::SeqCst),
+        workspace: state
+            .project_root
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|p| p.display().to_string()),
+    }
+}
+
+/// Read the connector state (the desktop polls this on mount).
 #[tauri::command]
-fn pair_status(state: State<'_, AppState>) -> Result<bool, String> {
-    Ok(state.ws_connected.load(std::sync::atomic::Ordering::SeqCst))
+fn mcp_status(state: State<'_, AppState>) -> McpStatus {
+    mcp_status_of(&state)
+}
+
+/// Open or close the connector's write surface at runtime. This is the only
+/// thing that moves `allow_write`, which seeds from `LEXSUS_MCP_ALLOW_WRITE`
+/// at launch and is otherwise read-only-first.
+#[tauri::command]
+fn mcp_set_allow_write(state: State<'_, AppState>, enabled: bool) -> McpStatus {
+    state.mcp_allow_write.store(enabled, Ordering::SeqCst);
+    mcp_status_of(&state)
 }
 
 /// Set the handoff objective (editable in the handoff panel).
@@ -624,7 +646,7 @@ pub struct Handoff {
 }
 
 /// Build the handoff card from persisted trace state (shared by the
-/// desktop command and the extension's handoff-request).
+/// desktop command and the automatic-failover paths).
 pub(crate) fn build_handoff_impl(state: &AppState) -> Result<Handoff, String> {
     // Transcript first (reads ~/.claude), then DB. Read root before
     // taking the DB lock so parsing never blocks the app.
@@ -709,18 +731,6 @@ fn build_handoff(state: State<'_, AppState>) -> Result<Handoff, String> {
     build_handoff_impl(&state)
 }
 
-/// Send the handoff to the paired extension (returns the payload; false
-/// when no extension is paired — the frontend falls back to copy).
-#[tauri::command]
-fn handoff_send(state: State<'_, AppState>, app: tauri::AppHandle) -> Result<Handoff, String> {
-    let handoff = build_handoff(state)?;
-    let payload = serde_json::to_value(&handoff).map_err(|e| e.to_string())?;
-    if !ws::push_handoff(&app, &payload) {
-        // still return the payload; frontend offers clipboard fallback
-    }
-    Ok(handoff)
-}
-
 // --- automatic failover -------------------------------------------------------
 
 /// Direction A trigger: the developer's own terminal went quiet for long
@@ -751,7 +761,10 @@ fn run_local_failover(app: &AppHandle) {
         obj.insert("direction".into(), serde_json::json!("local_to_web"));
         obj.insert("target".into(), serde_json::json!("chatgpt"));
     }
-    let delivered = ws::push_handoff(app, &payload);
+    // The connector is pull-based: the desktop can no longer push a handoff
+    // into a chat the way the extension relay could. The interruption is
+    // surfaced in-app instead, carrying the same handoff the connector's
+    // `get_handoff` tool hands back to a connected session.
     let payload_str = payload.to_string();
     let _ = db::record_failover(
         &state.conn.lock().unwrap(),
@@ -760,29 +773,28 @@ fn run_local_failover(app: &AppHandle) {
             trigger: "inactivity",
             idle_ms: idle,
             payload: Some(&payload_str),
-            target: Some("chatgpt"),
-            delivered,
-            outcome: if delivered {
-                Some("auto-continued on ChatGPT")
-            } else {
-                Some("unpaired — offered in-app")
-            },
+            target: None,
+            delivered: false,
+            outcome: Some("offered in-app"),
         },
     );
     let _ = app.emit(
         "failover://local",
-        serde_json::json!({"ok": true, "delivered": delivered, "idle_ms": idle, "handoff": handoff}),
+        serde_json::json!({"ok": true, "delivered": false, "idle_ms": idle, "handoff": handoff}),
     );
 }
 
-/// Direction B trigger: the paired web AI died mid-work (extension WS
-/// dropped or it went silent). Surface a card offering another web AI or
-/// handing back to the local terminal.
+/// Direction B trigger: the remote caller went quiet mid-work. With no
+/// persistent socket left to observe, this fires on inactivity alone.
+/// Surface a card offering another web AI or handing back to the local
+/// terminal.
 fn run_web_failover(app: &AppHandle) {
     let state = app.state::<AppState>();
     let idle = failover::idle_ms(&state.failover.lock().unwrap(), failover::Agent::Web);
-    let ws_down = !state.ws_connected.load(std::sync::atomic::Ordering::SeqCst);
-    let trigger = if ws_down { "ws_drop" } else { "inactivity" };
+    // The native connector attaches and detaches on its own schedule, so
+    // there is no persistent socket here to observe: this direction now
+    // fires on inactivity alone.
+    let trigger = "inactivity";
     let _ = db::record_failover(
         &state.conn.lock().unwrap(),
         &db::NewFailover {
@@ -808,11 +820,12 @@ fn spawn_failover_ticker(app: tauri::AppHandle) {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(30));
         let state = app.state::<AppState>();
-        let ws_connected = state.ws_connected.load(std::sync::atomic::Ordering::SeqCst);
         let now = Instant::now();
         let mut monitor = state.failover.lock().unwrap();
         let local = monitor.check(failover::Agent::Local, false, now);
-        let web = monitor.check(failover::Agent::Web, ws_connected, now);
+        // `true` means "remote attached": with the connector there is no
+        // socket to watch, so the web direction is inactivity-only.
+        let web = monitor.check(failover::Agent::Web, true, now);
         let status = serde_json::json!({
             "local": monitor.state(failover::Agent::Local).label(),
             "web": monitor.state(failover::Agent::Web).label(),
@@ -853,73 +866,6 @@ fn failover_reset(state: State<'_, AppState>, agent: String) -> Result<(), Strin
     };
     monitor.reset(agent);
     Ok(())
-}
-
-/// Direction B continuation: deliver the current handoff to a chosen
-/// target (`chatgpt | claudeai | gemini | grok`), or hand back to the local
-/// terminal (`local`).
-#[tauri::command]
-fn failover_deliver(
-    state: State<'_, AppState>,
-    app: tauri::AppHandle,
-    target: String,
-) -> Result<Handoff, String> {
-    // Must stay in step with TARGET_HOSTS in extension/background.js — the
-    // extension is what actually opens the tab for the target we name here.
-    if !matches!(
-        target.as_str(),
-        "chatgpt" | "claudeai" | "gemini" | "grok" | "local"
-    ) {
-        return Err("target must be chatgpt, claudeai, gemini, grok or local".into());
-    }
-    let handoff = build_handoff_impl(&state)?;
-    if target == "local" {
-        // Hand back: the developer resumes in their own terminal. Log it
-        // and re-arm the web monitor.
-        let _ = db::record_failover(
-            &state.conn.lock().unwrap(),
-            &db::NewFailover {
-                direction: "web_to_local",
-                trigger: "manual",
-                idle_ms: 0,
-                payload: None,
-                target: Some("local"),
-                delivered: false,
-                outcome: Some("developer resumes locally"),
-            },
-        );
-        state.failover.lock().unwrap().reset(failover::Agent::Web);
-        return Ok(handoff);
-    }
-    let payload = serde_json::to_value(&handoff)
-        .map(|mut v| {
-            if let Some(obj) = v.as_object_mut() {
-                obj.insert("auto".into(), serde_json::json!(true));
-                obj.insert("direction".into(), serde_json::json!("web_to_web"));
-                obj.insert("target".into(), serde_json::json!(target));
-            }
-            v
-        })
-        .map_err(|e| e.to_string())?;
-    let delivered = ws::push_handoff(&app, &payload);
-    let _ = db::record_failover(
-        &state.conn.lock().unwrap(),
-        &db::NewFailover {
-            direction: "web_to_web",
-            trigger: "manual",
-            idle_ms: 0,
-            payload: Some(&payload.to_string()),
-            target: Some(&target),
-            delivered,
-            outcome: if delivered {
-                Some("delivered to target")
-            } else {
-                Some("unpaired — offered in-app")
-            },
-        },
-    );
-    state.failover.lock().unwrap().reset(failover::Agent::Web);
-    Ok(handoff)
 }
 
 /// Recent automatic-failover records (feeds the continuation-rate metric).
@@ -1015,6 +961,16 @@ fn facts_extract(state: State<'_, AppState>) -> Result<FactsSnapshot, String> {
 
 // --- app bootstrap -----------------------------------------------------------
 
+/// Whether the connector starts with its write surface open. Off unless
+/// `LEXSUS_MCP_ALLOW_WRITE` is set to a truthy value — read-only-first is the
+/// security posture, and the desktop can still flip it live afterwards.
+fn mcp_allow_write_seed() -> bool {
+    matches!(
+        std::env::var("LEXSUS_MCP_ALLOW_WRITE").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -1024,38 +980,36 @@ pub fn run() {
             conn: Mutex::new(rusqlite::Connection::open_in_memory().expect("in-memory db")),
             project_root: Mutex::new(None),
             fs_watcher: Mutex::new(None),
-            pair_code: Mutex::new(String::new()),
-            ws_connected: AtomicBool::new(false),
-            ws_tx: Mutex::new(None),
             bridge: Mutex::new(bridge::Bridge::new()),
             objective: Mutex::new(None),
             recent_edits: Mutex::new(VecDeque::new()),
             failover: Mutex::new(failover::ActivityMonitor::new()),
-            mcp_allow_write: Arc::new(AtomicBool::new(false)),
+            // Read-only first: the connector exposes no write tool until the
+            // desktop flips it live (or `LEXSUS_MCP_ALLOW_WRITE` seeds it on).
+            mcp_allow_write: Arc::new(AtomicBool::new(mcp_allow_write_seed())),
+            mcp_listening: Arc::new(AtomicBool::new(false)),
         })
         .setup(|app| {
-            // Auto-init: app-data SQLite, persisted settings, WS server.
+            // Auto-init: app-data SQLite, persisted settings, connector.
             let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
             let db_path = dir.join("bridge.db");
             let conn = db::open_and_migrate(&db_path).map_err(|e| e.to_string())?;
             let root = db::get_setting(&conn, "project_root").ok().flatten();
-            // Pairing code: fresh from the CSPRNG at every launch, memory
-            // only. It used to be persisted in SQLite and reused forever —
-            // a standing credential that any local process could brute
-            // force at leisure (or read straight out of the DB). The
-            // extension re-pairs once per app session, like Bluetooth.
+            // The old extension's persisted pairing code is obsolete — drop it
+            // so no stale credential lingers in the DB.
             let _ = db::delete_setting(&conn, "pair_code");
-            let code = ws::new_pair_code();
             let state = app.state::<AppState>();
             *state.conn.lock().unwrap() = conn;
             *state.project_root.lock().unwrap() = root.map(PathBuf::from);
-            *state.pair_code.lock().unwrap() = code;
-            ws::spawn_server(app.handle().clone());
             spawn_failover_ticker(app.handle().clone());
-            // Path B (additive): the desktop-local MCP endpoint. Extension
-            // pairing above stays exactly as it is.
-            mcp::spawn_server(app.handle().clone(), state.mcp_allow_write.clone());
+            // The durable endpoint: a desktop-local MCP server on loopback,
+            // which a provider connector reaches through a tunnel.
+            mcp::spawn_server(
+                app.handle().clone(),
+                state.mcp_allow_write.clone(),
+                state.mcp_listening.clone(),
+            );
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1082,14 +1036,12 @@ pub fn run() {
             bridge_pause,
             cancel_request,
             processes_list,
-            pair_get_code,
-            pair_status,
+            mcp_status,
+            mcp_set_allow_write,
             set_objective,
             build_handoff,
-            handoff_send,
             failover_status,
             failover_reset,
-            failover_deliver,
             failover_log,
             sessions_archive,
             sessions_list,

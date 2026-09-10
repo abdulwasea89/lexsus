@@ -1,15 +1,14 @@
-//! Desktop-local MCP server (Path B, additive).
+//! Desktop-local MCP server — the bridge's remote transport.
 //!
-//! Exposes the same bridge tool engine as a Streamable-HTTP MCP server on
+//! Exposes the bridge tool engine as a Streamable-HTTP MCP server on
 //! `127.0.0.1:45147/mcp`. Local MCP hosts (MCP Inspector, Claude Code/Desktop)
-//! can point at it today; later the same server sits behind a dev tunnel or
-//! the hosted gateway so provider-native connectors (e.g. Claude.ai custom
-//! connectors) reach it too. The browser-extension loopback in [`crate::ws`]
-//! is untouched and keeps working — this is a second path, not a replacement.
+//! point at it directly; provider-native connectors (e.g. Claude.ai custom
+//! connectors) reach the same endpoint through a tunnel or the hosted gateway.
+//! One server, one tool engine, one approval system, one audit trail.
 //!
 //! Security posture mirrors the rest of the bridge:
-//! - Bound to loopback only; the endpoint exposes no write tool unless
-//!   [`AppState::mcp_allow_write`] is set (a connector is read-only first).
+//! - Bound to loopback only. The endpoint exposes no write tool unless
+//!   `mcp_allow_write` is set (a connector is read-only first).
 //! - Every call routes through `crate::tool_call(..., "mcp")`, so the desktop
 //!   stays the sole approval authority and session grants stay source-scoped.
 //! - Tool results are capped so a connector (provider ceiling ≈150k chars)
@@ -29,9 +28,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::AppHandle;
 
-/// Loopback bind address — the durable Path B endpoint. Chosen on a different
-/// port from the extension WS (`ws.rs::ADDR` = 45241) so the two paths never
-/// collide.
+/// Loopback bind address for the connector's MCP endpoint. Bound to loopback
+/// only, which is the security posture; reaching it from anywhere else is an
+/// explicit opt-in (`LEXSUS_MCP_ALLOWED_HOSTS`).
 pub const ADDR: &str = "127.0.0.1:45147";
 /// MCP endpoints are usually mounted under `/mcp`.
 pub const MCP_PATH: &str = "/mcp";
@@ -195,11 +194,27 @@ pub fn cap_text(text: &str) -> String {
     )
 }
 
+/// Extra `Host` values the DNS-rebinding guard should accept, from
+/// `LEXSUS_MCP_ALLOWED_HOSTS` (comma-separated). A tunnel or reverse proxy
+/// forwards its own `Host`, so reaching the endpoint through one means either
+/// listing that host here or rewriting `Host` at the proxy. Loopback is always
+/// allowed and is the default; anything beyond it is opt-in, never hardcoded.
+fn allowed_hosts_from_env() -> Vec<String> {
+    std::env::var("LEXSUS_MCP_ALLOWED_HOSTS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Bind and serve the MCP endpoint forever. Runs on its own tokio runtime on
-/// a detached thread (the same pattern as [`crate::ws::spawn_server`]) so it
-/// never interferes with the Tauri event loop, and its blocking-pool wait for
-/// approvals cannot stall anything else.
-pub fn spawn_server(app: AppHandle, allow_write: Arc<AtomicBool>) {
+/// a detached thread (the same pattern as the rest of the core's background
+/// work) so it never interferes with the Tauri event loop, and its
+/// blocking-pool wait for approvals cannot stall anything else. `listening`
+/// is flipped once the loopback socket is actually bound.
+pub fn spawn_server(app: AppHandle, allow_write: Arc<AtomicBool>, listening: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -207,19 +222,24 @@ pub fn spawn_server(app: AppHandle, allow_write: Arc<AtomicBool>) {
             .build()
             .expect("mcp tokio runtime");
         rt.block_on(async move {
-            if let Err(e) = serve(app, allow_write).await {
+            if let Err(e) = serve(app, allow_write, listening).await {
                 eprintln!("[mcp] server exited: {e}");
             }
         });
     });
 }
 
-async fn serve(app: AppHandle, allow_write: Arc<AtomicBool>) -> std::io::Result<()> {
+async fn serve(
+    app: AppHandle,
+    allow_write: Arc<AtomicBool>,
+    listening: Arc<AtomicBool>,
+) -> std::io::Result<()> {
     // Default already supplies a fresh cancellation token + loopback-only
     // allowed hosts; we just prefer JSON request/response for stateless calls
     // (SEP-2567) over text/event-stream where possible.
     let mut config = StreamableHttpServerConfig::default();
     config.json_response = true;
+    config.allowed_hosts.extend(allowed_hosts_from_env());
     // A fresh handler per connection/session, each sharing the live flag and
     // the app handle.
     let factory = move || {
@@ -232,6 +252,7 @@ async fn serve(app: AppHandle, allow_write: Arc<AtomicBool>) -> std::io::Result<
         StreamableHttpService::new(factory, Arc::new(LocalSessionManager::default()), config);
 
     let listener = tokio::net::TcpListener::bind(ADDR).await?;
+    listening.store(true, Ordering::SeqCst);
     eprintln!("[mcp] listening on http://{ADDR}{MCP_PATH}");
     let app = axum::Router::new().nest_service(MCP_PATH, service);
     axum::serve(listener, app)
