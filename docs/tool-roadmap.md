@@ -3,7 +3,10 @@
 > The tool surface the web AI sees, phase by phase: what is **built**, what is
 > **planned**, and the invariants every new tool must uphold.
 >
-> Status date: 2026-09-10. **15 of 58 built.**
+> Status date: 2026-09-10. **15 of 58 built.** Phase 1's *round trip* was
+> reworked on 2026-09-10 (text + `structuredContent`, per-tool `outputSchema`,
+> typed error codes, paging by offset) — the tools and their arguments are
+> unchanged; what crosses the connector boundary is not. See invariant 9.
 >
 > **Completed:** Phase 0 ✅, Phase 1 ✅. **Not started:** Phases 2, 3, 5, 7, 8, 9, 10.
 > **Partial:** Phase 4 (0 tools shipped, 6 of 10 have built backing) and
@@ -39,11 +42,15 @@ tool that looks fine in `tools/list` and fails on the first call.
 
 **The drift guard is now Rust unit tests**, not a script: `bridge.rs` and
 `mcp.rs` carry `surface_partitions_all_spec_tools`,
-`every_exposed_tool_has_descriptor_and_schema`, and
-`write_tools_hidden_until_enabled`. (The old `scripts/check-spec-sync.mjs`
-existed solely to keep `SPECS` aligned with `extension/tool-spec.js`; both the
-script and the extension are gone, and the invariant moved to the test that
-actually enforces it.)
+`every_exposed_tool_has_descriptor_and_schema`,
+`write_tools_hidden_until_enabled`, plus the round-trip guards added
+2026-09-10 — `every_exposed_tool_declares_output_schema`,
+`structured_output_matches_its_declared_schema`,
+`error_code_survives_the_mcp_boundary`, and
+`no_tool_output_reads_as_call_syntax`. (The old
+`scripts/check-spec-sync.mjs` existed solely to keep `SPECS` aligned with
+`extension/tool-spec.js`; both the script and the extension are gone, and the
+invariant moved to the test that actually enforces it.)
 
 ## The read-only gate — a second axis, above the approval classes
 
@@ -467,10 +474,17 @@ any of them is wrong regardless of what it adds:
    new tool trips it, the test is right and the tool is wrong.
 3. **Tool output must not parse as tool calls.** If the AI echoes a result,
    nothing fires. The anchored parser and the manifest's no-call-syntax rule
-   exist because this class of bug froze the host page.
+   exist because this class of bug froze the host page. This applies to
+   **results**, not just the manifest — `read_file`'s chunking footer used to
+   spell out `read_file("big.txt", 401)`, which the manifest-only test could
+   not see. `no_tool_output_reads_as_call_syntax` drives every tool and checks
+   every result; page with data (an offset) rather than with prose that
+   imitates a call.
 4. **Cap what you return.** `RESULT_CHAR_CAP` (140,000 chars) is applied by the
    connector; page like `read_file` does if a single result can be large, and
-   include the truncation marker so the model knows it was cut.
+   include the truncation marker so the model knows it was cut. The marker is
+   deliberately tool-neutral — it cannot know what it is truncating, so it
+   must not advise calling a specific tool.
 5. **Sensitive-path filtering applies to lists, not just reads.** `grep`,
    `glob`, `list_directory`, LSP symbols, and MCP resource listings included.
 6. **Destructive tools show what disappears** and refuse unsafe states
@@ -480,6 +494,16 @@ any of them is wrong regardless of what it adds:
 8. **Never block longer than the connector timeout.** Gated calls block on the
    desktop for at most `APPROVAL_WAIT_SECS` (120 s). A tool that needs longer
    belongs in Phase 5's background trio, not in a blocking call.
+9. **Structured output is a promise, not a bonus.** If a tool returns
+   `structuredContent`, add its row to `output_schema()` (`bridge.rs`) in the
+   same commit — MCP says the payload must conform to the advertised
+   `outputSchema`, and `structured_output_matches_its_declared_schema`
+   enforces it both ways (no undeclared key, no missing required key). Report
+   a **typed** `ErrorCode` from the core rather than a bare string, so a
+   failure reaches the model as something it can branch on instead of prose.
+   Put the facts a caller would otherwise have to scrape — a count, a line, a
+   next offset — in the structured half, and keep the text readable for the
+   human reading the trace.
 
 ## Verification per phase
 
