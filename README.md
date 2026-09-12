@@ -26,7 +26,11 @@ A local-first Tauri + Rust desktop app that turns an **MCP-capable web AI — Cl
 |---|---|---|
 | 🔌 | **Native MCP connector, not scraping** | Your web AI talks to Lexsus through its **own tool channel** — a desktop-local MCP server on `http://127.0.0.1:45147/mcp`. Native tool UI, native results, no browser extension, no DOM watching, no composer injection. |
 | 🔀 | **Handoff, not copy-paste** | One click packages the real state of your project — objective, decisions, failed attempts, constraints, changed files — into a prompt any web AI can continue from. Facts, not chat. |
+<<<<<<< HEAD
+| 🛠️ | **Real coding-agent tools** | The web AI gets 27 tools — reads (chunked), precise edits (`edit_file`, `multi_edit`, `apply_patch`), file management (`delete_file`, `move_file`, `copy_file`, `create_directory`), `run_command`, search (`grep`, `glob`), and a full git workflow — executed locally by the Rust core, not simulated in the browser. It discovers them with `list_tools` and `describe_tool`, so a chat can be primed without a handoff. |
+=======
 | 🛠️ | **Real coding-agent tools** | 15 tools so far — reads (chunked), precise edits (`edit_file`, `multi_edit`, `apply_patch`), file management (`delete_file`, `move_file`, `copy_file`, `create_directory`), `run_command` — executed locally by the Rust core, not simulated in the browser. The AI discovers them with `list_tools` and `describe_tool`, so a chat can be primed without a handoff. |
+>>>>>>> 15b86747d260d728cb108d11ca09c9706c5c764b
 | 👁️ | **Live activity trace** | Every read, write, and command the web AI performs shows up in real time, cross-checked against the filesystem watcher — nothing is claimed without evidence. |
 | 🛡️ | **Approval gates + session grants** | Writes, commands, and destructive calls (`delete_file`, `move_file` — the card shows the resolved absolute path) pause for your **Allow / Deny**. Tick "don't ask again" to grant a class of edits for the session; the kill switch revokes every grant and pauses the bridge. Every command streams live into the app's single read-only terminal so you see exactly what runs. |
 | 🚦 | **Read-only first** | The connector exposes read tools only until you flip "Allow writes & commands" — live, from the desktop, no rebuild and no reconnect. |

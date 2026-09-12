@@ -87,7 +87,59 @@ pub enum Tool {
     ListDirectory {
         path: String,
     },
+    /// Search file contents for a regular-expression pattern. Results are
+    /// filtered through `is_sensitive_path`, so search is not a backdoor past
+    /// the `read_file` gate.
+    Grep {
+        pattern: String,
+        /// Optional directory/file to search under. Absent → the project root.
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        case_sensitive: Option<bool>,
+    },
+    /// List files whose path matches a glob pattern. Same sensitive-path
+    /// filtering invariant as `grep`.
+    Glob {
+        pattern: String,
+        /// Optional directory to search under. Absent → the project root.
+        #[serde(default)]
+        path: Option<String>,
+    },
     GitStatus,
+    GitDiff {
+        /// Optional single path to restrict the diff to (gitignore-pattern).
+        #[serde(default)]
+        path: Option<String>,
+    },
+    GitLog {
+        /// Max commits to list. Absent → default (20).
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+    GitAdd {
+        /// File path to stage, or "all"/"." to stage everything.
+        path: String,
+    },
+    GitUnstage {
+        path: String,
+    },
+    GitCommit {
+        message: String,
+    },
+    GitBranches,
+    GitCreateBranch {
+        name: String,
+    },
+    GitCheckout {
+        branch: String,
+    },
+    GitCommitDiff {
+        commit: String,
+    },
+    GitShow {
+        commit: String,
+    },
     /// Meta: the full argument schema for one tool. Needs no project root.
     DescribeTool {
         name: String,
@@ -272,6 +324,28 @@ pub const SPECS: &[ToolSpec] = &[
         group: "Reading",
     },
     ToolSpec {
+        name: "grep",
+        aliases: &["search", "search_files", "find_text", "rg"],
+        args: "pattern, path?",
+        summary: "Search file contents for a regex, filtering out sensitive paths",
+        approval: Approval::Auto,
+        trace_kind: Some("reading"),
+        timeout_ms: 30_000,
+        auto_insert: true,
+        group: "Search",
+    },
+    ToolSpec {
+        name: "glob",
+        aliases: &["list_matching", "find", "match_paths"],
+        args: "pattern, path?",
+        summary: "List files whose path matches a glob pattern",
+        approval: Approval::Auto,
+        trace_kind: Some("reading"),
+        timeout_ms: 20_000,
+        auto_insert: true,
+        group: "Search",
+    },
+    ToolSpec {
         name: "run_command",
         aliases: &["bash", "shell", "execute", "terminal", "sh"],
         args: "command",
@@ -287,6 +361,116 @@ pub const SPECS: &[ToolSpec] = &[
         aliases: &["status", "git_st"],
         args: "",
         summary: "Show changed files in the git working tree",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 10_000,
+        auto_insert: true,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_diff",
+        aliases: &["diff", "git_diff_workdir"],
+        args: "path?",
+        summary: "Show the working-tree diff against the last commit",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 15_000,
+        auto_insert: true,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_log",
+        aliases: &["log", "git_history"],
+        args: "limit?",
+        summary: "Show recent commit history",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 10_000,
+        auto_insert: true,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_add",
+        aliases: &["git_stage", "stage", "add"],
+        args: "path",
+        summary: "Stage a file's changes, or \"all\" to stage everything",
+        approval: Approval::Always,
+        trace_kind: None,
+        timeout_ms: 10_000,
+        auto_insert: false,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_unstage",
+        aliases: &["unstage", "git_reset_file"],
+        args: "path",
+        summary: "Unstage a file (working tree untouched)",
+        approval: Approval::Always,
+        trace_kind: None,
+        timeout_ms: 10_000,
+        auto_insert: false,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_commit",
+        aliases: &["commit"],
+        args: "message",
+        summary: "Commit the currently staged changes",
+        approval: Approval::Always,
+        trace_kind: None,
+        timeout_ms: 10_000,
+        auto_insert: false,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_branches",
+        aliases: &["branch", "branches", "git_branch_list"],
+        args: "",
+        summary: "List local branches",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 10_000,
+        auto_insert: true,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_create_branch",
+        aliases: &["create_branch", "git_branch_new"],
+        args: "name",
+        summary: "Create a new branch at the current HEAD",
+        approval: Approval::Always,
+        trace_kind: None,
+        timeout_ms: 10_000,
+        auto_insert: false,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_checkout",
+        aliases: &["checkout", "git_switch", "switch_branch"],
+        args: "branch",
+        summary: "Switch to a branch (refuses on a dirty tree)",
+        approval: Approval::Destructive,
+        trace_kind: None,
+        timeout_ms: 10_000,
+        auto_insert: false,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_commit_diff",
+        aliases: &["show_diff", "commit_diff"],
+        args: "commit",
+        summary: "Show the patch of a specific commit",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 10_000,
+        auto_insert: true,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_show",
+        aliases: &["git_commit_show", "show_commit"],
+        args: "commit",
+        summary: "Show one commit: message, author and full diff",
         approval: Approval::Auto,
         trace_kind: None,
         timeout_ms: 10_000,
@@ -332,7 +516,19 @@ pub fn tool_name(tool: &Tool) -> &'static str {
         Tool::ReadManyFiles { .. } => "read_many_files",
         Tool::RunCommand { .. } => "run_command",
         Tool::ListDirectory { .. } => "list_directory",
+        Tool::Grep { .. } => "grep",
+        Tool::Glob { .. } => "glob",
         Tool::GitStatus => "git_status",
+        Tool::GitDiff { .. } => "git_diff",
+        Tool::GitLog { .. } => "git_log",
+        Tool::GitAdd { .. } => "git_add",
+        Tool::GitUnstage { .. } => "git_unstage",
+        Tool::GitCommit { .. } => "git_commit",
+        Tool::GitBranches => "git_branches",
+        Tool::GitCreateBranch { .. } => "git_create_branch",
+        Tool::GitCheckout { .. } => "git_checkout",
+        Tool::GitCommitDiff { .. } => "git_commit_diff",
+        Tool::GitShow { .. } => "git_show",
         Tool::DescribeTool { .. } => "describe_tool",
         Tool::ListTools => "list_tools",
     }
@@ -396,15 +592,37 @@ pub fn tool_manifest() -> String {
     out
 }
 
-/// Full detail for one tool, for `describe_tool`. Also handed straight to the
-/// model, so it avoids call syntax for the same reason as `tool_manifest`.
-fn describe_spec(s: &ToolSpec) -> String {
-    let approval = match s.approval {
+/// Plain-language approval behavior. Shared by `describe_tool`'s output and
+/// the MCP tool description so the two can never drift apart.
+fn approval_phrase(approval: Approval) -> &'static str {
+    match approval {
         Approval::Auto => "runs immediately",
         Approval::SensitivePathOnly => "runs immediately unless the path is sensitive",
         Approval::Always => "requires the user's approval",
         Approval::Destructive => "requires the user's approval (may destroy work)",
-    };
+    }
+}
+
+/// The description the MCP surface advertises for a tool in `tools/list`.
+///
+/// A connector's model reads this instead of the manifest, so it carries the
+/// argument list: the input schema's property names say nothing about order or
+/// which arguments are optional, and a model that has to guess tends to invent
+/// them. Kept to three lines because `tools/list` is paid for on every session.
+pub fn tool_description(name: &str) -> Option<String> {
+    let spec = spec_by_name(name)?;
+    let mut out = spec.summary.to_string();
+    if !spec.args.is_empty() {
+        out.push_str(&format!("\nArgs: {}", spec.args));
+    }
+    out.push_str(&format!("\nApproval: {}", approval_phrase(spec.approval)));
+    Some(out)
+}
+
+/// Full detail for one tool, for `describe_tool`. Also handed straight to the
+/// model, so it avoids call syntax for the same reason as `tool_manifest`.
+fn describe_spec(s: &ToolSpec) -> String {
+    let approval = approval_phrase(s.approval);
     let mut out = format!("{}\n  {}\n", s.name, s.summary);
     if s.args.is_empty() {
         out.push_str("  Arguments: none\n");
@@ -716,6 +934,241 @@ pub fn tool_input_schema(tool_name: &str) -> Option<serde_json::Value> {
     Some(schema)
 }
 
+/// The JSON Schema for a tool's [`ToolResult::structured`] payload, or `None`
+/// for a name with no SPECS row.
+///
+/// This is the `outputSchema` the MCP surface declares, which puts a real
+/// constraint on it: MCP requires the `structuredContent` we return to
+/// *conform* to the schema we advertise, so these rows must describe exactly
+/// what the executors emit and nothing more. `structured_content_conforms_to_declared_schema`
+/// holds the two in step — when you teach an executor a new field, teach its
+/// schema in the same commit.
+///
+/// Nullable fields are `["integer", "null"]` rather than omitted-keys, because
+/// a model paging a file is better served by an explicit `next_offset: null`
+/// (there is no more) than by having to distinguish "absent" from "last page".
+pub fn output_schema(tool_name: &str) -> Option<serde_json::Value> {
+    let spec = spec_by_name(tool_name)?;
+    let schema = match spec.name {
+        "read_file" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "The file that was read" },
+                "start_line": { "type": "integer", "description": "1-based first line of this chunk" },
+                "end_line": { "type": "integer", "description": "1-based last line of this chunk" },
+                "total_lines": { "type": "integer", "description": "Lines in the whole file" },
+                "bytes_shown": { "type": "integer", "description": "Bytes of file content in this chunk" },
+                "total_bytes": { "type": "integer", "description": "Bytes in the whole file" },
+                "truncated": { "type": "boolean", "description": "True when lines remain after this chunk" },
+                "next_offset": {
+                    "type": ["integer", "null"],
+                    "description": "Pass as `offset` to read the next chunk; null at end of file"
+                }
+            },
+            "required": [
+                "path", "start_line", "end_line", "total_lines",
+                "bytes_shown", "total_bytes", "truncated", "next_offset"
+            ],
+            "additionalProperties": false
+        }),
+        "read_many_files" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "requested": { "type": "integer", "description": "Paths asked for" },
+                "shown": { "type": "integer", "description": "Paths whose content was returned" },
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "status": {
+                                "type": "string",
+                                "enum": ["shown", "skipped", "too_large", "error"],
+                                "description": "skipped = sensitive path; too_large = over this batch's budget"
+                            },
+                            "lines": { "type": "integer", "description": "Line count, when known" },
+                            "reason": { "type": "string", "description": "Why it was not shown" }
+                        },
+                        "required": ["path", "status"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["requested", "shown", "files"],
+            "additionalProperties": false
+        }),
+        "list_directory" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "The directory that was listed" },
+                "count": { "type": "integer", "description": "Number of entries" },
+                "entries": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string", "description": "Entry name, not a full path" },
+                            "kind": { "type": "string", "enum": ["file", "dir", "other"] },
+                            "size": { "type": ["integer", "null"], "description": "Bytes, for files only" }
+                        },
+                        "required": ["name", "kind", "size"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["path", "count", "entries"],
+            "additionalProperties": false
+        }),
+        "git_status" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "clean": { "type": "boolean", "description": "True when nothing has changed" },
+                "count": { "type": "integer", "description": "Changed files" },
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "status": { "type": "string", "description": "Short git status code, e.g. M, A, ??" },
+                            "additions": { "type": "integer" },
+                            "deletions": { "type": "integer" }
+                        },
+                        "required": ["path", "status", "additions", "deletions"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["clean", "count", "files"],
+            "additionalProperties": false
+        }),
+        // Write/edit results carry evidence of what actually changed, so the
+        // model can verify its own edit instead of re-reading the file to
+        // find out whether it landed.
+        "write_file" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "bytes_written": { "type": "integer", "description": "Bytes now in the file" }
+            },
+            "required": ["path", "bytes_written"],
+            "additionalProperties": false
+        }),
+        "edit_file" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "replacements": { "type": "integer", "description": "How many occurrences were replaced" },
+                "first_line": { "type": ["integer", "null"], "description": "1-based line of the first replacement" },
+                "bytes_before": { "type": "integer" },
+                "bytes_after": { "type": "integer" }
+            },
+            "required": ["path", "replacements", "first_line", "bytes_before", "bytes_after"],
+            "additionalProperties": false
+        }),
+        "multi_edit" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "edits_applied": { "type": "integer", "description": "Edits in the batch that matched" },
+                "replacements": { "type": "integer", "description": "Total occurrences replaced" },
+                "lines": {
+                    "type": "array",
+                    "items": { "type": "integer" },
+                    "description": "1-based line of each edit's first replacement, in order"
+                }
+            },
+            "required": ["path", "edits_applied", "replacements", "lines"],
+            "additionalProperties": false
+        }),
+        "apply_patch" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "hunks_applied": { "type": "integer" },
+                "lines": {
+                    "type": "array",
+                    "items": { "type": "integer" },
+                    "description": "1-based line where each hunk was applied, in order"
+                }
+            },
+            "required": ["path", "hunks_applied", "lines"],
+            "additionalProperties": false
+        }),
+        "delete_file" => serde_json::json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" } },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        "move_file" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "from": { "type": "string" },
+                "to": { "type": "string" }
+            },
+            "required": ["from", "to"],
+            "additionalProperties": false
+        }),
+        "copy_file" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "from": { "type": "string" },
+                "to": { "type": "string" },
+                "bytes": { "type": "integer", "description": "Bytes copied" }
+            },
+            "required": ["from", "to", "bytes"],
+            "additionalProperties": false
+        }),
+        "create_directory" => serde_json::json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" } },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        "run_command" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string" },
+                "exit_code": {
+                    "type": ["integer", "null"],
+                    "description": "Process exit status; null when it was killed"
+                },
+                "timed_out": { "type": "boolean" },
+                "truncated": { "type": "boolean", "description": "Output hit the capture cap" }
+            },
+            "required": ["command", "exit_code", "timed_out", "truncated"],
+            "additionalProperties": false
+        }),
+        "list_tools" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tools": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Canonical names of every tool this connector exposes"
+                }
+            },
+            "required": ["tools"],
+            "additionalProperties": false
+        }),
+        "describe_tool" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" },
+                "summary": { "type": "string" },
+                "args": { "type": "string", "description": "Argument list as written in the manifest" },
+                "approval": { "type": "string", "description": "When the desktop app must approve this tool" }
+            },
+            "required": ["name", "summary", "args", "approval"],
+            "additionalProperties": false
+        }),
+        _ => return None,
+    };
+    Some(schema)
+}
+
 /// Filesystem paths a call touches, for the sensitive-path policy. Tools
 /// that take two paths must return both, or a secret can be laundered by
 /// copying it to an innocuous name.
@@ -740,7 +1193,19 @@ pub fn tool_paths(tool: &Tool) -> Vec<&str> {
         // carries the count instead (see `detail`).
         Tool::ReadManyFiles { .. }
         | Tool::RunCommand { .. }
+        | Tool::Grep { .. }
+        | Tool::Glob { .. }
         | Tool::GitStatus
+        | Tool::GitDiff { .. }
+        | Tool::GitLog { .. }
+        | Tool::GitAdd { .. }
+        | Tool::GitUnstage { .. }
+        | Tool::GitCommit { .. }
+        | Tool::GitBranches
+        | Tool::GitCreateBranch { .. }
+        | Tool::GitCheckout { .. }
+        | Tool::GitCommitDiff { .. }
+        | Tool::GitShow { .. }
         | Tool::DescribeTool { .. }
         | Tool::ListTools => vec![],
     }
@@ -774,9 +1239,30 @@ pub fn detail(tool: &Tool) -> Option<String> {
         Tool::MoveFile { from, to } | Tool::CopyFile { from, to } => Some(format!("{from} → {to}")),
         Tool::CreateDirectory { path } => Some(path.clone()),
         Tool::ReadManyFiles { paths } => Some(format!("{} files", paths.len())),
+        Tool::Grep {
+            pattern,
+            path,
+            case_sensitive: _,
+        } => Some(match path {
+            Some(p) => format!("{pattern} in {p}"),
+            None => pattern.clone(),
+        }),
+        Tool::Glob { pattern, path } => Some(match path {
+            Some(p) => format!("{pattern} under {p}"),
+            None => pattern.clone(),
+        }),
         Tool::RunCommand { command } => Some(command.clone()),
         Tool::DescribeTool { name } => Some(name.clone()),
-        Tool::GitStatus | Tool::ListTools => None,
+        Tool::GitStatus | Tool::GitBranches | Tool::ListTools => None,
+        Tool::GitDiff { path } => Some(path.clone().unwrap_or_else(|| ".".to_string())),
+        Tool::GitLog { limit } => Some(format!("{} commits", limit.unwrap_or(20))),
+        Tool::GitAdd { path } => Some(path.clone()),
+        Tool::GitUnstage { path } => Some(path.clone()),
+        Tool::GitCommit { message } => Some(message.clone()),
+        Tool::GitCreateBranch { name } => Some(name.clone()),
+        Tool::GitCheckout { branch } => Some(branch.clone()),
+        Tool::GitCommitDiff { commit } => Some(commit.clone()),
+        Tool::GitShow { commit } => Some(commit.clone()),
     }
 }
 
@@ -852,6 +1338,9 @@ pub struct ToolError {
 
 /// Result of a tool call. `pending` is set when the call awaits an
 /// explicit user approval (the caller should wait for resolution).
+///
+/// `structured` is the machine-readable half of the same result: the facts
+/// in `output`, as JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
     pub ok: bool,
@@ -859,6 +1348,14 @@ pub struct ToolResult {
     pub error: Option<String>,
     pub error_code: Option<ErrorCode>,
     pub pending: Option<String>,
+    /// The same facts as `output`, as JSON — a line offset or a replacement
+    /// count the model should *read* rather than scrape out of prose. Its
+    /// shape is the tool's row in [`output_schema`], which the MCP surface
+    /// declares as `outputSchema`; the two are held in step by the
+    /// `structured_content_conforms_to_declared_schema` test. `None` for
+    /// results with nothing to structure (errors the caller can't act on,
+    /// approval pendings).
+    pub structured: Option<serde_json::Value>,
 }
 
 impl ToolResult {
@@ -869,8 +1366,24 @@ impl ToolResult {
             error: None,
             error_code: None,
             pending: None,
+            structured: None,
         }
     }
+
+    /// A successful call whose facts are also available as JSON. The text in
+    /// `output` stays the primary, readable form — a human reads the trace —
+    /// while `structured` spares a model from parsing it.
+    pub fn ok_structured(output: String, structured: serde_json::Value) -> Self {
+        Self {
+            ok: true,
+            output: Some(output),
+            error: None,
+            error_code: None,
+            pending: None,
+            structured: Some(structured),
+        }
+    }
+
     pub fn err<S: Into<String>>(error: S) -> Self {
         Self {
             ok: false,
@@ -878,6 +1391,7 @@ impl ToolResult {
             error: Some(error.into()),
             error_code: None,
             pending: None,
+            structured: None,
         }
     }
     pub fn err_code(code: ErrorCode, message: impl Into<String>) -> Self {
@@ -887,6 +1401,7 @@ impl ToolResult {
             error: Some(message.into()),
             error_code: Some(code),
             pending: None,
+            structured: None,
         }
     }
     pub fn pending<S: Into<String>>(summary: S) -> Self {
@@ -896,6 +1411,7 @@ impl ToolResult {
             error: None,
             error_code: None,
             pending: Some(summary.into()),
+            structured: None,
         }
     }
 }
@@ -1350,11 +1866,41 @@ fn chunk_bounds(lines: &[&str], want: usize) -> Vec<(usize, usize)> {
 /// leave the AI unable to see the rest of the file, and returning the whole
 /// thing (up to `READ_CAP`) would swamp both the model's context and the
 /// connector's result cap.
-fn chunk_text(path: &str, text: &str, offset: Option<u32>, limit: Option<u32>) -> String {
+/// One page of a file, plus the facts needed to ask for the next one.
+///
+/// The point of the struct is `next_offset`. The footer used to spell paging
+/// out as a call — `read_file("big.txt", 401)` — which is exactly the call
+/// syntax `tool_manifest`'s doc comment forbids: a model that echoes the
+/// result back turns the footer into a burst of fabricated calls. Carrying the
+/// offset as data keeps the text inert and gives the model a number to pass
+/// instead of a phrase to imitate.
+struct Chunk {
+    /// The rendered page. Never contains call syntax.
+    text: String,
+    /// 1-based first line shown; 0 when the file is empty.
+    start_line: usize,
+    /// 1-based last line shown; 0 when the file is empty.
+    end_line: usize,
+    total_lines: usize,
+    /// The `offset` that continues from here; `None` at end of file.
+    next_offset: Option<u32>,
+    bytes_shown: usize,
+    total_bytes: usize,
+}
+
+fn chunk_text(path: &str, text: &str, offset: Option<u32>, limit: Option<u32>) -> Chunk {
     let lines: Vec<&str> = text.lines().collect();
     let total = lines.len();
     if total == 0 {
-        return format!("[{path} is empty]\n");
+        return Chunk {
+            text: format!("[{path} is empty]\n"),
+            start_line: 0,
+            end_line: 0,
+            total_lines: 0,
+            next_offset: None,
+            bytes_shown: 0,
+            total_bytes: 0,
+        };
     }
 
     // Clamped rather than rejected: the AI is guessing at file length, and a
@@ -1381,24 +1927,43 @@ fn chunk_text(path: &str, text: &str, offset: Option<u32>, limit: Option<u32>) -
                 .unwrap_or(total)
         });
 
+    let shown: usize = lines[start..end].iter().map(|l| l.len() + 1).sum();
+    let next_offset = if end < total {
+        Some((end + 1) as u32)
+    } else {
+        None
+    };
+
     let width = total.to_string().len().max(4);
-    let mut out = String::with_capacity(CHUNK_BYTES + 256);
+    let mut body = String::with_capacity(CHUNK_BYTES + 256);
     for (i, line) in lines[start..end].iter().enumerate() {
-        out.push_str(&format!("{:>width$}| {}\n", start + i + 1, line));
+        body.push_str(&format!("{:>width$}| {}\n", start + i + 1, line));
     }
+
+    // Size of the whole file, read before the closure takes ownership of the
+    // rendered page under a different name.
+    let total_bytes = text.len();
+    let chunk = |body: String| Chunk {
+        text: body,
+        start_line: start + 1,
+        end_line: end,
+        total_lines: total,
+        next_offset,
+        bytes_shown: shown,
+        total_bytes,
+    };
 
     // A file that fits in one chunk reads exactly as it did before.
     if start == 0 && end == total {
-        return out;
+        return chunk(body);
     }
 
-    let shown: usize = lines[start..end].iter().map(|l| l.len() + 1).sum();
-    out.push('\n');
+    body.push('\n');
     match chunk_no {
-        Some((i, n)) => out.push_str(&format!("[chunk {i} of {n} · ")),
-        None => out.push('['),
+        Some((i, n)) => body.push_str(&format!("[chunk {i} of {n} · ")),
+        None => body.push('['),
     }
-    out.push_str(&format!(
+    body.push_str(&format!(
         "lines {}-{} of {} · {} of {}]\n",
         start + 1,
         end,
@@ -1407,15 +1972,12 @@ fn chunk_text(path: &str, text: &str, offset: Option<u32>, limit: Option<u32>) -
         human_bytes(text.len())
     ));
     if end < total {
-        out.push_str(&format!(
-            "[to continue, call: read_file(\"{}\", {})]\n",
-            path,
-            end + 1
-        ));
+        // Deliberately prose, not a call: the offset to pass is `next_offset`.
+        body.push_str(&format!("[more below — continues at line {}]\n", end + 1));
     } else {
-        out.push_str("[end of file]\n");
+        body.push_str("[end of file]\n");
     }
-    out
+    chunk(body)
 }
 
 fn human_bytes(n: usize) -> String {
@@ -1537,26 +2099,51 @@ fn read_text_file(p: &Path, rel: &str) -> Result<String, ToolResult> {
 /// (it would match everywhere), a missing match is `StringNotFound`, and
 /// multiple matches without `replace_all` are `AmbiguousMatch` — the count
 /// is in the message so the AI can disambiguate on its next attempt.
+/// What one string replacement actually did. The new text plus the evidence of
+/// it — a model told only "edited" has to re-read the file to find out whether
+/// its edit landed, which is the loop this exists to break.
+struct EditOutcome {
+    text: String,
+    /// Occurrences replaced.
+    replacements: usize,
+    /// 1-based line of the first replacement, in the text as it was *before*.
+    first_line: usize,
+}
+
 fn apply_str_edit(
     text: &str,
     old: &str,
     new: &str,
     replace_all: bool,
-) -> Result<String, ToolError> {
+) -> Result<EditOutcome, ToolError> {
     if old.is_empty() {
         return Err(ToolError {
             code: ErrorCode::InvalidArguments,
             message: "old_string is empty — it would match everywhere".into(),
         });
     }
+    // Line of the first hit, counted over the original text — after the
+    // replacement the offsets have all shifted.
+    let first_line = text
+        .find(old)
+        .map(|i| text[..i].lines().count() + 1)
+        .unwrap_or(1);
     let matches = text.match_indices(old).count();
     match matches {
         0 => Err(ToolError {
             code: ErrorCode::StringNotFound,
             message: "old_string not found".into(),
         }),
-        1 => Ok(text.replacen(old, new, 1)),
-        _ if replace_all => Ok(text.replace(old, new)),
+        1 => Ok(EditOutcome {
+            text: text.replacen(old, new, 1),
+            replacements: 1,
+            first_line,
+        }),
+        _ if replace_all => Ok(EditOutcome {
+            text: text.replace(old, new),
+            replacements: matches,
+            first_line,
+        }),
         _ => Err(ToolError {
             code: ErrorCode::AmbiguousMatch,
             message: format!(
@@ -1716,6 +2303,92 @@ const MANY_BYTES_BUDGET: usize = 20 * 1024;
 
 /// Execute a tool call locally. `root: None` → tool requires the root.
 /// `on_event` streams command events while a `run_command` executes.
+/// Open the repo at the project root, mapping failure to a `ToolResult`.
+fn git_repo(root: &Path) -> Result<git2::Repository, ToolResult> {
+    git::open_repo(root).map_err(|e| {
+        ToolResult::err_code(ErrorCode::ExecutionFailed, format!("not a git repo: {e}"))
+    })
+}
+
+/// A git index path must stay inside the project root. Git resolves relative
+/// paths against the working directory, so a `..` that pops past the root is
+/// rejected here before it reaches the index (mirrors `resolve_path`).
+fn valid_git_rel(rel: &str) -> Result<(), ToolResult> {
+    if rel.trim().is_empty() {
+        return Err(ToolResult::err_code(
+            ErrorCode::InvalidArguments,
+            "path is empty",
+        ));
+    }
+    let normalized = normalize_path(Path::new(rel));
+    if normalized.starts_with("..") {
+        return Err(ToolResult::err_code(
+            ErrorCode::PathEscapesRoot,
+            format!("path escapes project root: {rel}"),
+        ));
+    }
+    Ok(())
+}
+
+// ── Search tools (Phase 2): grep / glob ─────────────────────────────
+// Both walk the project tree and filter every result through
+// `is_sensitive_path`, so a search can never launder a secret that a direct
+// `read_file` would have gated (`grep ".env"` must not match `.env` itself).
+// Budgets keep an Auto-approved search from hanging or flooding the chat.
+
+const GREP_FILE_CAP: u64 = 4 * 1024 * 1024; // skip anything larger when scanning
+const GREP_MAX_FILES: usize = 2000;
+const GREP_MAX_HITS: usize = 300;
+const GREP_MAX_BYTES: usize = 200 * 1024;
+const GLOB_MAX_FILES: usize = 4000;
+
+/// Prune the walk: never descend into `.git`, dependency/vendor or build
+/// directories — they are huge, rarely what a search wants, and can blow the
+/// file budget before the AI sees anything useful. Files always pass.
+fn keep_search_entry(e: &walkdir::DirEntry) -> bool {
+    if e.depth() == 0 || !e.file_type().is_dir() {
+        return true;
+    }
+    let name = e.file_name().to_string_lossy().into_owned();
+    if name.starts_with('.') {
+        return false; // .git, .venv, .next, …
+    }
+    !matches!(
+        name.as_str(),
+        "node_modules" | "target" | "dist" | "build" | "vendor" | "__pycache__"
+    )
+}
+
+/// Grep one file, appending `rel:line: text` matches. Returns how many hits
+/// were added (so the caller can stop once the budget is spent).
+fn grep_file(abs: &Path, rel: &str, re: &regex::Regex, out: &mut String, hits: &mut usize) {
+    if is_sensitive_path(abs) {
+        return;
+    }
+    let Ok(md) = std::fs::metadata(abs) else {
+        return;
+    };
+    if !md.is_file() || md.len() > GREP_FILE_CAP {
+        return;
+    }
+    let Ok(bytes) = std::fs::read(abs) else {
+        return;
+    };
+    if bytes.contains(&0) {
+        return; // binary — matches on it would be noise
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    for (i, line) in text.lines().enumerate() {
+        if *hits >= GREP_MAX_HITS {
+            return;
+        }
+        if re.is_match(line) {
+            *hits += 1;
+            out.push_str(&format!("{rel}:{}: {}\n", i + 1, line.trim_end()));
+        }
+    }
+}
+
 pub fn execute(
     tool: &Tool,
     root: Option<&Path>,
@@ -1725,11 +2398,23 @@ pub fn execute(
     // is opened — an AI that has lost the manifest can always recover it.
     match tool {
         Tool::ListTools => {
-            return ToolResult::ok(tool_manifest());
+            let tools: Vec<&str> = SPECS.iter().map(|s| s.name).collect();
+            return ToolResult::ok_structured(
+                tool_manifest(),
+                serde_json::json!({ "tools": tools }),
+            );
         }
         Tool::DescribeTool { name } => {
             return match spec_by_name(name) {
-                Some(s) => ToolResult::ok(describe_spec(s)),
+                Some(s) => ToolResult::ok_structured(
+                    describe_spec(s),
+                    serde_json::json!({
+                        "name": s.name,
+                        "summary": s.summary,
+                        "args": s.args,
+                        "approval": approval_phrase(s.approval),
+                    }),
+                ),
                 None => ToolResult::err_code(
                     ErrorCode::UnknownTool,
                     format!("unknown tool: {name}. Call list_tools for the full list."),
@@ -1786,7 +2471,18 @@ pub fn execute(
                         );
                     }
                     let text = String::from_utf8_lossy(&bytes);
-                    ToolResult::ok(chunk_text(path, &text, *offset, *limit))
+                    let chunk = chunk_text(path, &text, *offset, *limit);
+                    let structured = serde_json::json!({
+                        "path": path,
+                        "start_line": chunk.start_line,
+                        "end_line": chunk.end_line,
+                        "total_lines": chunk.total_lines,
+                        "bytes_shown": chunk.bytes_shown,
+                        "total_bytes": chunk.total_bytes,
+                        "truncated": chunk.next_offset.is_some(),
+                        "next_offset": chunk.next_offset,
+                    });
+                    ToolResult::ok_structured(chunk.text, structured)
                 }
                 Err(e) => ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{path}: {e}")),
             }
@@ -1810,7 +2506,16 @@ pub fn execute(
                 }
             }
             match std::fs::write(&p, content.as_bytes()) {
-                Ok(()) => ToolResult::ok(format!("wrote {} bytes to {path}", content.len())),
+                Ok(()) => {
+                    let structured = serde_json::json!({
+                        "path": path,
+                        "bytes_written": content.len(),
+                    });
+                    ToolResult::ok_structured(
+                        format!("wrote {} bytes to {path}", content.len()),
+                        structured,
+                    )
+                }
                 Err(e) => ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{path}: {e}")),
             }
         }
@@ -1828,9 +2533,30 @@ pub fn execute(
                 Ok(t) => t,
                 Err(r) => return r,
             };
+            let bytes_before = text.len();
             match apply_str_edit(&text, old_string, new_string, replace_all.unwrap_or(false)) {
-                Ok(new_text) => match std::fs::write(&p, new_text.as_bytes()) {
-                    Ok(()) => ToolResult::ok(format!("edited {path}")),
+                Ok(outcome) => match std::fs::write(&p, outcome.text.as_bytes()) {
+                    Ok(()) => {
+                        // The evidence, not just the fact. "edited x.ts" left a
+                        // model no way to tell a landed edit from a silent
+                        // no-op, so it re-read the file to check.
+                        let structured = serde_json::json!({
+                            "path": path,
+                            "replacements": outcome.replacements,
+                            "first_line": outcome.first_line,
+                            "bytes_before": bytes_before,
+                            "bytes_after": outcome.text.len(),
+                        });
+                        ToolResult::ok_structured(
+                            format!(
+                                "edited {path} — {} replacement{} at line {}",
+                                outcome.replacements,
+                                if outcome.replacements == 1 { "" } else { "s" },
+                                outcome.first_line
+                            ),
+                            structured,
+                        )
+                    }
                     Err(e) => {
                         ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{path}: {e}"))
                     }
@@ -1856,6 +2582,10 @@ pub fn execute(
             // Fold every edit through the in-memory text before touching
             // the file: one bad edit leaves the file exactly as it was.
             let mut new_text = text;
+            let mut replacements = 0usize;
+            // Line of each edit's first hit, as the file stood when that edit
+            // ran — earlier edits in the batch have already shifted the text.
+            let mut lines: Vec<usize> = Vec::with_capacity(edits.len());
             for (i, e) in edits.iter().enumerate() {
                 match apply_str_edit(
                     &new_text,
@@ -1863,7 +2593,11 @@ pub fn execute(
                     &e.new_string,
                     e.replace_all.unwrap_or(false),
                 ) {
-                    Ok(t) => new_text = t,
+                    Ok(outcome) => {
+                        replacements += outcome.replacements;
+                        lines.push(outcome.first_line);
+                        new_text = outcome.text;
+                    }
                     Err(err) => {
                         return ToolResult::err_code(
                             err.code,
@@ -1873,7 +2607,22 @@ pub fn execute(
                 }
             }
             match std::fs::write(&p, new_text.as_bytes()) {
-                Ok(()) => ToolResult::ok(format!("applied {} edits to {path}", edits.len())),
+                Ok(()) => {
+                    let structured = serde_json::json!({
+                        "path": path,
+                        "edits_applied": edits.len(),
+                        "replacements": replacements,
+                        "lines": lines,
+                    });
+                    ToolResult::ok_structured(
+                        format!(
+                            "applied {} edits to {path} — {replacements} replacement{}",
+                            edits.len(),
+                            if replacements == 1 { "" } else { "s" }
+                        ),
+                        structured,
+                    )
+                }
                 Err(e) => ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{path}: {e}")),
             }
         }
@@ -1900,7 +2649,21 @@ pub fn execute(
                 new_text.push('\n');
             }
             match std::fs::write(&p, new_text.as_bytes()) {
-                Ok(()) => ToolResult::ok(format!("applied {} hunks to {path}", hunks.len())),
+                Ok(()) => {
+                    // Hunks carry the line they were built against in the file
+                    // the patch came from; applying one shifts the rest, so
+                    // these are anchors, not a final address.
+                    let hunk_lines: Vec<usize> = hunks.iter().map(|h| h.old_start).collect();
+                    let structured = serde_json::json!({
+                        "path": path,
+                        "hunks_applied": hunks.len(),
+                        "lines": hunk_lines,
+                    });
+                    ToolResult::ok_structured(
+                        format!("applied {} hunks to {path}", hunks.len()),
+                        structured,
+                    )
+                }
                 Err(e) => ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{path}: {e}")),
             }
         }
@@ -1922,7 +2685,10 @@ pub fn execute(
                 }
             }
             match std::fs::remove_file(&p) {
-                Ok(()) => ToolResult::ok(format!("deleted {path}")),
+                Ok(()) => ToolResult::ok_structured(
+                    format!("deleted {path}"),
+                    serde_json::json!({ "path": path }),
+                ),
                 Err(e) => ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{path}: {e}")),
             }
         }
@@ -1945,7 +2711,10 @@ pub fn execute(
             }
             // Overwrites the target — the approval card shows both paths.
             match std::fs::rename(&src, &dst) {
-                Ok(()) => ToolResult::ok(format!("moved {from} → {to}")),
+                Ok(()) => ToolResult::ok_structured(
+                    format!("moved {from} → {to}"),
+                    serde_json::json!({ "from": from, "to": to }),
+                ),
                 Err(e) => ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{from}: {e}")),
             }
         }
@@ -1967,7 +2736,10 @@ pub fn execute(
                 }
             }
             match std::fs::copy(&src, &dst) {
-                Ok(n) => ToolResult::ok(format!("copied {from} → {to} ({n} bytes)")),
+                Ok(n) => ToolResult::ok_structured(
+                    format!("copied {from} → {to} ({n} bytes)"),
+                    serde_json::json!({ "from": from, "to": to, "bytes": n }),
+                ),
                 Err(e) => ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{from}: {e}")),
             }
         }
@@ -1977,7 +2749,10 @@ pub fn execute(
                 Err(r) => return r,
             };
             match std::fs::create_dir_all(&p) {
-                Ok(()) => ToolResult::ok(format!("created directory {path}")),
+                Ok(()) => ToolResult::ok_structured(
+                    format!("created directory {path}"),
+                    serde_json::json!({ "path": path }),
+                ),
                 Err(e) => ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{path}: {e}")),
             }
         }
@@ -1994,11 +2769,18 @@ pub fn execute(
             let mut out = String::new();
             let mut budget = MANY_BYTES_BUDGET;
             let mut shown = 0usize;
+            // One row per requested path, in request order, so a caller can
+            // tell "you skipped my .env" apart from "the file was empty"
+            // without reading the prose.
+            let mut files: Vec<serde_json::Value> = Vec::with_capacity(paths.len());
             for path in paths {
                 // Sensitive paths are skipped, not refused: one .env in a
                 // batch of package files shouldn't block the rest.
                 if is_sensitive_path(Path::new(path)) {
                     out.push_str(&format!("[{path} — skipped: sensitive]\n"));
+                    files.push(serde_json::json!({
+                        "path": path, "status": "skipped", "reason": "sensitive path"
+                    }));
                     continue;
                 }
                 let p = match resolve_tool_path(root, path) {
@@ -2006,6 +2788,9 @@ pub fn execute(
                     Err(r) => {
                         let msg = r.error.unwrap_or_default();
                         out.push_str(&format!("[{path} — {msg}]\n"));
+                        files.push(serde_json::json!({
+                            "path": path, "status": "error", "reason": msg
+                        }));
                         continue;
                     }
                 };
@@ -2014,30 +2799,48 @@ pub fn execute(
                     Err(r) => {
                         let msg = r.error.unwrap_or_default();
                         out.push_str(&format!("[{path} — {msg}]\n"));
+                        files.push(serde_json::json!({
+                            "path": path, "status": "error", "reason": msg
+                        }));
                         continue;
                     }
                 };
                 if budget == 0 {
                     out.push_str(&format!(
-                        "[{path} — batch budget spent; call read_file on it]\n"
+                        "[{path} — batch budget spent; read it separately]\n"
                     ));
+                    files.push(serde_json::json!({
+                        "path": path, "status": "too_large", "reason": "batch budget spent"
+                    }));
                     continue;
                 }
                 let chunk = chunk_text(path, &text, None, None);
-                if chunk.len() > budget {
+                if chunk.text.len() > budget {
+                    let lines = text.lines().count();
                     out.push_str(&format!(
-                        "[{path} — {} lines, too large for this batch; call read_file on it]\n",
-                        text.lines().count()
+                        "[{path} — {lines} lines, too large for this batch; read it separately]\n"
                     ));
+                    files.push(serde_json::json!({
+                        "path": path, "status": "too_large", "lines": lines,
+                        "reason": "over this batch's byte budget"
+                    }));
                     continue;
                 }
                 out.push_str(&format!("── {path} ──\n"));
-                out.push_str(&chunk);
-                budget -= chunk.len();
+                out.push_str(&chunk.text);
+                budget -= chunk.text.len();
                 shown += 1;
+                files.push(serde_json::json!({
+                    "path": path, "status": "shown", "lines": chunk.total_lines
+                }));
             }
             out.push_str(&format!("\n[{shown} of {} files shown]\n", paths.len()));
-            ToolResult::ok(out)
+            let structured = serde_json::json!({
+                "requested": paths.len(),
+                "shown": shown,
+                "files": files,
+            });
+            ToolResult::ok_structured(out, structured)
         }
         Tool::RunCommand { command } => {
             if let Some(cb) = on_event.as_mut() {
@@ -2112,7 +2915,13 @@ pub fn execute(
                 text.push_str("\n[output truncated]");
             }
             text.push_str(&format!("\n[exit code: {}]", out.exit_code.unwrap_or(-1)));
-            ToolResult::ok(text)
+            let structured = serde_json::json!({
+                "command": command,
+                "exit_code": out.exit_code,
+                "timed_out": out.timed_out,
+                "truncated": out.truncated,
+            });
+            ToolResult::ok_structured(text, structured)
         }
         Tool::ListDirectory { path } => {
             let p = match resolve_path(root, path) {
@@ -2124,22 +2933,169 @@ pub fn execute(
                     return ToolResult::err_code(ErrorCode::FileNotFound, e);
                 }
             };
-            let mut names = Vec::new();
+            let mut entries: Vec<(String, &'static str, Option<u64>)> = Vec::new();
             match std::fs::read_dir(&p) {
-                Ok(entries) => {
-                    for entry in entries.flatten() {
+                Ok(read) => {
+                    for entry in read.flatten() {
                         let name = entry.file_name().to_string_lossy().into_owned();
-                        names.push(name);
+                        // `file_type` comes off the directory read itself; only
+                        // files pay for a stat, and only to report a size.
+                        let kind = match entry.file_type() {
+                            Ok(t) if t.is_dir() => "dir",
+                            Ok(t) if t.is_file() => "file",
+                            _ => "other",
+                        };
+                        let size = if kind == "file" {
+                            entry.metadata().ok().map(|m| m.len())
+                        } else {
+                            None
+                        };
+                        entries.push((name, kind, size));
                     }
                 }
                 Err(e) => {
                     return ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{path}: {e}"))
                 }
             }
-            names.sort();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let names: Vec<&str> = entries.iter().map(|(n, _, _)| n.as_str()).collect();
             let mut out = format!("[{} entries]\n", names.len());
             out.push_str(&names.join("\n"));
-            ToolResult::ok(out)
+
+            // The text stays the bare name list it always was; which entries
+            // are directories, and how big the files are, is what the model
+            // would otherwise have to guess or spend a call finding out.
+            let listing: Vec<serde_json::Value> = entries
+                .iter()
+                .map(|(name, kind, size)| {
+                    serde_json::json!({ "name": name, "kind": kind, "size": size })
+                })
+                .collect();
+            let structured = serde_json::json!({
+                "path": path,
+                "count": names.len(),
+                "entries": listing,
+            });
+            ToolResult::ok_structured(out, structured)
+        }
+        Tool::Grep {
+            pattern,
+            path,
+            case_sensitive,
+        } => {
+            let root_abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+            let base = match path {
+                Some(p) => match resolve_tool_path(&root_abs, p) {
+                    Ok(b) => b,
+                    Err(r) => return r,
+                },
+                None => root_abs.clone(),
+            };
+            let re = match regex::RegexBuilder::new(pattern)
+                .case_insensitive(!case_sensitive.unwrap_or(false))
+                .build()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    return ToolResult::err_code(
+                        ErrorCode::InvalidArguments,
+                        format!("invalid regex /{pattern}/: {e}"),
+                    );
+                }
+            };
+            let mut out = String::new();
+            let mut files = 0usize;
+            let mut hits = 0usize;
+            for entry in walkdir::WalkDir::new(&base)
+                .into_iter()
+                .filter_entry(keep_search_entry)
+            {
+                let Ok(e) = entry else { continue };
+                if !e.file_type().is_file() {
+                    continue;
+                }
+                if files >= GREP_MAX_FILES {
+                    break;
+                }
+                files += 1;
+                let abs = e.path();
+                let rel = abs
+                    .strip_prefix(&root_abs)
+                    .unwrap_or(abs)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                grep_file(abs, &rel, &re, &mut out, &mut hits);
+                if hits >= GREP_MAX_HITS || out.len() >= GREP_MAX_BYTES {
+                    break;
+                }
+            }
+            if hits == 0 {
+                return ToolResult::ok(format!(
+                    "no matches for /{pattern}/ (scanned {files} files)"
+                ));
+            }
+            let mut head = format!("[{hits} matches in {files} file(s)]\n");
+            if hits >= GREP_MAX_HITS || out.len() >= GREP_MAX_BYTES {
+                head.push_str("[results truncated — narrow the pattern or pass a path]\n");
+            }
+            head.push_str(&out);
+            ToolResult::ok(head)
+        }
+        Tool::Glob { pattern, path } => {
+            let root_abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+            let base = match path {
+                Some(p) => match resolve_tool_path(&root_abs, p) {
+                    Ok(b) => b,
+                    Err(r) => return r,
+                },
+                None => root_abs.clone(),
+            };
+            let pat = match glob::Pattern::new(pattern) {
+                Ok(p) => p,
+                Err(e) => {
+                    return ToolResult::err_code(
+                        ErrorCode::InvalidArguments,
+                        format!("invalid glob /{pattern}/: {e}"),
+                    );
+                }
+            };
+            let mut out = String::new();
+            let mut count = 0usize;
+            for entry in walkdir::WalkDir::new(&base)
+                .into_iter()
+                .filter_entry(keep_search_entry)
+            {
+                let Ok(e) = entry else { continue };
+                if !e.file_type().is_file() {
+                    continue;
+                }
+                if count >= GLOB_MAX_FILES {
+                    break;
+                }
+                let abs = e.path();
+                if is_sensitive_path(abs) {
+                    continue;
+                }
+                let rel = abs
+                    .strip_prefix(&base)
+                    .unwrap_or(abs)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let fname = e.file_name().to_string_lossy();
+                if pat.matches(&rel) || pat.matches(fname.as_ref()) {
+                    out.push_str(&format!("{rel}\n"));
+                    count += 1;
+                }
+            }
+            if count == 0 {
+                return ToolResult::ok(format!("no files match /{pattern}/"));
+            }
+            let mut head = format!("[{count} file(s) matching /{pattern}/]\n");
+            if count >= GLOB_MAX_FILES {
+                head.push_str("[results truncated]\n");
+            }
+            head.push_str(&out);
+            ToolResult::ok(head)
         }
         Tool::GitStatus => {
             let repo = match git::open_repo(root) {
@@ -2161,16 +3117,251 @@ pub fn execute(
                 }
             };
             if statuses.is_empty() {
-                return ToolResult::ok("working tree clean".to_string());
+                return ToolResult::ok_structured(
+                    "working tree clean".to_string(),
+                    serde_json::json!({ "clean": true, "count": 0, "files": [] }),
+                );
             }
             let mut out = format!("[{} changed files]\n", statuses.len());
-            for s in statuses {
+            for s in &statuses {
                 out.push_str(&format!(
                     "{} [{} +{}/-{}]\n",
                     s.path, s.status, s.additions, s.deletions
                 ));
             }
+            let files: Vec<serde_json::Value> = statuses
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "path": s.path,
+                        "status": s.status,
+                        "additions": s.additions,
+                        "deletions": s.deletions,
+                    })
+                })
+                .collect();
+            let structured = serde_json::json!({
+                "clean": false,
+                "count": statuses.len(),
+                "files": files,
+            });
+            ToolResult::ok_structured(out, structured)
+        }
+        Tool::GitDiff { path } => {
+            let repo = match git_repo(root) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            let diffs = match git::diff_workdir(&repo) {
+                Ok(d) => d,
+                Err(e) => {
+                    return ToolResult::err_code(
+                        ErrorCode::ExecutionFailed,
+                        format!("git diff: {e}"),
+                    );
+                }
+            };
+            let diffs: Vec<_> = match path {
+                Some(p) if !p.is_empty() && p != "." => diffs
+                    .into_iter()
+                    .filter(|d| d.path == *p || d.path.contains(&format!("{p}/")))
+                    .collect(),
+                _ => diffs,
+            };
+            if diffs.is_empty() {
+                return ToolResult::ok("no changes".to_string());
+            }
+            let mut out = format!("[{} changed file(s)]\n", diffs.len());
+            for d in diffs {
+                out.push_str(&format!(
+                    "\n── {} [{} +{}/-{}]\n",
+                    d.path, d.status, d.added, d.deleted
+                ));
+                out.push_str(&d.patch);
+                if !d.patch.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
             ToolResult::ok(out)
+        }
+        Tool::GitLog { limit } => {
+            let repo = match git_repo(root) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            let want = (limit.unwrap_or(20) as usize).clamp(1, 100);
+            let commits = match git::log(&repo, want) {
+                Ok(c) => c,
+                Err(e) => {
+                    return ToolResult::err_code(
+                        ErrorCode::ExecutionFailed,
+                        format!("git log: {e}"),
+                    );
+                }
+            };
+            if commits.is_empty() {
+                return ToolResult::ok("no commits yet".to_string());
+            }
+            let mut out = format!("[{}/{} commits]\n", commits.len(), want);
+            for c in commits {
+                let short = c.oid.chars().take(7).collect::<String>();
+                out.push_str(&format!("{short}  {}  {}\n", c.author, c.message));
+            }
+            ToolResult::ok(out)
+        }
+        Tool::GitAdd { path } => {
+            let repo = match git_repo(root) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            let all = matches!(path.as_str(), "all" | "." | "*");
+            if !all {
+                match valid_git_rel(path) {
+                    Ok(()) => {}
+                    Err(e) => return e,
+                }
+            }
+            let res = if all {
+                git::stage_all(&repo).map_err(|e| format!("git add: {e}"))
+            } else {
+                git::stage(&repo, path).map_err(|e| format!("git add {path}: {e}"))
+            };
+            match res {
+                Ok(()) => ToolResult::ok(if all {
+                    "staged all changes".to_string()
+                } else {
+                    format!("staged {path}")
+                }),
+                Err(e) => ToolResult::err_code(ErrorCode::ExecutionFailed, e),
+            }
+        }
+        Tool::GitUnstage { path } => {
+            let repo = match git_repo(root) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            match valid_git_rel(path) {
+                Ok(()) => {}
+                Err(e) => return e,
+            }
+            match git::unstage(&repo, path) {
+                Ok(()) => ToolResult::ok(format!("unstaged {path}")),
+                Err(e) => {
+                    ToolResult::err_code(ErrorCode::ExecutionFailed, format!("git unstage: {e}"))
+                }
+            }
+        }
+        Tool::GitCommit { message } => {
+            let repo = match git_repo(root) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            if message.trim().is_empty() {
+                return ToolResult::err_code(
+                    ErrorCode::InvalidArguments,
+                    "commit message is empty",
+                );
+            }
+            match git::has_staged_changes(&repo) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return ToolResult::err_code(
+                        ErrorCode::InvalidArguments,
+                        "nothing staged to commit — stage changes with git_add first",
+                    );
+                }
+                Err(e) => {
+                    return ToolResult::err_code(ErrorCode::ExecutionFailed, format!("git: {e}"));
+                }
+            }
+            match git::commit(&repo, message.trim()) {
+                Ok(oid) => ToolResult::ok(format!(
+                    "committed {}: {}",
+                    oid.to_string().chars().take(7).collect::<String>(),
+                    message.trim()
+                )),
+                Err(e) => {
+                    ToolResult::err_code(ErrorCode::ExecutionFailed, format!("git commit: {e}"))
+                }
+            }
+        }
+        Tool::GitBranches => {
+            let repo = match git_repo(root) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            let branches = match git::branches(&repo) {
+                Ok(b) => b,
+                Err(e) => {
+                    return ToolResult::err_code(
+                        ErrorCode::ExecutionFailed,
+                        format!("git branch: {e}"),
+                    );
+                }
+            };
+            if branches.is_empty() {
+                return ToolResult::ok("no branches".to_string());
+            }
+            let mut out = format!("[{} branches]\n", branches.len());
+            for b in branches {
+                let marker = if b.is_current { "*" } else { " " };
+                out.push_str(&format!("{marker} {}\n", b.name));
+            }
+            ToolResult::ok(out)
+        }
+        Tool::GitCreateBranch { name } => {
+            let repo = match git_repo(root) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            if name.trim().is_empty() {
+                return ToolResult::err_code(ErrorCode::InvalidArguments, "branch name is empty");
+            }
+            match git::create_branch(&repo, name.trim()) {
+                Ok(()) => ToolResult::ok(format!("created branch {name}")),
+                Err(e) => {
+                    ToolResult::err_code(ErrorCode::ExecutionFailed, format!("git branch: {e}"))
+                }
+            }
+        }
+        Tool::GitCheckout { branch } => {
+            let repo = match git_repo(root) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            match git::checkout(&repo, branch) {
+                Ok(()) => ToolResult::ok(format!("switched to branch {branch}")),
+                Err(e) => {
+                    ToolResult::err_code(ErrorCode::ExecutionFailed, format!("git checkout: {e}"))
+                }
+            }
+        }
+        Tool::GitCommitDiff { commit } => {
+            let repo = match git_repo(root) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            match git::commit_diff(&repo, commit) {
+                Ok(patch) if !patch.is_empty() => ToolResult::ok(patch),
+                Ok(_) => ToolResult::ok("commit has no diff".to_string()),
+                Err(e) => ToolResult::err_code(
+                    ErrorCode::ExecutionFailed,
+                    format!("git diff {commit}: {e}"),
+                ),
+            }
+        }
+        Tool::GitShow { commit } => {
+            let repo = match git_repo(root) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            match git::show(&repo, commit) {
+                Ok(text) => ToolResult::ok(text),
+                Err(e) => ToolResult::err_code(
+                    ErrorCode::ExecutionFailed,
+                    format!("git show {commit}: {e}"),
+                ),
+            }
         }
         // Handled above, before the project-root check.
         Tool::DescribeTool { .. } | Tool::ListTools => unreachable!(),
@@ -3082,7 +4273,40 @@ mod tests {
                 command: "true".into(),
             },
             Tool::ListDirectory { path: ".".into() },
+            Tool::Grep {
+                pattern: "foo".into(),
+                path: None,
+                case_sensitive: None,
+            },
+            Tool::Glob {
+                pattern: "*.rs".into(),
+                path: None,
+            },
             Tool::GitStatus,
+            Tool::GitDiff { path: None },
+            Tool::GitLog { limit: None },
+            Tool::GitAdd {
+                path: "a.ts".into(),
+            },
+            Tool::GitUnstage {
+                path: "a.ts".into(),
+            },
+            Tool::GitCommit {
+                message: "wip".into(),
+            },
+            Tool::GitBranches,
+            Tool::GitCreateBranch {
+                name: "feat/x".into(),
+            },
+            Tool::GitCheckout {
+                branch: "main".into(),
+            },
+            Tool::GitCommitDiff {
+                commit: "abc123".into(),
+            },
+            Tool::GitShow {
+                commit: "abc123".into(),
+            },
             Tool::DescribeTool {
                 name: "read_file".into(),
             },
@@ -3103,7 +4327,19 @@ mod tests {
                 | Tool::ReadManyFiles { .. }
                 | Tool::RunCommand { .. }
                 | Tool::ListDirectory { .. }
+                | Tool::Grep { .. }
+                | Tool::Glob { .. }
                 | Tool::GitStatus
+                | Tool::GitDiff { .. }
+                | Tool::GitLog { .. }
+                | Tool::GitAdd { .. }
+                | Tool::GitUnstage { .. }
+                | Tool::GitCommit { .. }
+                | Tool::GitBranches
+                | Tool::GitCreateBranch { .. }
+                | Tool::GitCheckout { .. }
+                | Tool::GitCommitDiff { .. }
+                | Tool::GitShow { .. }
                 | Tool::DescribeTool { .. }
                 | Tool::ListTools => {}
             }
@@ -3173,7 +4409,7 @@ mod tests {
 
         let r = execute(
             &Tool::DescribeTool {
-                name: "grep".into(), // not implemented yet
+                name: "web_fetch".into(), // on the roadmap, not yet implemented
             },
             None,
             None,
@@ -3222,6 +4458,88 @@ mod tests {
         );
     }
 
+    // ── Phase 2 search: sensitive-path filtering is the whole point ──
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "lexsus-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn grep_filters_sensitive_files_and_prunes_vendored_dirs() {
+        let root = scratch_dir("grep");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        std::fs::write(root.join("src/a.txt"), "the secret is on the wire\n").unwrap();
+        std::fs::write(root.join(".env"), "DATABASE_SECRET=hidden\n").unwrap();
+        std::fs::write(root.join("node_modules/dep.txt"), "the secret too\n").unwrap();
+
+        let out = execute(
+            &Tool::Grep {
+                pattern: "secret".into(),
+                path: None,
+                case_sensitive: Some(true),
+            },
+            Some(&root),
+            None,
+        );
+        assert!(out.ok, "{:?}", out.error);
+        let text = out.output.unwrap();
+        // Found in the normal source file…
+        assert!(
+            text.contains("src/a.txt:1"),
+            "missing match in a.txt:\n{text}"
+        );
+        // …but NOT in the sensitive `.env`, nor in pruned node_modules.
+        assert!(!text.contains(".env"), "leaked sensitive path:\n{text}");
+        assert!(
+            !text.contains("node_modules"),
+            "scanned vendored dir:\n{text}"
+        );
+    }
+
+    #[test]
+    fn glob_filters_sensitive_files() {
+        let root = scratch_dir("glob");
+        std::fs::write(root.join("a.txt"), "x").unwrap();
+        std::fs::write(root.join(".env"), "x").unwrap();
+        let out = execute(
+            &Tool::Glob {
+                pattern: "*.env".into(),
+                path: None,
+            },
+            Some(&root),
+            None,
+        );
+        assert!(out.ok, "{:?}", out.error);
+        let text = out.output.unwrap();
+        // The pattern itself may echo in the header; assert no *match line*.
+        assert!(
+            !text.lines().any(|l| l.trim() == ".env"),
+            "glob surfaced a sensitive path:\n{text}"
+        );
+        assert!(text.contains("no files"), "expected no files, got:\n{text}");
+
+        let out = execute(
+            &Tool::Glob {
+                pattern: "*.txt".into(),
+                path: None,
+            },
+            Some(&root),
+            None,
+        );
+        assert!(out.ok, "{:?}", out.error);
+        assert!(out.output.unwrap().contains("a.txt"));
+    }
+
     #[test]
     fn manifest_and_describe_are_not_call_syntax() {
         // `list_tools` and `describe_tool` output goes straight into a model's
@@ -3244,39 +4562,213 @@ mod tests {
         assert!(!text.contains("(shell command)"));
     }
 
+    /// Args tuned so each tool actually succeeds against the workspace the two
+    /// tests below build. `sample_args` only has to *parse*; these have to run,
+    /// because the point is to inspect a real payload rather than skip every
+    /// tool that happened to fail.
+    ///
+    /// Depends on SPECS order: the file tools build on each other (write, then
+    /// edit, then move), and both tests iterate `SPECS` in declaration order.
+    fn succeeding_args(name: &str) -> serde_json::Value {
+        match name {
+            "read_file" => serde_json::json!({"path": "long.txt"}),
+            "write_file" => serde_json::json!({"path": "a.txt", "content": "x"}),
+            "edit_file" => {
+                serde_json::json!({"path": "a.txt", "old_string": "x", "new_string": "y"})
+            }
+            "multi_edit" => serde_json::json!({
+                "path": "a.txt",
+                "edits": [{"old_string": "y", "new_string": "z"}]
+            }),
+            "apply_patch" => serde_json::json!({
+                "path": "a.txt", "patch": "@@ -1 +1 @@\n-z\n+w"
+            }),
+            "delete_file" => serde_json::json!({"path": "b.txt"}),
+            "move_file" => serde_json::json!({"from": "a.txt", "to": "moved.txt"}),
+            "copy_file" => serde_json::json!({"from": "moved.txt", "to": "copy.txt"}),
+            "create_directory" => serde_json::json!({"path": "d"}),
+            "read_many_files" => serde_json::json!({"paths": ["moved.txt"]}),
+            "run_command" => serde_json::json!({"command": "echo hi"}),
+            other => sample_args(other),
+        }
+    }
+
+    /// A workspace with a chunking-length file, a small file, and a git repo
+    /// (so `git_status` succeeds and gets checked like everything else).
+    fn structured_workspace(tag: &str) -> PathBuf {
+        let dir = temp_project(tag);
+        std::fs::write(dir.join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "one\ntwo\n").unwrap();
+        let long: String = (1..=1000).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(dir.join("long.txt"), &long).unwrap();
+        let _ = git2::Repository::init(&dir);
+        dir
+    }
+
+    /// Drive every tool on the read-only *and* the write surface and check no
+    /// result — success or failure — ever renders a tool name in call syntax.
+    ///
+    /// `manifest_and_describe_are_not_call_syntax` was too narrow to catch
+    /// this: it only ever looked at the manifest and `describe_tool`, so the
+    /// `read_file` chunking footer spelled out `read_file("big.txt", 401)` in
+    /// tool *results* for as long as it liked. Echoing a result back is as
+    /// easy as echoing a manifest, so every result the engine can produce is
+    /// checked here.
+    #[test]
+    fn no_tool_output_reads_as_call_syntax() {
+        let dir = structured_workspace("call-syntax");
+
+        for spec in SPECS {
+            // Built through the parser, the same way the connector builds one.
+            let tool = parse_tool_call(spec.name, &succeeding_args(spec.name))
+                .unwrap_or_else(|e| panic!("{}: {e}", spec.name));
+            let result = execute(&tool, Some(&dir), None);
+            for text in [result.output.as_deref(), result.error.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                for other in SPECS {
+                    assert!(
+                        !text.contains(&format!("{}(", other.name)),
+                        "{}'s result renders {} in call syntax — echoing it \
+                         back would run a tool:\n{text}",
+                        spec.name,
+                        other.name
+                    );
+                }
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every tool that returns a structured payload emits exactly the keys its
+    /// `output_schema` advertises, and every key the schema marks `required`.
+    ///
+    /// MCP makes `outputSchema` a promise about `structuredContent`, so a
+    /// field an executor adds without a schema row is a broken promise rather
+    /// than a harmless extra — this is what keeps the two halves honest.
+    #[test]
+    fn structured_output_matches_its_declared_schema() {
+        let dir = structured_workspace("structured");
+
+        let mut structured_tools = Vec::new();
+        for spec in SPECS {
+            let tool = parse_tool_call(spec.name, &succeeding_args(spec.name))
+                .unwrap_or_else(|e| panic!("{}: {e}", spec.name));
+            let result = execute(&tool, Some(&dir), None);
+            let schema = output_schema(spec.name)
+                .unwrap_or_else(|| panic!("no output schema for {}", spec.name));
+            let props = schema["properties"].as_object().expect("properties");
+            let required: Vec<&str> = schema["required"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+
+            let Some(structured) = result.structured.as_ref() else {
+                // Errors legitimately carry no payload; a *success* without one
+                // means a tool was added with no structured channel at all.
+                assert!(
+                    !result.ok,
+                    "{} succeeded without a structured payload",
+                    spec.name
+                );
+                continue;
+            };
+            structured_tools.push(spec.name);
+
+            let emitted = structured.as_object().expect("structured is an object");
+            for key in emitted.keys() {
+                assert!(
+                    props.contains_key(key),
+                    "{} emits '{key}' but its schema does not list it",
+                    spec.name
+                );
+            }
+            for key in &required {
+                assert!(
+                    emitted.contains_key(*key),
+                    "{} schema requires '{key}' but nothing was emitted",
+                    spec.name
+                );
+            }
+        }
+
+        // A guard on the guard: if the args above ever stop landing, this test
+        // would pass by checking nothing at all.
+        assert!(
+            structured_tools.len() >= 12,
+            "only {} tools produced a structured payload — the fixtures have \
+             drifted and this test is no longer covering the surface: {structured_tools:?}",
+            structured_tools.len()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn small_file_reads_whole_with_no_footer() {
         let out = chunk_text("a.txt", "one\ntwo\nthree\n", None, None);
-        assert_eq!(out, "   1| one\n   2| two\n   3| three\n");
+        assert_eq!(out.text, "   1| one\n   2| two\n   3| three\n");
+        // The whole file in one page: no next offset to hand out.
+        assert_eq!(out.next_offset, None);
+        assert_eq!((out.start_line, out.end_line, out.total_lines), (1, 3, 3));
     }
 
     #[test]
     fn empty_file_is_reported_not_blank() {
-        assert_eq!(chunk_text("a.txt", "", None, None), "[a.txt is empty]\n");
+        let out = chunk_text("a.txt", "", None, None);
+        assert_eq!(out.text, "[a.txt is empty]\n");
+        assert_eq!(out.total_lines, 0);
+        assert_eq!(out.next_offset, None);
     }
 
     #[test]
-    fn large_file_pages_and_names_the_next_call() {
+    fn large_file_pages_and_hands_out_the_next_offset() {
         let text = (1..=1000)
             .map(|i| format!("line {i}\n"))
             .collect::<String>();
 
         let first = chunk_text("big.txt", &text, None, None);
-        assert!(first.starts_with("   1| line 1\n"), "{first:.40}");
-        assert!(first.contains(&format!("{:>4}| line {}\n", CHUNK_LINES, CHUNK_LINES)));
-        assert!(!first.contains(&format!("| line {}\n", CHUNK_LINES + 1)));
-        assert!(first.contains("[chunk 1 of 3 · lines 1-400 of 1000"));
-        assert!(first.contains(r#"[to continue, call: read_file("big.txt", 401)]"#));
+        assert!(
+            first.text.starts_with("   1| line 1\n"),
+            "{:.40}",
+            first.text
+        );
+        assert!(first
+            .text
+            .contains(&format!("{:>4}| line {}\n", CHUNK_LINES, CHUNK_LINES)));
+        assert!(!first
+            .text
+            .contains(&format!("| line {}\n", CHUNK_LINES + 1)));
+        assert!(first.text.contains("[chunk 1 of 3 · lines 1-400 of 1000"));
+        // The offset is the paging primitive — data to pass, not a call to copy.
+        assert_eq!(first.next_offset, Some(401));
+        assert!(
+            !first.text.contains("read_file("),
+            "the footer is call syntax again: {}",
+            first.text
+        );
 
-        // Following the footer must land exactly where the last chunk stopped.
+        // Following `next_offset` must land exactly where the last chunk stopped.
         let second = chunk_text("big.txt", &text, Some(401), None);
-        assert!(second.starts_with(" 401| line 401\n"), "{second:.40}");
-        assert!(second.contains("[chunk 2 of 3 · lines 401-800 of 1000"));
+        assert!(
+            second.text.starts_with(" 401| line 401\n"),
+            "{:.40}",
+            second.text
+        );
+        assert!(second
+            .text
+            .contains("[chunk 2 of 3 · lines 401-800 of 1000"));
+        assert_eq!(second.next_offset, Some(801));
 
         let third = chunk_text("big.txt", &text, Some(801), None);
-        assert!(third.contains("[chunk 3 of 3 · lines 801-1000 of 1000"));
-        assert!(third.contains("[end of file]"));
-        assert!(!third.contains("to continue"));
+        assert!(third
+            .text
+            .contains("[chunk 3 of 3 · lines 801-1000 of 1000"));
+        assert!(third.text.contains("[end of file]"));
+        // End of file: nothing left to page to.
+        assert_eq!(third.next_offset, None);
     }
 
     #[test]
@@ -3287,8 +4779,12 @@ mod tests {
             .map(|_| format!("{}\n", "x".repeat(1024)))
             .collect::<String>();
         let out = chunk_text("wide.txt", &text, None, None);
-        assert!(out.len() < CHUNK_BYTES * 2, "chunk was {} bytes", out.len());
-        assert!(out.contains("to continue"));
+        assert!(
+            out.text.len() < CHUNK_BYTES * 2,
+            "chunk was {} bytes",
+            out.text.len()
+        );
+        assert!(out.next_offset.is_some());
     }
 
     #[test]
@@ -3297,8 +4793,8 @@ mod tests {
         // empty chunk would leave the AI looping on the same offset forever.
         let text = format!("{}\nsecond\n", "y".repeat(CHUNK_BYTES * 3));
         let out = chunk_text("min.js", &text, None, None);
-        assert!(out.starts_with("   1| yyy"));
-        assert!(out.contains(r#"read_file("min.js", 2)"#));
+        assert!(out.text.starts_with("   1| yyy"));
+        assert_eq!(out.next_offset, Some(2));
     }
 
     #[test]
@@ -3306,17 +4802,19 @@ mod tests {
         // The AI guesses at file length; stranding it on a stale offset is worse
         // than showing the last line.
         let out = chunk_text("a.txt", "one\ntwo\n", Some(99), None);
-        assert!(out.contains("| two"), "{out}");
+        assert!(out.text.contains("| two"), "{}", out.text);
     }
 
     #[test]
     fn explicit_limit_is_honoured() {
         let text = (1..=50).map(|i| format!("line {i}\n")).collect::<String>();
         let out = chunk_text("a.txt", &text, Some(10), Some(5));
-        assert!(out.starts_with("  10| line 10\n"), "{out:.40}");
-        assert!(out.contains("  14| line 14\n"));
-        assert!(!out.contains("line 15"));
-        assert!(out.contains(r#"read_file("a.txt", 15)"#));
+        assert!(out.text.starts_with("  10| line 10\n"), "{:.40}", out.text);
+        assert!(out.text.contains("  14| line 14\n"));
+        // Matched with the rendered body's pipe, so the footer's "continues at
+        // line 15" doesn't read as a leaked body line.
+        assert!(!out.text.contains("| line 15"));
+        assert_eq!(out.next_offset, Some(15));
     }
 
     // ── parse_tool_call / tool_input_schema drift guards ────────────────

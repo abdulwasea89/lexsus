@@ -3,11 +3,27 @@
 > The tool surface the web AI sees, phase by phase: what is **built**, what is
 > **planned**, and the invariants every new tool must uphold.
 >
+<<<<<<< HEAD
+<<<<<<< HEAD
+> Status date: 2026-09-09. **27 of 44 built.**
+>
+> **Completed:** Phase 0 ✅, Phase 1 ✅, Phase 2 ✅, Phase 3 ✅. **Not started:**
+> Phases 5, 7. **Partial:** Phase 4 (0 tools shipped, 6 of 9 have built
+> backing) and Phase 6 (session-grants slice landed; persisted
+> policy/config/expiry remain).
+=======
 > Status date: 2026-09-10. **15 of 58 built.**
+=======
+> Status date: 2026-09-10. **15 of 58 built.** Phase 1's *round trip* was
+> reworked on 2026-09-10 (text + `structuredContent`, per-tool `outputSchema`,
+> typed error codes, paging by offset) — the tools and their arguments are
+> unchanged; what crosses the connector boundary is not. See invariant 9.
+>>>>>>> 6cbf3487c9d86e9f38a231a2773b5a6ad6fc339a
 >
 > **Completed:** Phase 0 ✅, Phase 1 ✅. **Not started:** Phases 2, 3, 5, 7, 8, 9, 10.
 > **Partial:** Phase 4 (0 tools shipped, 6 of 10 have built backing) and
 > Phase 6 (session-grants slice landed; persisted policy/config/expiry remain).
+>>>>>>> 15b86747d260d728cb108d11ca09c9706c5c764b
 
 This is the capability roadmap for the coding-agent bridge. It is deliberately
 separate from `full-plan.md` §13, whose "Phase 0"–"Phase 7" describe the
@@ -39,11 +55,15 @@ tool that looks fine in `tools/list` and fails on the first call.
 
 **The drift guard is now Rust unit tests**, not a script: `bridge.rs` and
 `mcp.rs` carry `surface_partitions_all_spec_tools`,
-`every_exposed_tool_has_descriptor_and_schema`, and
-`write_tools_hidden_until_enabled`. (The old `scripts/check-spec-sync.mjs`
-existed solely to keep `SPECS` aligned with `extension/tool-spec.js`; both the
-script and the extension are gone, and the invariant moved to the test that
-actually enforces it.)
+`every_exposed_tool_has_descriptor_and_schema`,
+`write_tools_hidden_until_enabled`, plus the round-trip guards added
+2026-09-10 — `every_exposed_tool_declares_output_schema`,
+`structured_output_matches_its_declared_schema`,
+`error_code_survives_the_mcp_boundary`, and
+`no_tool_output_reads_as_call_syntax`. (The old
+`scripts/check-spec-sync.mjs` existed solely to keep `SPECS` aligned with
+`extension/tool-spec.js`; both the script and the extension are gone, and the
+invariant moved to the test that actually enforces it.)
 
 ## The read-only gate — a second axis, above the approval classes
 
@@ -85,6 +105,18 @@ grant made for a connector session never covers a desktop call.
 | — | original MVP tools | 5 | — | 5 | ✅ done |
 | 0 | registry + progressive disclosure | 5 | 2 | 7 | ✅ done |
 | 1 | files & editing | 8 (+1 early) | 8 | 15 | ✅ done |
+<<<<<<< HEAD
+| 2 | search | 0 | 2 | 17 | ✅ done |
+| 3 | git | 0 | 10 | 27 | ✅ done |
+| 4 | project memory | 0 | 9 | 36 | 🔶 partial |
+| 5 | background commands | 0 | 3 | 39 | ⏳ not started |
+| 6 | approval policy engine | — | 0 | 39 | 🔶 partial |
+| 7 | web & long tail | 0 | 5 | 44 | ⏳ not started |
+
+Of the 17 not yet built, **~11 are wiring over code that already exists** —
+most of Phase 4 (the SQLite tables and extraction are built) and the thin
+file ops.
+=======
 | 2 | search | 0 | 2 | 17 | ⏳ not started |
 | 3 | git | 0 | 10 | 27 | ⏳ not started |
 | 4 | project memory | 0 | 10 | 37 | 🔶 partial |
@@ -98,6 +130,7 @@ grant made for a connector session never covers a desktop call.
 Of the 43 not yet built, **~18 are wiring over code that already exists** — all
 of Phase 3 (git.rs has every function), 6 of 10 in Phase 4 (the SQLite tables and
 extraction are built), and the thin file ops.
+>>>>>>> 15b86747d260d728cb108d11ca09c9706c5c764b
 
 **Suggested order of attack.** Phase 2 (`grep`/`glob`) and Phase 8 (LSP
 diagnostics) are the two highest-value gaps: without search an agent guesses
@@ -164,7 +197,7 @@ persisted grant policies and per-tool configuration.
 
 ---
 
-## Phase 2 — Search (2 tools) ⏳ NOT STARTED
+## Phase 2 — Search (2 tools) ✅ DONE
 
 **Goal:** the AI can find things instead of guessing filenames.
 
@@ -178,10 +211,14 @@ through `is_sensitive_path()`. Without it, search becomes a secret-exfiltration
 path that bypasses the `read_file` gate entirely: `grep ".env"` must return
 nothing for `.env` itself even though the file matches.
 
-Gated behind the chunked-read work (now landed): search output can exceed
-anything the UI handles, so results need the same paging treatment `read_file`
-got.
+Both walk the project tree with `walkdir`, prune `.git`/vendored/build
+directories, skip binary and over-large files, filter every hit (and glob
+result) through `is_sensitive_path()`, and cap files/hits/output bytes so an
+`Auto` search can't hang or flood the chat.
 
+<<<<<<< HEAD
+## Phase 3 — Git (10 tools) — the cheapest phase ✅ DONE
+=======
 **Parity note (Claude Code's `Grep`/`Glob`):** those tools take a `path` scope,
 an optional `glob` filter, and a result-count cap, and return *files-with-matches*
 by default rather than every matching line. Copy that shape — the cap matters
@@ -190,6 +227,7 @@ more than the search itself, because an uncapped search is a context bomb.
 ---
 
 ## Phase 3 — Git (10 tools) — the cheapest phase ⏳ NOT STARTED
+>>>>>>> 15b86747d260d728cb108d11ca09c9706c5c764b
 
 **Goal:** expose the git workflow the app already has to the AI using it.
 Almost pure wiring: `git.rs` has every function, and most already have Tauri
@@ -198,6 +236,18 @@ commands in `lib.rs` for the UI panel. Only `git_create_branch` and
 
 | Tool | Approval | Backing |
 |---|---|---|
+<<<<<<< HEAD
+| `git_diff` | Auto | `git.rs::diff_workdir` |
+| `git_log` | Auto | `git.rs::log` |
+| `git_add` | Always | `git.rs::stage`/`stage_all` |
+| `git_unstage` | Always | `git.rs::unstage` |
+| `git_commit` | Always | `git.rs::commit` — refuses an empty/staged-nothing commit |
+| `git_branches` | Auto | `git.rs::branches` |
+| `git_create_branch` | Always | `git.rs::create_branch` |
+| `git_checkout` | **Destructive** | `git.rs::checkout` — refuses on a dirty tree |
+| `git_commit_diff` | Auto | `git.rs::commit_diff` |
+| `git_show` | Auto | `git.rs::show` — commit message + diff by oid |
+=======
 | `git_diff` | Auto | `git.rs::diff_workdir`, `lib.rs` |
 | `git_log` | Auto | `git.rs::log`, `lib.rs` |
 | `git_add` | Always | `git.rs::stage`/`stage_all` |
@@ -208,6 +258,7 @@ commands in `lib.rs` for the UI panel. Only `git_create_branch` and
 | `git_checkout` | **Destructive** | `git.rs::checkout`, `lib.rs` — **must refuse on a dirty tree** |
 | `git_commit_diff` | Auto | `git.rs::commit_diff`, `lib.rs` |
 | `git_show` | Auto | new: render a commit (message + diff) by oid |
+>>>>>>> 15b86747d260d728cb108d11ca09c9706c5c764b
 
 ---
 
@@ -467,10 +518,17 @@ any of them is wrong regardless of what it adds:
    new tool trips it, the test is right and the tool is wrong.
 3. **Tool output must not parse as tool calls.** If the AI echoes a result,
    nothing fires. The anchored parser and the manifest's no-call-syntax rule
-   exist because this class of bug froze the host page.
+   exist because this class of bug froze the host page. This applies to
+   **results**, not just the manifest — `read_file`'s chunking footer used to
+   spell out `read_file("big.txt", 401)`, which the manifest-only test could
+   not see. `no_tool_output_reads_as_call_syntax` drives every tool and checks
+   every result; page with data (an offset) rather than with prose that
+   imitates a call.
 4. **Cap what you return.** `RESULT_CHAR_CAP` (140,000 chars) is applied by the
    connector; page like `read_file` does if a single result can be large, and
-   include the truncation marker so the model knows it was cut.
+   include the truncation marker so the model knows it was cut. The marker is
+   deliberately tool-neutral — it cannot know what it is truncating, so it
+   must not advise calling a specific tool.
 5. **Sensitive-path filtering applies to lists, not just reads.** `grep`,
    `glob`, `list_directory`, LSP symbols, and MCP resource listings included.
 6. **Destructive tools show what disappears** and refuse unsafe states
@@ -480,6 +538,16 @@ any of them is wrong regardless of what it adds:
 8. **Never block longer than the connector timeout.** Gated calls block on the
    desktop for at most `APPROVAL_WAIT_SECS` (120 s). A tool that needs longer
    belongs in Phase 5's background trio, not in a blocking call.
+9. **Structured output is a promise, not a bonus.** If a tool returns
+   `structuredContent`, add its row to `output_schema()` (`bridge.rs`) in the
+   same commit — MCP says the payload must conform to the advertised
+   `outputSchema`, and `structured_output_matches_its_declared_schema`
+   enforces it both ways (no undeclared key, no missing required key). Report
+   a **typed** `ErrorCode` from the core rather than a bare string, so a
+   failure reaches the model as something it can branch on instead of prose.
+   Put the facts a caller would otherwise have to scrape — a count, a line, a
+   next offset — in the structured half, and keep the text readable for the
+   human reading the trace.
 
 ## Verification per phase
 

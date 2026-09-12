@@ -8,8 +8,8 @@
 | | |
 |---|---|
 | 🧩 What exists | 15 of 58 planned tools built · 5-view workbench · **native MCP connector (single transport)** · Rust core (~8.5k LOC) + React/TS (~5.0k LOC) |
-| ✅ Code healthy | `cargo fmt --all --check` clean · `cargo clippy --lib --all-targets -- -D warnings` exit 0 · `pnpm typecheck` clean · `pnpm lint` 0 errors (6 pre-existing warnings) · `pnpm build` succeeded |
-| ⚠️ Unverified | **`cargo test --lib` was not run** after this change (see §6). Last green: **62 passed / 0 failed** on 2026-09-09, before the extension removal |
+| ✅ Code healthy | `cargo fmt --all --check` clean · `cargo clippy --lib --all-targets -- -D warnings` exit 0 · **`cargo test --lib` 78 passed / 0 failed** · `pnpm typecheck` clean · `pnpm lint` 0 errors (6 pre-existing warnings) · `pnpm build` succeeded |
+| 🔌 Round trip reworked | Every tool result now crosses MCP as **readable text + `structuredContent`**, with `outputSchema` declared per tool. Errors carry their real `error_code`; edits report replacement count and line; `read_file` hands back `next_offset` instead of a call to copy |
 | 🚪 Still to prove | **M1 live gate** (a real web-AI session end-to-end through the connector) and the **exit gate** (5–10 developers) — the actual startup validation is not yet done |
 
 ---
@@ -76,7 +76,15 @@ It is **not** a chat-history copier, a limit bypass, or browser automation/DOM s
 
 ### 3.2 The web-AI tool surface — **15 of 58 tools built**
 
-Every tool is registered **once** in `SPECS` (`src-tauri/src/bridge.rs`) with a matching JSON Schema in `tool_input_schema()` and matching coercion in `parse_tool_call()`. The drift guard is now the Rust unit tests in `bridge.rs`/`mcp.rs` — the old `scripts/check-spec-sync.mjs` and its JS registry are gone with the extension.
+Every tool is registered **once** in `SPECS` (`src-tauri/src/bridge.rs`) with a matching JSON Schema in `tool_input_schema()`, an output schema in `output_schema()`, and matching coercion in `parse_tool_call()`. The drift guard is now the Rust unit tests in `bridge.rs`/`mcp.rs` — the old `scripts/check-spec-sync.mjs` and its JS registry are gone with the extension.
+
+**What crosses the connector boundary (reworked 2026-09-10).** Every successful call returns **readable text *and* `structuredContent`**, and each tool advertises an `outputSchema` in `tools/list`. The text stays the primary, human-readable form — a person reads the trace — while the structured half spares the model from parsing prose:
+
+- **`read_file` hands back `next_offset`** (plus `start_line`/`end_line`/`total_lines`/`truncated`) as data. Paging used to be spelled out inside the output as `read_file("big.txt", 401)` — call syntax in tool output, which violates this file's own inertness rule, since a model that echoes a result back would fire a burst of real calls. The footer is now plain prose and the offset is a number to pass.
+- **Edits report what changed**: `edit_file` returns `replacements`, `first_line`, `bytes_before`/`bytes_after`; `multi_edit` returns per-edit lines. `"edited a.ts"` alone left a model unable to tell a landed edit from a silent no-op, so it re-read the file to find out.
+- **Failures carry their real `error_code`** (`STRING_NOT_FOUND`, `AMBIGUOUS_MATCH`, `PATCH_DOES_NOT_APPLY`, …) in `structuredContent` instead of only prose. It was already computed in the core and then discarded at the MCP boundary; `null` when a failure genuinely has no code (an approval timeout is not a tool error).
+- **`list_directory` reports `kind` and `size`** per entry, not just names; `git_status` and `read_many_files` report per-file structure; `run_command` reports `exit_code`/`timed_out`/`truncated`.
+- **`tools/list` descriptors are derived, not authored**: description + argument list + approval line from the `SPECS` row, a human-readable `title`, `readOnlyHint`/`destructiveHint`/`idempotentHint`, and the output schema. A tool added to `SPECS` appears on the connector fully described without touching `mcp.rs`.
 
 | Group | Tool | Approval | Auto-insert |
 |---|---|---|---|
@@ -190,23 +198,23 @@ A 58-tool plan in phases 0–10. **15 of 58 built.** Phases 8–10 and a **Claud
 |---|---|---|
 | `cargo check --lib` | ✅ clean | |
 | `cargo fmt --all --check` | ✅ **clean** | was **red** on 2026-09-09; the `ws.rs` fmt-diff site is gone |
-| `cargo clippy --lib --all-targets -- -D warnings` | ✅ **exit 0, no warnings** | was **red** on 2026-09-09 (`result_large_err` at `ws.rs:354`); that file no longer exists |
+| `cargo clippy --lib --all-targets -- -D warnings` | ✅ **exit 0, no warnings** | was **red** on 2026-09-09 (`result_large_err` at `ws.rs:354`); that file no longer exists. Re-verified after the 2026-09-10 tool round-trip rework. |
 | `pnpm typecheck` (`tsc --noEmit`) | ✅ clean | |
 | `pnpm lint` | ⚠️ 0 errors, 6 pre-existing warnings | |
 | `pnpm build` | ✅ succeeded | |
-| **`cargo test --lib`** | ⚠️ **NOT RUN** | Deliberate: the user's standing instruction for this pass was *do not run tests*. Last green **62 passed / 0 failed** on 2026-09-09, *before* this change. The change deleted `ws.rs` (and its tests) and altered `mcp.rs` config, so the suite's composition changed even though the policy engine did not. **Running it is the top follow-up.** |
+| **`cargo test --lib`** | ✅ **78 passed / 0 failed** | **Now run and verified.** The instruction was lifted for this pass. A baseline run *before* any edit came back **73 / 0** — so the extension removal did **not** break the suite (the old "62 green" figure predated the Stage-1 parser/schema and MCP tests). The rework then added 5 tests: 78 / 0. |
 | `node scripts/check-spec-sync.mjs` | ➖ **n/a** | The script and the `extension/tool-spec.js` registry it guarded were both deleted; the invariant moved to the `bridge.rs`/`mcp.rs` unit tests. |
 
 **CI (`.github/workflows/ci.yml`):** frontend lint/typecheck/build · `cargo fmt --all --check` · `cargo clippy -- -D warnings` · compression `/health`. A second workflow runs a **Claude PR review** on every PR via `agentrouter.org` (deepseek-v4-flash), gated on the `THIRD_PARTY_API_KEY` secret — its review prompt was updated on 2026-09-10 to describe the new single-registry + read-only-gate invariants instead of the deleted extension registries.
 
-> **CI gap:** `cargo test` is **not** in CI, and this change deliberately did **not** add it — pushing an unverified gate to `main` would be worse than the existing gap. Add it once the suite is confirmed green.
+> **CI gap:** `cargo test` is **still not** in CI. The blocker is gone — the suite is now confirmed green and gate-worthy — so adding it is a small, safe follow-up rather than the risk it was when the result was unknown.
 
 ---
 
 ## 7. Open issues & known gaps (the honest list)
 
 1. **The extension removal cost one real capability: push delivery.** MCP cannot push a message into a chat, so (a) the Handoff view copies to the clipboard instead of injecting, and (b) failover now *offers* continuation in-app instead of auto-delivering. The fix is a **`get_handoff` pull tool** (tool-roadmap Phase 4) or, better, a **`continue_work` MCP prompt** — neither is built. The one structural obstacle: the bridge executor's `(tool, source, root)` signature has no `AppState`, which `build_handoff_impl()` needs.
-2. **`cargo test --lib` is unverified after this change** — the top follow-up, and the reason `cargo test` still isn't a CI gate.
+2. **~~`cargo test --lib` is unverified after this change~~ — RESOLVED 2026-09-10.** The suite was run: **73 / 0 baseline before the rework, 78 / 0 after**. The extension removal did not break it. `cargo test` is still not a CI gate, but the blocker is gone and adding it is now a trivial follow-up.
 3. **Live validation is the real gap.** Everything above is machine-verified; nothing has been proven end-to-end with a real web-AI session through the connector. Startup validation = **M1 live gate**, then the **exit gate with 5–10 real developers** (metric: *successful continuation rate*).
 4. **Provider connector coverage is now the platform risk** (it replaced DOM scraping as risk #1). Gemini has no broad consumer MCP; ChatGPT/Codex varies; Claude and Grok depend on plan and rollout. Mitigated by the connector being provider-native (no selectors to break) and read-only-first — but Lexsus now reaches fewer providers out of the box than the extension did.
 5. **Compression service is a stub** (Layer 3, `/compress` 501) — the handoff today is uncompressed structured facts.
@@ -214,7 +222,7 @@ A 58-tool plan in phases 0–10. **15 of 58 built.** Phases 8–10 and a **Claud
 7. **Package-manager drift:** repo is on pnpm (`pnpm-lock.yaml`, docs say pnpm) yet `package-lock.json` still exists and CI uses `npm ci` / `npm run`. Clean one direction or the other. (Pre-existing; not touched here.)
 8. **Phase 6 remainder:** persisted grant policies, per-tool configuration, grant expiry (grants are in-memory and die with the app).
 9. **F29 encryption not started; F22 unified timeline only partial.**
-10. **No automated test coverage for the connector's live path** — `mcp.rs`'s tests cover surface gating and parsing, but nothing exercises a real MCP client against the loopback server in CI.
+10. **~~No automated test coverage for the connector's live path~~ — partly closed 2026-09-10.** The round-trip rework added tests for the *shaped result* the connector returns (`error_code_survives_the_mcp_boundary`, `success_keeps_readable_text_and_structured_content`, `every_exposed_tool_declares_output_schema`) and, bridge-side, for the payloads themselves (`structured_output_matches_its_declared_schema`) and for the set of all tool outputs (`no_tool_output_reads_as_call_syntax`). What is still untested is a **real MCP client against the loopback server** — the transport, not the payload.
 11. **The per-call cancel path is now vestigial (found during this pass).** `process::set_execution_owner` is only ever called from tests, so `execution_owner()` is always `None`, every `ProcessEntry.owner` is `None`, and the `cancel_request` Tauri command (still registered in `invoke_handler!`) can match no process. Its owner used to be the WebSocket request id that `ws.rs` set — the transport that populated it is gone. **No UI calls `cancel_request`, so nothing is broken for a user today**, but the capability (stop a running `run_command`) is unreachable. Either re-wire the owner to the MCP request id or delete the machinery; do not leave it in the half state.
 
 ---
@@ -225,7 +233,7 @@ A 58-tool plan in phases 0–10. **15 of 58 built.** Phases 8–10 and a **Claud
 - **MVP success criterion:** *a real interrupted coding task is continued by a web AI that genuinely reads, writes, and runs commands on the local project — without the developer re-explaining.* Validated with 5–10 developers.
 - **Primary metric:** successful continuation rate. Secondary: weekly retained devs, handoffs/user/week, tool usage, user-reported trust.
 - **Risk posture:** the highest risks are now provider connector availability (mitigated by using the provider's native tool channel rather than DOM scraping, plus a read-only-first default) and command-execution safety (mitigated by per-tool approval, grants, destructive-path cards, audit log, sensitive-path filtering).
-- **Near-term next actions, in order:** (1) **run `cargo test --lib`** and record the result; (2) run the **M1 live gate** through the MCP connector (runbook: `docs/connector-native-proof-runbook.md`); (3) build **`get_handoff`** / the `continue_work` prompt to restore pull-based continuity; (4) **Phase 2 `grep`/`glob`** and **Phase 8 LSP diagnostics** — the two highest-value tool gaps; (5) real **Layer 3 compression**; then the 5–10-dev validation.
+- **Near-term next actions, in order:** (1) run the **M1 live gate** through the MCP connector (runbook: `docs/connector-native-proof-runbook.md`) — this is now the top item, since `cargo test --lib` came back green; (2) build **`get_handoff`** / the `continue_work` prompt to restore pull-based continuity; (3) **Phase 2 `grep`/`glob`** and **Phase 8 LSP diagnostics** — the two highest-value tool gaps; (4) add **`cargo test` to CI** (now safe); (5) real **Layer 3 compression**; then the 5–10-dev validation.
 
 ---
 

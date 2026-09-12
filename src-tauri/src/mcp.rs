@@ -80,19 +80,54 @@ pub fn tool_visible(name: &str, allow_write: bool) -> bool {
     READ_ONLY.contains(&name) || (allow_write && WRITE.contains(&name))
 }
 
+/// Human-readable title for a tool descriptor: `read_file` → `Read file`.
+/// Connector UIs show this next to the name, where the raw snake_case reads
+/// as an identifier rather than a sentence.
+fn title_for(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + &chars.as_str().replace('_', " "),
+        None => String::new(),
+    }
+}
+
 /// Build the rmcp [`Tool`] descriptor for one canonical tool name, from the
-/// bridge's single source of truth: the SPECS summary + the Stage-1
-/// [`bridge::tool_input_schema`]. Returns `None` for a name with no SPECS row
-/// or schema (shouldn't happen — guarded by tests).
+/// bridge's single source of truth: the SPECS row (summary, argument list,
+/// approval class), the Stage-1 [`bridge::tool_input_schema`], and the
+/// Stage-2 [`bridge::output_schema`]. Returns `None` for a name with no SPECS
+/// row or schema (shouldn't happen — guarded by tests).
+///
+/// Everything here is derived, never authored: a tool added to SPECS shows up
+/// on the connector with a description, a schema and correct hints without
+/// this function being touched.
 fn mcp_tool(name: &'static str) -> Option<Tool> {
-    let summary = bridge::spec_by_name(name)?.summary;
+    let spec = bridge::spec_by_name(name)?;
+    let description = bridge::tool_description(name)?;
     let schema = bridge::tool_input_schema(name)?;
     let schema = schema.as_object()?.clone();
     let read_only = READ_ONLY.contains(&name);
-    Some(
-        Tool::new_with_raw(name, Some(summary.into()), schema)
-            .with_annotations(ToolAnnotations::default().read_only(read_only)),
-    )
+    let destructive = spec.approval == bridge::Approval::Destructive;
+    let mut tool = Tool::new_with_raw(name, Some(description.into()), schema)
+        .with_title(title_for(name))
+        .with_annotations(
+            ToolAnnotations::default()
+                .read_only(read_only)
+                .destructive(destructive)
+                // Reads and the meta tools are safe to repeat; a write that
+                // lands twice is not, so only the read surface claims this.
+                .idempotent(read_only),
+        );
+    // Declaring an output schema is a promise that `structuredContent`
+    // conforms to it, so this is emitted only where `output_schema` has a row
+    // — and `structured_output_matches_its_declared_schema` keeps the promise
+    // honest rather than trusting it.
+    if let Some(output) = bridge::output_schema(name)
+        .as_ref()
+        .and_then(|v| v.as_object())
+    {
+        tool = tool.with_raw_output_schema(Arc::new(output.clone()));
+    }
+    Some(tool)
 }
 
 /// A running MCP server whose every call funnels through the bridge engine.
@@ -168,30 +203,62 @@ impl ServerHandler for LexsusServer {
             .await
             .map_err(|_| McpError::internal_error("mcp execution task failed", None))?;
 
-            if result.ok {
-                let text = cap_text(result.output.as_deref().unwrap_or_default());
-                Ok(CallToolResult::success(vec![ContentBlock::text(text)]).into())
-            } else {
-                let message = result
-                    .error
-                    .as_deref()
-                    .unwrap_or("the tool failed (no detail)");
-                Ok(CallToolResult::error(vec![ContentBlock::text(message.to_string())]).into())
-            }
+            Ok(call_tool_response(result).into())
         }
     }
 }
 
+/// Turn a finished bridge call into the wire response.
+///
+/// Split out of `call_tool` so the shaped result can be asserted directly,
+/// without standing up an MCP session to look at it.
+fn call_tool_response(result: bridge::ToolResult) -> CallToolResult {
+    if result.ok {
+        let text = cap_text(result.output.as_deref().unwrap_or_default());
+        let mut response = CallToolResult::success(vec![ContentBlock::text(text)]);
+        // Assigned to the field directly, never via
+        // `CallToolResult::structured()`: that constructor sets `content` to a
+        // raw `value.to_string()` dump, which would throw away the readable
+        // text this result is built around.
+        response.structured_content = result.structured;
+        response
+    } else {
+        let message = result
+            .error
+            .as_deref()
+            .unwrap_or("the tool failed (no detail)");
+        let mut response = CallToolResult::error(vec![ContentBlock::text(message.to_string())]);
+        // The structured code is the half a model can branch on: "retry with a
+        // different path" and "your old_string did not match" are the same wall
+        // of prose otherwise. Null when the failure carries no code — an
+        // approval that timed out is not a tool error, and inventing a code for
+        // it would be worse than admitting there isn't one.
+        response.structured_content = Some(serde_json::json!({
+            "error_code": result
+                .error_code
+                .as_ref()
+                .and_then(|c| serde_json::to_value(c).ok()),
+            "message": message,
+        }));
+        response
+    }
+}
+
 /// Cap a tool-result string to [`RESULT_CHAR_CAP`] chars, keeping the existing
-/// "cut and say so" convention so a model that hits the cap knows to page.
+/// "cut and say so" convention so a model that hits the cap knows the result
+/// is incomplete rather than believing it saw everything.
+///
+/// The marker is deliberately tool-neutral. It used to advise calling
+/// `read_file` with an offset, which is only ever true for `read_file` — a
+/// truncated `git_status` or `run_command` was told to page a file. A read
+/// that gets cut now carries its continuation in `structured_content.next_offset`
+/// instead, so the text does not have to guess at what it is.
 pub fn cap_text(text: &str) -> String {
     if text.chars().count() <= RESULT_CHAR_CAP {
         return text.to_string();
     }
     let cut: String = text.chars().take(RESULT_CHAR_CAP).collect();
-    format!(
-        "{cut}\n… [output truncated at {RESULT_CHAR_CAP} chars — call read_file with an offset to continue]"
-    )
+    format!("{cut}\n… [output truncated at {RESULT_CHAR_CAP} chars]")
 }
 
 /// Extra `Host` values the DNS-rebinding guard should accept, from
@@ -372,5 +439,94 @@ mod tests {
             assert!(!tool_visible(name, false), "{name}");
             assert!(!tool_visible(name, true), "{name}");
         }
+    }
+
+    /// Declaring `outputSchema` is a promise about `structuredContent`, so
+    /// every exposed tool has to be able to keep it: a schema row, and a
+    /// descriptor that actually advertises it. Paired with the bridge-side
+    /// `structured_output_matches_its_declared_schema`, which checks the
+    /// payloads match the promise.
+    #[test]
+    fn every_exposed_tool_declares_output_schema() {
+        for name in bridge::SPECS.iter().map(|s| s.name) {
+            let spec = bridge::spec_by_name(name).expect("spec row");
+            assert!(
+                bridge::output_schema(name).is_some(),
+                "{name} has no output_schema row"
+            );
+            let tool = mcp_tool(name).unwrap_or_else(|| panic!("no descriptor for {name}"));
+            assert!(
+                tool.output_schema.is_some(),
+                "{name} descriptor advertises no outputSchema"
+            );
+            assert!(tool.title.is_some(), "{name} descriptor has no title");
+            let description = tool.description.as_deref().unwrap_or_default();
+            assert!(
+                description.contains("Approval:"),
+                "{name} description omits the approval line"
+            );
+            if !spec.args.is_empty() {
+                assert!(
+                    description.contains("Args:"),
+                    "{name} description omits its argument list"
+                );
+            }
+        }
+        // No schema for a name that isn't a tool. Aliases resolve on purpose
+        // (same as `tool_input_schema`), so only genuinely unknown names are
+        // checked here.
+        for unknown in ["nope", "read_fil", "", "definitely_not_a_tool"] {
+            assert!(bridge::output_schema(unknown).is_none(), "{unknown}");
+        }
+        assert!(
+            bridge::output_schema("default_api.read_file").is_some(),
+            "aliases must resolve to their canonical tool's schema"
+        );
+    }
+
+    /// The whole point of the rework: a failing call tells the caller *how* it
+    /// failed. Before, `error_code` was computed in the core and then dropped
+    /// on the floor here, leaving the model to guess from prose.
+    #[test]
+    fn error_code_survives_the_mcp_boundary() {
+        let failed = bridge::ToolResult::err_code(
+            bridge::ErrorCode::StringNotFound,
+            "a.txt: old_string not found",
+        );
+        let response = call_tool_response(failed);
+        assert_eq!(response.is_error, Some(true));
+        let structured = response.structured_content.expect("structured error");
+        assert_eq!(structured["error_code"], "STRING_NOT_FOUND");
+        assert_eq!(structured["message"], "a.txt: old_string not found");
+
+        // A failure with no code says so rather than inventing one — an
+        // approval that timed out is not a tool error.
+        let uncoded = bridge::ToolResult::err("approval timed out");
+        let response = call_tool_response(uncoded);
+        let structured = response.structured_content.expect("structured error");
+        assert!(structured["error_code"].is_null(), "{structured}");
+    }
+
+    /// Success keeps the readable text *and* carries the structured half.
+    /// `CallToolResult::structured()` would have replaced the text with a JSON
+    /// dump, so this pins the two together.
+    #[test]
+    fn success_keeps_readable_text_and_structured_content() {
+        let ok = bridge::ToolResult::ok_structured(
+            "edited a.txt — 1 replacement at line 4".to_string(),
+            serde_json::json!({"path": "a.txt", "replacements": 1, "first_line": 4}),
+        );
+        let response = call_tool_response(ok);
+        assert_eq!(response.is_error, Some(false));
+        let text = match response.content.first() {
+            Some(ContentBlock::Text(t)) => t.text.clone(),
+            other => panic!("expected a text block, got {other:?}"),
+        };
+        assert!(
+            text.starts_with("edited a.txt"),
+            "readable text was replaced: {text}"
+        );
+        let structured = response.structured_content.expect("structured content");
+        assert_eq!(structured["first_line"], 4);
     }
 }

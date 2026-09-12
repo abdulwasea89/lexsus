@@ -24,7 +24,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 /// What spawned the process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

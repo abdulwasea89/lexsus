@@ -1,5 +1,27 @@
 use std::path::Path;
 
+/// Render a git timestamp as `YYYY-MM-DD HH:MM:SS` in the author's local
+/// offset (`seconds` since epoch, `offset_minutes` east of UTC). Uses the
+/// standard civil-from-days algorithm so no date crate is needed.
+fn format_utc(seconds: i64, offset_minutes: i32) -> String {
+    let local = seconds + offset_minutes as i64 * 60;
+    let days = local.div_euclid(86_400);
+    let rem = local.rem_euclid(86_400);
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let yr = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let dd = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let yr = if mo <= 2 { yr + 1 } else { yr };
+    format!("{yr:04}-{mo:02}-{dd:02} {hh:02}:{mm:02}:{ss:02}")
+}
+
 /// A single changed file with its diff (used by the git panel).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GitFileStatus {
@@ -300,6 +322,76 @@ pub fn log(repo: &git2::Repository, limit: usize) -> Result<Vec<CommitInfo>, git
     Ok(out)
 }
 
+/// Create a new branch at the current HEAD, without switching to it.
+pub fn create_branch(repo: &git2::Repository, name: &str) -> Result<(), git2::Error> {
+    if repo.find_branch(name, git2::BranchType::Local).is_ok() {
+        return Err(git2::Error::from_str(&format!(
+            "branch already exists: {name}"
+        )));
+    }
+    let head = repo.head()?;
+    let commit = head.peel_to_commit()?;
+    repo.branch(name, &commit, false)?;
+    Ok(())
+}
+
+/// Whether the index differs from HEAD — i.e. a commit would not be empty.
+/// On a repo with no commits yet, any staged entry counts as a change.
+pub fn has_staged_changes(repo: &git2::Repository) -> Result<bool, git2::Error> {
+    let mut index = repo.index()?;
+    let tree_oid = index.write_tree()?;
+    // The well-known empty-tree object id.
+    const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+    match repo.head().ok().and_then(|h| h.peel_to_commit().ok()) {
+        Some(head) => {
+            let head_tree = head.tree()?;
+            Ok(head_tree.id() != tree_oid)
+        }
+        None => Ok(tree_oid.to_string() != EMPTY_TREE && !index.is_empty()),
+    }
+}
+
+/// Render a commit: oid, author, timestamp, message and the full patch
+/// against its parent (root commits diff against the empty tree).
+pub fn show(repo: &git2::Repository, oid: &str) -> Result<String, git2::Error> {
+    let oid = git2::Oid::from_str(oid).map_err(|e| git2::Error::from_str(&e.to_string()))?;
+    let commit = repo.find_commit(oid)?;
+    let author = commit.author();
+    let when = author.when();
+    let mut out = format!(
+        "commit {}\nAuthor: {}\nDate:   {}\n\n    {}\n",
+        commit.id(),
+        author
+            .name()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        format_utc(when.seconds(), when.offset_minutes()),
+        commit.summary().unwrap_or(""),
+    );
+    if let Some(body) = commit.message() {
+        // summary() strips the first line; append the remainder indented.
+        if let Some(rest) = body.strip_prefix(commit.summary().unwrap_or_default()) {
+            for line in rest.trim_start_matches('\n').lines() {
+                out.push_str(&format!("    {}\n", line.trim_end()));
+            }
+        }
+    }
+    out.push('\n');
+    // Diff against the parent (or empty tree for a root commit).
+    let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+    let tree = commit.tree()?;
+    let diff = match parent_tree {
+        Some(pt) => repo.diff_tree_to_tree(Some(&pt), Some(&tree), None)?,
+        None => repo.diff_tree_to_tree(None, Some(&tree), None)?,
+    };
+    diff.print(git2::DiffFormat::Patch, |_d, _h, line| {
+        out.push(line.origin());
+        out.push_str(&String::from_utf8_lossy(line.content()));
+        true
+    })?;
+    Ok(out)
+}
+
 /// Full patch text of a single commit (against its parent; root commits/// diff against the empty tree).
 pub fn commit_diff(repo: &git2::Repository, oid: &str) -> Result<String, git2::Error> {
     let commit = repo.find_commit(
@@ -318,4 +410,81 @@ pub fn commit_diff(repo: &git2::Repository, oid: &str) -> Result<String, git2::E
         true
     })?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "lexsus-git-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let repo = git2::Repository::init(&p).unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "t").unwrap();
+        cfg.set_str("user.email", "t@example.com").unwrap();
+        drop(repo);
+        p
+    }
+
+    fn repo(p: &Path) -> git2::Repository {
+        git2::Repository::open(p).unwrap()
+    }
+
+    fn stage_all(r: &git2::Repository) {
+        let mut index = r.index().unwrap();
+        index
+            .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+    }
+
+    fn commit(r: &git2::Repository, msg: &str) {
+        let sig = r.signature().unwrap();
+        stage_all(r);
+        let tree = r
+            .find_tree(r.index().unwrap().write_tree().unwrap())
+            .unwrap();
+        let oid = match r.head().ok().and_then(|h| h.peel_to_commit().ok()) {
+            Some(p) => r
+                .commit(Some("HEAD"), &sig, &sig, msg, &tree, &[&p])
+                .unwrap(),
+            None => r.commit(Some("HEAD"), &sig, &sig, msg, &tree, &[]).unwrap(),
+        };
+        assert!(r.find_commit(oid).is_ok());
+    }
+
+    #[test]
+    fn has_staged_changes_tracks_the_index() {
+        let dir = scratch("staged");
+        let r = repo(&dir);
+        std::fs::write(dir.join("a.txt"), "one").unwrap();
+        // Nothing staged yet (file untracked, not added).
+        assert!(!has_staged_changes(&r).unwrap());
+        stage_all(&r);
+        assert!(has_staged_changes(&r).unwrap());
+        commit(&r, "initial");
+        assert!(!has_staged_changes(&r).unwrap(), "clean after commit");
+    }
+
+    #[test]
+    fn create_branch_and_refuses_duplicate() {
+        let dir = scratch("branch");
+        let r = repo(&dir);
+        std::fs::write(dir.join("a.txt"), "one").unwrap();
+        commit(&r, "initial");
+        create_branch(&r, "feat/x").unwrap();
+        // A duplicate of an existing local branch is refused.
+        assert!(create_branch(&r, "feat/x").is_err());
+        // Creating does not switch HEAD.
+        assert!(current_branch(&r).is_some());
+    }
 }
