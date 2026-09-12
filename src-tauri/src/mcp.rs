@@ -321,8 +321,15 @@ async fn serve(
     let listener = tokio::net::TcpListener::bind(ADDR).await?;
     listening.store(true, Ordering::SeqCst);
     eprintln!("[mcp] listening on http://{ADDR}{MCP_PATH}");
-    let app = axum::Router::new().nest_service(MCP_PATH, service);
-    axum::serve(listener, app)
+    // The canonical endpoint is `/mcp`, but some provider connectors (Claude.ai)
+    // treat the bare origin as the resource URL and POST `initialize` to `/`.
+    // A 404 there is misread as an auth failure, so the same engine answers at
+    // both paths. `/.well-known/*` is left to 404 so OAuth discovery still
+    // reads as "no auth advertised".
+    let router = axum::Router::new()
+        .nest_service(MCP_PATH, service.clone())
+        .route("/", axum::routing::any_service(service));
+    axum::serve(listener, router)
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))
 }
