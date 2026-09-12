@@ -84,7 +84,15 @@ export interface ToolResult {
   ok: boolean;
   output: string | null;
   error: string | null;
+  /** Stable code for a failure (`STRING_NOT_FOUND`, `AMBIGUOUS_MATCH`, …). */
+  error_code: string | null;
   pending: string | null;
+  /**
+   * The machine-readable half of the result — the same facts as `output`.
+   * Its shape is per-tool and mirrors the Rust `bridge::output_schema` row,
+   * which is what the MCP connector advertises as `outputSchema`.
+   */
+  structured: unknown | null;
 }
 
 export interface ApprovalRequested {
