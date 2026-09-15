@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { CircleAlertIcon } from "lucide-react";
 import {
@@ -9,6 +9,7 @@ import {
 } from "./lib/bridge";
 import type { McpStatus } from "./lib/types";
 import ApprovalBanner from "./components/ApprovalBanner";
+import ErrorBoundary from "./components/ErrorBoundary";
 import GrantsBar from "./components/GrantsBar";
 import BridgeView from "./views/BridgeView";
 import FailoverBanner from "./components/FailoverBanner";
@@ -22,12 +23,21 @@ import TerminalPane from "./components/TerminalPane";
 import Titlebar from "./components/Titlebar";
 import WorkbenchRail, { type View } from "./components/WorkbenchRail";
 import { useApprovals } from "./hooks/useApprovals";
+import { useFailover } from "./hooks/useFailover";
 import { Alert, AlertDescription, AlertTitle } from "./components/ui/alert";
 import GettingStarted from "./components/GettingStarted";
 
 const RECENTS_KEY = "lexsus.recentProjects";
 const VIEW_KEY = "lexsus.view";
 const VIEWS: View[] = ["trace", "git", "handoff", "memory", "bridge"];
+
+const VIEW_LABELS: Record<View, string> = {
+  trace: "Live activity trace",
+  git: "Git",
+  handoff: "Handoff",
+  memory: "Project memory",
+  bridge: "Web-AI connector",
+};
 
 function loadRecents(): string[] {
   try {
@@ -66,6 +76,9 @@ export default function App() {
   const [view, setView] = useState<View>(loadView);
   const [projectOpen, setProjectOpen] = useState(false);
   const { approvals, grantState, decide } = useApprovals();
+  const { status, localEvent, webEvent, dismiss } = useFailover();
+  // Guards project switches: a slow switch must not clobber a newer one.
+  const switchToken = useRef(0);
 
   useEffect(() => {
     localStorage.setItem(VIEW_KEY, view);
@@ -100,15 +113,19 @@ export default function App() {
   }, []);
 
   async function applyProject(path: string) {
+    const token = ++switchToken.current;
     try {
       await setProjectRoot(path);
       await startWatch();
       // The connector's blast radius follows the bound workspace.
-      setMcp(await mcpStatus().catch(() => null));
+      const connector = await mcpStatus().catch(() => null);
+      if (token !== switchToken.current) return;
+      setMcp(connector);
       setError("");
       saveRecent(path);
       setRecents(loadRecents());
     } catch (e) {
+      if (token !== switchToken.current) return;
       setError(String(e));
     }
   }
@@ -149,7 +166,12 @@ export default function App() {
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <ApprovalBanner approvals={approvals} onDecide={decide} />
         <GrantsBar grantState={grantState} />
-        <FailoverBanner />
+        <FailoverBanner
+          status={status}
+          localEvent={localEvent}
+          webEvent={webEvent}
+          dismiss={dismiss}
+        />
 
         {error && (
           <Alert variant="destructive" className="m-3 mb-0 anim-pop">
@@ -176,18 +198,29 @@ export default function App() {
             </div>
 
             <div className="flex min-h-0 flex-1 flex-col">
-              <div key={view} className="h-full anim-fade-up">
-                {view === "trace" && <TraceView />}
-                {view === "git" && <GitView />}
-                {view === "handoff" && <HandoffView />}
-                {view === "memory" && <MemoryView />}
-                {view === "bridge" && <BridgeView />}
-              </div>
+              {/* The trace stays mounted while you're on another tab, so its
+                  event stream and history survive — and no steps are dropped
+                  in the meantime. */}
+              <ErrorBoundary label={VIEW_LABELS.trace}>
+                <div className={view === "trace" ? "h-full" : "hidden"}>
+                  <TraceView />
+                </div>
+              </ErrorBoundary>
+              {view !== "trace" && (
+                <ErrorBoundary key={view} label={VIEW_LABELS[view]}>
+                  <div className="h-full anim-fade-up">
+                    {view === "git" && <GitView />}
+                    {view === "handoff" && <HandoffView />}
+                    {view === "memory" && <MemoryView />}
+                    {view === "bridge" && <BridgeView />}
+                  </div>
+                </ErrorBoundary>
+              )}
             </div>
           </div>
         )}
 
-        <Statusbar projectRoot={projectRoot} connector={mcp} />
+        <Statusbar projectRoot={projectRoot} connector={mcp} status={status} />
       </main>
 
       <ProjectDialog
