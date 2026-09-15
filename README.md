@@ -1,5 +1,5 @@
 <div align="center">
-
+   
 # Lexsus
  
 **Your AI can change. Your work doesn't.**
