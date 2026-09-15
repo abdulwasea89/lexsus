@@ -75,7 +75,7 @@ export default function FailoverBanner() {
   if (empty) return null;
 
   return (
-    <div className="flex shrink-0 flex-col gap-0.5 border-b border-border/60 bg-surface-2/60 px-4 py-2 text-xs">
+    <div className="flex shrink-0 flex-col gap-0.5 border-b border-border/60 bg-surface-2/60 px-4 py-2 text-xs anim-fade-down">
       {local === "stalled" && !localEvent && (
         <div className="flex items-center gap-2">
           <AlertTriangleIcon className="size-4 shrink-0 text-warning" />

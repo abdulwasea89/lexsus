@@ -63,6 +63,7 @@ export default function GitView() {
   const [message, setMessage] = useState("");
   const [result, setResult] = useState("");
   const [error, setError] = useState("");
+  const [committing, setCommitting] = useState(false);
 
   const refresh = useCallback(async (opts?: { clearError?: boolean }) => {
     try {
@@ -102,6 +103,7 @@ export default function GitView() {
   const checkout = (name: string) => runGit(() => gitCheckout(name));
   async function commit() {
     try {
+      setCommitting(true);
       const oid = await gitCommit(message);
       setResult(`committed ${oid.slice(0, 8)}`);
       setMessage("");
@@ -114,6 +116,8 @@ export default function GitView() {
     } catch (e) {
       setError(String(e));
       toast.add({ title: "Commit failed", description: String(e), type: "error" });
+    } finally {
+      setCommitting(false);
     }
   }
   async function showCommit(oid: string) {
@@ -270,8 +274,8 @@ export default function GitView() {
                 onChange={(e) => setMessage(e.currentTarget.value)}
                 onKeyDown={(e) => e.key === "Enter" && message.trim() && commit()}
               />
-              <Button onClick={() => void commit()} disabled={!message.trim()}>
-                Commit
+              <Button disabled={!message.trim() || committing}>
+                {committing ? "Committing…" : "Commit"}
               </Button>
             </div>
           </>
