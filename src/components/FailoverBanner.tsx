@@ -1,12 +1,9 @@
-import { useEffect, useState } from "react";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   AlertTriangleIcon,
   GlobeIcon,
   ShieldAlertIcon,
   SparklesIcon,
 } from "lucide-react";
-import { failoverReset, failoverStatus } from "../lib/bridge";
 import type {
   FailoverLocalEvent,
   FailoverStatus,
@@ -22,6 +19,13 @@ function fmtIdle(ms: number): string {
   return `${m}m ${sec.toString().padStart(2, "0")}s`;
 }
 
+interface FailoverBannerProps {
+  status: FailoverStatus | null;
+  localEvent: FailoverLocalEvent | null;
+  webEvent: FailoverWebEvent | null;
+  dismiss: (agent: "local" | "web") => void;
+}
+
 /**
  * Failover alerts promoted from the old panel into the global banner
  * stack: a stalled local agent or an interrupted session. Renders nothing
@@ -32,51 +36,25 @@ function fmtIdle(ms: number): string {
  * app surfaces the interruption and hands the user the built handoff
  * rather than pushing into a chat.
  */
-export default function FailoverBanner() {
-  const [status, setStatus] = useState<FailoverStatus | null>(null);
-  const [localEvent, setLocalEvent] = useState<FailoverLocalEvent | null>(null);
-  const [webEvent, setWebEvent] = useState<FailoverWebEvent | null>(null);
+export default function FailoverBanner({
+  status,
+  localEvent,
+  webEvent,
+  dismiss,
+}: FailoverBannerProps) {
+  const local = status?.local ?? "inactive";
 
-  useEffect(() => {
-    let unlistens: UnlistenFn[] = [];
-    void (async () => {
-      try {
-        setStatus(await failoverStatus());
-      } catch {
-        /* not ready */
-      }
-      unlistens = [
-        await listen<FailoverStatus>("failover://status", (e) =>
-          setStatus(e.payload),
-        ),
-        await listen<FailoverLocalEvent>("failover://local", (e) =>
-          setLocalEvent(e.payload),
-        ),
-        await listen<FailoverWebEvent>("failover://web", (e) =>
-          setWebEvent(e.payload),
-        ),
-      ];
-    })();
-    return () => {
-      for (const u of unlistens) u();
-    };
-  }, []);
+  const localStalled = local === "stalled" && !localEvent;
+  const localError = localEvent && !localEvent.ok;
+  const localDelivered = !!localEvent?.ok;
 
-  function dismiss(agent: "local" | "web") {
-    void failoverReset(agent).then(() => {
-      if (agent === "local") setLocalEvent(null);
-      else setWebEvent(null);
-    });
+  if (!localStalled && !localError && !localDelivered && !webEvent) {
+    return null;
   }
 
-  const local = status?.local ?? "inactive";
-  const empty =
-    !(local === "stalled" && !localEvent) && !localEvent?.ok && !webEvent;
-  if (empty) return null;
-
   return (
-    <div className="flex shrink-0 flex-col gap-0.5 border-b border-border/60 bg-surface-2/60 px-4 py-2 text-xs">
-      {local === "stalled" && !localEvent && (
+    <div className="flex shrink-0 flex-col gap-0.5 border-b border-border/60 bg-surface-2/60 px-4 py-2 text-xs anim-fade-down">
+      {localStalled && (
         <div className="flex items-center gap-2">
           <AlertTriangleIcon className="size-4 shrink-0 text-warning" />
           <p className="min-w-0 flex-1 text-muted-foreground">
@@ -89,7 +67,24 @@ export default function FailoverBanner() {
         </div>
       )}
 
-      {localEvent?.ok && (
+      {localError && (
+        <div className="flex items-center gap-2">
+          <ShieldAlertIcon className="size-4 shrink-0 text-danger" />
+          <p className="min-w-0 flex-1 font-medium text-danger">
+            Could not build a handoff for the interrupted local session
+            {localEvent.error && (
+              <span className="ml-2 font-normal text-muted-foreground">
+                {localEvent.error}
+              </span>
+            )}
+          </p>
+          <Button variant="ghost" size="sm" onClick={() => dismiss("local")}>
+            Dismiss
+          </Button>
+        </div>
+      )}
+
+      {localDelivered && (
         <div className="flex items-center gap-2">
           {localEvent.delivered ? (
             <SparklesIcon className="size-4 shrink-0 text-success" />

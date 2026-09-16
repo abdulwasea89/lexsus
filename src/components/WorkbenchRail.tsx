@@ -14,17 +14,52 @@ import {
 import { toggleTheme, useTheme } from "../hooks/useTheme";
 import type { McpStatus } from "../lib/types";
 import { cn } from "../lib/utils";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "./ui/tooltip";
 
 export type View = "trace" | "git" | "handoff" | "memory" | "bridge";
 
 const RAIL_KEY = "lexsus.railOpen";
 
-const NAV: { view: View; label: string; icon: typeof ActivityIcon }[] = [
-  { view: "trace", label: "Live activity trace", icon: ActivityIcon },
-  { view: "git", label: "Git", icon: GitBranchIcon },
-  { view: "handoff", label: "Handoff", icon: MessageCircleIcon },
-  { view: "memory", label: "Project memory", icon: BrainIcon },
-  { view: "bridge", label: "Web-AI connector", icon: GlobeIcon },
+const NAV: {
+  view: View;
+  label: string;
+  hint: string;
+  icon: typeof ActivityIcon;
+}[] = [
+  {
+    view: "trace",
+    label: "Live activity trace",
+    hint: "Watch every read, edit and command the web AI performs.",
+    icon: ActivityIcon,
+  },
+  {
+    view: "git",
+    label: "Git",
+    hint: "Review changes, switch branches and commit from here.",
+    icon: GitBranchIcon,
+  },
+  {
+    view: "handoff",
+    label: "Handoff",
+    hint: "Package your progress to continue in another AI.",
+    icon: MessageCircleIcon,
+  },
+  {
+    view: "memory",
+    label: "Project memory",
+    hint: "Facts saved from past sessions: decisions and dead ends.",
+    icon: BrainIcon,
+  },
+  {
+    view: "bridge",
+    label: "Web-AI connector",
+    hint: "The endpoint your web AI connects to, plus tool diagnostics.",
+    icon: GlobeIcon,
+  },
 ];
 
 interface WorkbenchRailProps {
@@ -76,31 +111,32 @@ export default function WorkbenchRail({
   const pill = "absolute inset-y-0 left-2 right-2 rounded-lg";
 
   const rowBase =
-    "relative flex h-9 w-full items-center justify-start px-0 outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/50";
+    "relative flex h-9 w-full items-center justify-start px-0 outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/50 [&_svg]:transition-transform [&_svg]:duration-200 [&_svg]:ease-[cubic-bezier(0.22,1,0.36,1)]";
 
   function renderRow({
-    key,
+    id,
     label,
+    hint,
     icon: Icon,
     active = false,
     onClick,
   }: {
-    key: string;
+    id: string;
     label: string;
+    hint: string;
     icon: typeof ActivityIcon;
     active?: boolean;
     onClick: () => void;
   }) {
-    return (
+    const button = (
       <button
-        key={key}
         type="button"
         aria-label={label}
         aria-current={active ? "page" : undefined}
         onClick={onClick}
         className={cn(
           rowBase,
-          "group text-muted-foreground hover:text-foreground",
+          "group text-muted-foreground hover:text-foreground group-hover:[&_svg]:scale-110",
           active && "text-foreground",
         )}
       >
@@ -108,6 +144,7 @@ export default function WorkbenchRail({
           aria-hidden
           className={cn(
             pill,
+            "transition-colors",
             active ? "bg-muted" : "bg-transparent group-hover:bg-muted/60",
           )}
         />
@@ -118,6 +155,20 @@ export default function WorkbenchRail({
           <span className={revealInner}>{label}</span>
         </span>
       </button>
+    );
+
+    return (
+      <Tooltip key={id} disabled={open}>
+        <TooltipTrigger delay={200} render={button} />
+        <TooltipContent
+          side="right"
+          sideOffset={10}
+          className="max-w-60 flex-col items-start gap-0.5"
+        >
+          <span className="font-medium">{label}</span>
+          <span className="text-background/70">{hint}</span>
+        </TooltipContent>
+      </Tooltip>
     );
   }
 
@@ -152,10 +203,11 @@ export default function WorkbenchRail({
       </button>
 
       <div className="flex flex-col gap-0.5">
-        {NAV.map(({ view: v, label, icon }) =>
+        {NAV.map(({ view: v, label, hint, icon }) =>
           renderRow({
-            key: v,
+            id: v,
             label,
+            hint,
             icon,
             active: view === v,
             onClick: () => onViewChange(v),
@@ -166,50 +218,102 @@ export default function WorkbenchRail({
       <div className="grow" />
 
       <div className="flex flex-col gap-0.5">
+        <Tooltip disabled={open}>
+          <TooltipTrigger delay={200} render={
+            <button
+              type="button"
+              aria-label={open ? "Collapse sidebar" : "Expand sidebar"}
+              aria-expanded={open}
+              onClick={() => setOpen((o) => !o)}
+              className={cn(
+                rowBase,
+                "group mb-2 text-muted-foreground hover:text-foreground",
+              )}
+            />
+          }>
+          </TooltipTrigger>
+          <TooltipContent
+            side="right"
+            sideOffset={10}
+            className="max-w-40 flex-col items-start gap-0.5"
+          >
+            <span className="font-medium">
+              {open ? "Collapse sidebar" : "Expand sidebar"}
+            </span>
+            <span className="text-background/70">
+              {open
+                ? "Hide the navigation labels."
+                : "Show the navigation labels and hints."}
+            </span>
+          </TooltipContent>
+        </Tooltip>
+
         {renderRow({
-          key: "theme",
+          id: "theme",
           label: theme === "dark" ? "Dark theme" : "Light theme",
+          hint: theme === "dark"
+            ? "Switch to the light paper theme."
+            : "Switch to the dark terminal theme.",
           icon: theme === "dark" ? MoonIcon : SunIcon,
           onClick: toggleTheme,
         })}
 
         {renderRow({
-          key: "project",
+          id: "project",
           label: "Project & connector",
+          hint: "Pick a folder and set the web-AI endpoint.",
           icon: FolderOpenIcon,
           onClick: onOpenProject,
         })}
 
-        <span
-          aria-label={
-            connector?.listening
-              ? "MCP connector listening"
-              : "MCP connector offline"
-          }
-          className="relative flex h-9 w-full items-center text-xs text-muted-foreground"
-        >
-          <span className={iconSlot}>
+        <Tooltip>
+          <TooltipTrigger delay={200} render={
             <span
-              className={cn(
-                "size-2 rounded-full",
+              aria-label={
                 connector?.listening
-                  ? connector.allow_write
-                    ? "bg-warning"
-                    : "bg-success"
-                  : "bg-muted-foreground/40",
-              )}
-            />
-          </span>
-          <span className={cn(reveal, "relative z-10 font-normal")}>
-            <span className={revealInner}>
+                  ? "MCP connector listening"
+                  : "MCP connector offline"
+              }
+              className="relative flex h-9 w-full items-center text-xs text-muted-foreground"
+            >
+              <span className={iconSlot}>
+                <span
+                  className={cn(
+                    "size-2 rounded-full",
+                    connector?.listening
+                      ? connector.allow_write
+                        ? "bg-warning anim-pulse"
+                        : "bg-success anim-pulse"
+                      : "bg-muted-foreground/40",
+                  )}
+                />
+              </span>
+              <span className={cn(reveal, "relative z-10 font-normal")}>
+                <span className={revealInner}>
+                  {connector?.listening
+                    ? connector.allow_write
+                      ? "Connector · read/write"
+                      : "Connector · read-only"
+                    : "Connector offline"}
+                </span>
+              </span>
+            </span>
+          } />
+          <TooltipContent
+            side="right"
+            sideOffset={10}
+            className="max-w-52 flex-col items-start gap-0.5"
+          >
+            <span className="font-medium">Connector status</span>
+            <span className="text-background/70">
               {connector?.listening
                 ? connector.allow_write
-                  ? "Connector · read/write"
-                  : "Connector · read-only"
-                : "Connector offline"}
+                  ? "Listening · writes are allowed."
+                  : "Listening · reads only until enabled."
+                : "The connector is not running locally."}
             </span>
-          </span>
-        </span>
+          </TooltipContent>
+        </Tooltip>
       </div>
     </nav>
   );

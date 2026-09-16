@@ -67,9 +67,9 @@ export default function BridgeView() {
         <Collapsible className="flex flex-col gap-2" defaultOpen>
           <CollapsibleTrigger className={sectionClass}>
             MCP connector
-            <ChevronDownIcon className="size-4" />
+            <ChevronDownIcon className="size-4 transition-transform data-[state=open]:rotate-180" />
           </CollapsibleTrigger>
-          <CollapsibleContent>
+          <CollapsibleContent className="data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=closed]:fade-out-0">
             <div className="flex flex-col gap-3 rounded-lg border border-border/60 bg-surface-2/50 p-3">
               <div className="flex items-center justify-between gap-3">
                 <span className="shrink-0 text-[11px] text-muted-foreground">
@@ -136,9 +136,9 @@ export default function BridgeView() {
         <Collapsible className="flex flex-col gap-2">
           <CollapsibleTrigger className={sectionClass}>
             Tool sandbox (test read / write / run locally)
-            <ChevronDownIcon className="size-4" />
+            <ChevronDownIcon className="size-4 transition-transform data-[state=open]:rotate-180" />
           </CollapsibleTrigger>
-          <CollapsibleContent>
+          <CollapsibleContent className="data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=closed]:fade-out-0">
             <div className="flex min-h-0 flex-col gap-3 rounded-lg border border-border/60 bg-surface-2/50 p-3">
               <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:gap-3">
                 <Label className="shrink-0 text-[11px] text-muted-foreground sm:w-28 sm:pb-2">
@@ -236,9 +236,9 @@ export default function BridgeView() {
         <Collapsible className="flex flex-col gap-2">
           <CollapsibleTrigger className={sectionClass}>
             Audit trail (last {audit.length})
-            <ChevronDownIcon className="size-4" />
+            <ChevronDownIcon className="size-4 transition-transform data-[state=open]:rotate-180" />
           </CollapsibleTrigger>
-          <CollapsibleContent>
+          <CollapsibleContent className="data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=closed]:fade-out-0">
             <ScrollArea className="h-40 min-h-0 rounded-lg border border-border/60 bg-surface-2/50 p-3">
               {audit.length === 0 ? (
                 <p className="text-xs text-muted-foreground">

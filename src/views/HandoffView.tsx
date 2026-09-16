@@ -28,6 +28,7 @@ export default function HandoffView() {
   const [objective, setObj] = useState("");
   const [status, setStatus] = useState("");
   const [built, setBuilt] = useState(false);
+  const [copied, setCopied] = useState(false);
 
   async function build() {
     const h = await buildHandoff();
@@ -39,12 +40,11 @@ export default function HandoffView() {
   async function continueWith() {
     if (!handoff) return;
     await setObjective(objective).catch(() => {});
-    // Rebuild from *current* state (the edited objective, refreshed trace):
-    // the `handoff` snapshot is stale by the time the user edits the
-    // objective and clicks.
     const fresh = await buildHandoff();
     await navigator.clipboard.writeText(handoffText(fresh)).catch(() => {});
     setStatus("handoff copied — paste it as the opening message");
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
     toast.add({
       title: "Handoff copied",
       description: "Paste it into the web AI's chat to continue.",
@@ -99,16 +99,19 @@ export default function HandoffView() {
             onClick={() =>
               void navigator.clipboard
                 .writeText(handoffText(handoff))
-                .then(() =>
+                .then(() => {
+                  setCopied(true);
+                  setTimeout(() => setCopied(false), 1500);
                   toast.add({
                     title: "Copied",
                     description: "handoff text is on your clipboard",
                     type: "success",
-                  }),
-                )
+                  });
+                })
             }
           >
-            <ClipboardIcon /> Copy
+            {copied ? "Copied ✓" : <ClipboardIcon />}
+            {copied ? "" : " Copy"}
           </Button>
         )
       }

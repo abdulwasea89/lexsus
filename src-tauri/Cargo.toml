@@ -27,6 +27,18 @@ portable-pty = "0.8"
 notify = "6"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# `walkdir` was added alongside an independent search implementation; the
+# tool engine here uses `regex`/`glob` (declared below). Kept so the
+# dependency set stays a superset of main's.
+walkdir = "2.5"
+
+# Local WebSocket server for the browser extension (M2) — loopback only,
+# plain ws:// on 127.0.0.1, no TLS needed. Not wired into the build; kept
+# because it exists on main.
+tungstenite = "0.24"
+# Pairing codes come from the OS CSPRNG (clock-derived codes were guessable).
+getrandom = "0.2"
+
 # The tool engine's single remote transport: rmcp serves a Streamable-HTTP MCP
 # endpoint over loopback (axum drives its tower Service). Every call funnels
 # through the same bridge policy engine — approvals, sensitive paths,

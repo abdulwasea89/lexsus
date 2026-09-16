@@ -34,7 +34,7 @@ export default function ApprovalBanner({
   if (approvals.length === 0) return null;
 
   return (
-    <div className="flex shrink-0 flex-col gap-1.5 border-b border-warning/30 bg-warning/10 px-4 py-2.5">
+    <div className="flex shrink-0 flex-col gap-1.5 border-b border-warning/30 bg-warning/10 px-4 py-2.5 anim-fade-down">
       {approvals.map((a) => {
         const grant = a.grantable;
         const wantsGrant = grantWanted[a.id] ?? false;

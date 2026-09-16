@@ -1,5 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { useRef, useState, type ReactNode } from "react";
 import { Chip } from "@heroui/react";
 import {
   ActivityIcon,
@@ -12,8 +11,10 @@ import {
   SquarePenIcon,
 } from "lucide-react";
 import type { FsEvent, TraceStep } from "../lib/types";
+import { useTauriEvent } from "../hooks/useTauriEvent";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
+import { cn } from "../lib/utils";
 import { ViewShell } from "./ViewShell";
 
 interface TraceItem extends TraceStep {
@@ -38,79 +39,42 @@ export default function TraceView() {
   const [collapsed, setCollapsed] = useState(true);
   const idRef = useRef(0);
 
-  useEffect(() => {
-    // `listen` registers asynchronously, and this view mounts/unmounts on tab
-    // switch (and is double-mounted by StrictMode in dev). If it unmounts
-    // before all three registrations resolve, the cleanup runs with an empty
-    // array and the late-arriving listeners are never removed — a leak that
-    // keeps firing setState on every visit. Register incrementally and, the
-    // moment the effect is disposed, drop anything that lands after cleanup.
-    let disposed = false;
-    const unlistens: UnlistenFn[] = [];
-    const flush = () => {
-      for (const u of unlistens) u();
-      unlistens.length = 0;
-    };
-    void (async () => {
-      unlistens.push(
-        await listen<TraceStep>("trace://step", (e) => {
-          if (disposed) return;
-          const step = e.payload;
-          setItems((prev) => [
-            ...prev,
-            {
-              ...step,
-              id: ++idRef.current,
-              confirmed: step.kind === "editing" ? false : step.confirmed,
-            },
-          ]);
-        }),
-      );
-      if (disposed) {
-        flush();
-        return;
-      }
-      unlistens.push(
-        await listen<{ path: string }>("trace://confirm", (e) => {
-          if (disposed) return;
-          setItems((prev) =>
-            prev.map((it) =>
-              it.kind === "editing" && it.file === e.payload.path
-                ? { ...it, confirmed: true }
-                : it,
-            ),
-          );
-        }),
-      );
-      if (disposed) {
-        flush();
-        return;
-      }
-      unlistens.push(
-        await listen<FsEvent>("fs://event", () => {
-          if (disposed) return;
-          setItems((prev) => [
-            ...prev,
-            {
-              kind: "fs",
-              file: null,
-              command: null,
-              detail: null,
-              confirmed: false,
-              agent: "watcher",
-              ts: Date.now(),
-              id: ++idRef.current,
-            },
-          ]);
-        }),
-      );
-      if (disposed) flush();
-    })();
-    return () => {
-      disposed = true;
-      flush();
-    };
-  }, []);
+  useTauriEvent<TraceStep>("trace://step", (step) => {
+    setItems((prev) => [
+      ...prev,
+      {
+        ...step,
+        id: ++idRef.current,
+        confirmed: step.kind === "editing" ? false : step.confirmed,
+      },
+    ]);
+  });
+
+  useTauriEvent<{ path: string }>("trace://confirm", (payload) => {
+    setItems((prev) =>
+      prev.map((it) =>
+        it.kind === "editing" && it.file === payload.path
+          ? { ...it, confirmed: true }
+          : it,
+      ),
+    );
+  });
+
+  useTauriEvent<FsEvent>("fs://event", () => {
+    setItems((prev) => [
+      ...prev,
+      {
+        kind: "fs",
+        file: null,
+        command: null,
+        detail: null,
+        confirmed: false,
+        agent: "watcher",
+        ts: Date.now(),
+        id: ++idRef.current,
+      },
+    ]);
+  });
 
   // Keep the list bounded (last 500).
   const visible = items.slice(-500);
@@ -120,7 +84,7 @@ export default function TraceView() {
     earlier.filter((e) => e.kind === "editing").map((e) => e.file),
   ).size;
 
-  function renderItem(it: TraceItem) {
+  function renderItem(it: TraceItem, i: number) {
     const icon = ICONS[it.kind] ?? <CircleIcon />;
     const label =
       it.kind === "fs"
@@ -131,7 +95,10 @@ export default function TraceView() {
     return (
       <li
         key={it.id}
-        className="flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-muted/40"
+        className={cn(
+          "flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-muted/40 anim-fade-up",
+        )}
+        style={{ animationDelay: `${i * 30}ms` }}
       >
         <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground [&_svg]:size-3.5">
           {icon}
@@ -139,11 +106,16 @@ export default function TraceView() {
         <span className="min-w-0 flex-1 truncate text-xs">{label}</span>
         {it.kind === "editing" &&
           (it.confirmed ? (
-            <Badge className="border-success/30 bg-success/10 text-success">
+            <Badge
+              className="border-success/30 bg-success/10 text-success transition-colors duration-200"
+            >
               <CheckIcon /> saved
             </Badge>
           ) : (
-            <Badge variant="outline" className="text-warning">
+            <Badge
+              variant="outline"
+              className="text-warning transition-colors duration-200"
+            >
               waiting
             </Badge>
           ))}
@@ -195,7 +167,7 @@ export default function TraceView() {
               </Button>
             </li>
           )}
-          {expanded.map(renderItem)}
+          {expanded.map((it, i) => renderItem(it, i))}
           {!collapsed && (
             <li>
               <Button

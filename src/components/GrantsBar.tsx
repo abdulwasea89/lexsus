@@ -24,7 +24,7 @@ export default function GrantsBar({ grantState }: GrantsBarProps) {
   if (grants.length === 0 && !paused) return null;
 
   return (
-    <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border bg-muted/40 px-4 py-1.5 text-xs">
+    <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-border bg-muted/40 px-4 py-1.5 text-xs anim-fade-down">
       {paused ? (
         <span className="flex items-center gap-1.5 font-semibold text-danger">
           <OctagonPauseIcon className="size-3.5" />

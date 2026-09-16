@@ -1,16 +1,15 @@
-import { useEffect, useState } from "react";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { useState } from "react";
 import {
   FolderIcon,
   RadioIcon,
   SquareTerminalIcon,
 } from "lucide-react";
-import { failoverStatus } from "../lib/bridge";
 import type {
   FailoverStatus,
   McpStatus,
   TerminalRunEvent,
 } from "../lib/types";
+import { useTauriEvent } from "../hooks/useTauriEvent";
 import { cn } from "../lib/utils";
 
 function stateColor(state: string): string {
@@ -29,6 +28,8 @@ function stateColor(state: string): string {
 interface StatusbarProps {
   projectRoot: string;
   connector: McpStatus | null;
+  /** Failover state, owned by `useFailover` and shared with FailoverBanner. */
+  status: FailoverStatus | null;
 }
 
 /**
@@ -36,28 +37,17 @@ interface StatusbarProps {
  * connector endpoint and the live terminal indicator — the app's quiet
  * heartbeat.
  */
-export default function Statusbar({ projectRoot, connector }: StatusbarProps) {
-  const [status, setStatus] = useState<FailoverStatus | null>(null);
+export default function Statusbar({
+  projectRoot,
+  connector,
+  status,
+}: StatusbarProps) {
   const [running, setRunning] = useState(false);
 
-  useEffect(() => {
-    let unlistens: UnlistenFn[] = [];
-    void (async () => {
-      setStatus(await failoverStatus().catch(() => null));
-      unlistens = [
-        await listen<FailoverStatus>("failover://status", (e) =>
-          setStatus(e.payload),
-        ),
-        await listen<TerminalRunEvent>("terminal://run", (e) => {
-          if (e.payload.kind === "start") setRunning(true);
-          else if (e.payload.kind === "exit") setRunning(false);
-        }),
-      ];
-    })();
-    return () => {
-      for (const u of unlistens) u();
-    };
-  }, []);
+  useTauriEvent<TerminalRunEvent>("terminal://run", (payload) => {
+    if (payload.kind === "start") setRunning(true);
+    else if (payload.kind === "exit") setRunning(false);
+  });
 
   const local = status?.local ?? "inactive";
   const web = status?.web ?? "inactive";

@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from "react";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { useEffect, useState } from "react";
 import { bridgeApprove, bridgeGrantState } from "../lib/bridge";
 import type { ApprovalRequested, GrantState } from "../lib/types";
+import { toast } from "../components/ui/toast";
+import { useTauriEvent } from "./useTauriEvent";
 
 export interface Approval extends ApprovalRequested {
   resolving?: boolean;
@@ -24,43 +25,46 @@ export function useApprovals() {
     grants: [],
     paused: false,
   });
-  const mounted = useRef(false);
 
   useEffect(() => {
-    mounted.current = true;
-    let unlistens: UnlistenFn[] = [];
-    void (async () => {
-      setGrantState(await bridgeGrantState().catch(() => ({ grants: [], paused: false })));
-      unlistens = [
-        await listen<ApprovalRequested>("bridge://approval-requested", (e) => {
-          if (!mounted.current) return;
-          setApprovals((prev) => [
-            { ...e.payload, id: e.payload.id },
-            ...prev.filter((p) => p.id !== e.payload.id),
-          ]);
-        }),
-        await listen<{ id: number }>("bridge://approval-resolved", (e) => {
-          if (!mounted.current) return;
-          setApprovals((prev) => prev.filter((p) => p.id !== e.payload.id));
-        }),
-        await listen<GrantState>("bridge://grants-changed", (e) => {
-          if (!mounted.current) return;
-          setGrantState(e.payload);
-        }),
-      ];
-    })();
-    return () => {
-      mounted.current = false;
-      for (const u of unlistens) u();
-    };
+    void bridgeGrantState()
+      .then(setGrantState)
+      .catch(() => setGrantState({ grants: [], paused: false }));
   }, []);
+
+  useTauriEvent<ApprovalRequested>("bridge://approval-requested", (payload) => {
+    setApprovals((prev) => [
+      { ...payload, id: payload.id },
+      ...prev.filter((p) => p.id !== payload.id),
+    ]);
+  });
+
+  useTauriEvent<{ id: number }>("bridge://approval-resolved", (payload) => {
+    setApprovals((prev) => prev.filter((p) => p.id !== payload.id));
+  });
+
+  useTauriEvent<GrantState>("bridge://grants-changed", setGrantState);
 
   async function decide(id: number, allow: boolean, grant?: GrantChoice) {
     setApprovals((prev) =>
       prev.map((p) => (p.id === id ? { ...p, resolving: true } : p)),
     );
-    await bridgeApprove(id, allow, grant).catch(() => {});
-    setApprovals((prev) => prev.filter((p) => p.id !== id));
+    try {
+      await bridgeApprove(id, allow, grant);
+      // Only clear the card once the core confirms the decision landed.
+      setApprovals((prev) => prev.filter((p) => p.id !== id));
+    } catch (e) {
+      // A failed decision must stay actionable: re-enable it and say so,
+      // rather than silently dropping a still-pending request.
+      setApprovals((prev) =>
+        prev.map((p) => (p.id === id ? { ...p, resolving: false } : p)),
+      );
+      toast.add({
+        title: allow ? "Approval failed" : "Denial failed",
+        description: String(e),
+        type: "error",
+      });
+    }
   }
 
   return { approvals, grantState, decide };

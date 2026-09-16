@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { CircleAlertIcon, SquareTerminalIcon } from "lucide-react";
+import { CircleAlertIcon } from "lucide-react";
 import {
   getProjectRoot,
   mcpStatus,
@@ -9,6 +9,7 @@ import {
 } from "./lib/bridge";
 import type { McpStatus } from "./lib/types";
 import ApprovalBanner from "./components/ApprovalBanner";
+import ErrorBoundary from "./components/ErrorBoundary";
 import GrantsBar from "./components/GrantsBar";
 import BridgeView from "./views/BridgeView";
 import FailoverBanner from "./components/FailoverBanner";
@@ -23,12 +24,22 @@ import TerminalPane from "./components/TerminalPane";
 import Titlebar from "./components/Titlebar";
 import WorkbenchRail, { type View } from "./components/WorkbenchRail";
 import { useApprovals } from "./hooks/useApprovals";
+import { useFailover } from "./hooks/useFailover";
 import { useQuestions } from "./hooks/useQuestions";
 import { Alert, AlertDescription, AlertTitle } from "./components/ui/alert";
+import GettingStarted from "./components/GettingStarted";
 
 const RECENTS_KEY = "lexsus.recentProjects";
 const VIEW_KEY = "lexsus.view";
 const VIEWS: View[] = ["trace", "git", "handoff", "memory", "bridge"];
+
+const VIEW_LABELS: Record<View, string> = {
+  trace: "Live activity trace",
+  git: "Git",
+  handoff: "Handoff",
+  memory: "Project memory",
+  bridge: "Web-AI connector",
+};
 
 function loadRecents(): string[] {
   try {
@@ -68,6 +79,9 @@ export default function App() {
   const [projectOpen, setProjectOpen] = useState(false);
   const { approvals, grantState, decide } = useApprovals();
   const { questions, answer } = useQuestions();
+  const { status, localEvent, webEvent, dismiss } = useFailover();
+  // Guards project switches: a slow switch must not clobber a newer one.
+  const switchToken = useRef(0);
 
   useEffect(() => {
     localStorage.setItem(VIEW_KEY, view);
@@ -102,15 +116,19 @@ export default function App() {
   }, []);
 
   async function applyProject(path: string) {
+    const token = ++switchToken.current;
     try {
       await setProjectRoot(path);
       await startWatch();
       // The connector's blast radius follows the bound workspace.
-      setMcp(await mcpStatus().catch(() => null));
+      const connector = await mcpStatus().catch(() => null);
+      if (token !== switchToken.current) return;
+      setMcp(connector);
       setError("");
       saveRecent(path);
       setRecents(loadRecents());
     } catch (e) {
+      if (token !== switchToken.current) return;
       setError(String(e));
     }
   }
@@ -152,10 +170,15 @@ export default function App() {
         <ApprovalBanner approvals={approvals} onDecide={decide} />
         <QuestionBanner questions={questions} onAnswer={answer} />
         <GrantsBar grantState={grantState} />
-        <FailoverBanner />
+        <FailoverBanner
+          status={status}
+          localEvent={localEvent}
+          webEvent={webEvent}
+          dismiss={dismiss}
+        />
 
         {error && (
-          <Alert variant="destructive" className="m-3 mb-0">
+          <Alert variant="destructive" className="m-3 mb-0 anim-pop">
             <CircleAlertIcon />
             <AlertTitle>Something went wrong</AlertTitle>
             <AlertDescription className="font-mono text-xs">
@@ -170,48 +193,38 @@ export default function App() {
           </div>
         ) : (
           <div className="flex min-h-0 flex-1 flex-col gap-3 p-3 lg:flex-row">
-            <div className="flex h-[50vh] min-h-0 shrink-0 flex-col lg:h-auto lg:w-[55%] lg:shrink">
+            <div className="flex h-[50vh] min-h-0 shrink-0 flex-col lg:h-auto lg:w-[55%] lg:shrink anim-fade-up">
               {projectRoot ? (
                 <TerminalPane />
               ) : (
-                <section className="flex h-full min-h-0 flex-col overflow-hidden rounded-lg border border-border bg-surface">
-                  <header className="flex shrink-0 items-center gap-2 border-b border-border px-4 py-2.5">
-                    <SquareTerminalIcon className="size-4 shrink-0 text-muted-foreground" />
-                    <h2 className="text-sm font-semibold">Terminal</h2>
-                    <span className="ml-auto text-xs text-muted-foreground">
-                      locked
-                    </span>
-                  </header>
-                  <div className="flex flex-1 flex-col items-center justify-center gap-2 p-8 text-center">
-                    <SquareTerminalIcon className="size-8 text-muted-foreground/50" />
-                    <p className="text-sm font-medium">Terminal locked</p>
-                    <p className="max-w-64 text-xs leading-relaxed text-muted-foreground">
-                      Pick a project folder to watch the web AI run commands
-                      here.
-                    </p>
-                    <button
-                      type="button"
-                      onClick={() => setProjectOpen(true)}
-                      className="text-xs text-primary underline-offset-4 hover:underline"
-                    >
-                      Choose a folder →
-                    </button>
-                  </div>
-                </section>
+                <GettingStarted onOpenProject={() => setProjectOpen(true)} />
               )}
             </div>
 
             <div className="flex min-h-0 flex-1 flex-col">
-              {view === "trace" && <TraceView />}
-              {view === "git" && <GitView />}
-              {view === "handoff" && <HandoffView />}
-              {view === "memory" && <MemoryView />}
-              {view === "bridge" && <BridgeView />}
+              {/* The trace stays mounted while you're on another tab, so its
+                  event stream and history survive — and no steps are dropped
+                  in the meantime. */}
+              <ErrorBoundary label={VIEW_LABELS.trace}>
+                <div className={view === "trace" ? "h-full" : "hidden"}>
+                  <TraceView />
+                </div>
+              </ErrorBoundary>
+              {view !== "trace" && (
+                <ErrorBoundary key={view} label={VIEW_LABELS[view]}>
+                  <div className="h-full anim-fade-up">
+                    {view === "git" && <GitView />}
+                    {view === "handoff" && <HandoffView />}
+                    {view === "memory" && <MemoryView />}
+                    {view === "bridge" && <BridgeView />}
+                  </div>
+                </ErrorBoundary>
+              )}
             </div>
           </div>
         )}
 
-        <Statusbar projectRoot={projectRoot} connector={mcp} />
+        <Statusbar projectRoot={projectRoot} connector={mcp} status={status} />
       </main>
 
       <ProjectDialog
