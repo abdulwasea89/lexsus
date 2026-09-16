@@ -577,5 +577,8 @@ pub fn worktree_dirty(repo: &git2::Repository, name: &str) -> Result<bool, git2:
     // Unlike `dirty_paths`, untracked files count: a worktree whose only
     // content is a new file is not "clean" in the sense that matters here.
     status_opts.include_untracked(true).include_ignored(false);
-    Ok(!wt_repo.statuses(Some(&mut status_opts))?.is_empty())
+    // Bound before the `Ok(...)` so the borrow `statuses()` takes on the
+    // repository ends at this statement, not at the end of the function.
+    let dirty = !wt_repo.statuses(Some(&mut status_opts))?.is_empty();
+    Ok(dirty)
 }

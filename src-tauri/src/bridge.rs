@@ -3313,6 +3313,49 @@ pub fn detail(tool: &Tool) -> Option<String> {
         Tool::TodoRead | Tool::GetHandoff => None,
         Tool::DescribeTool { name } => Some(name.clone()),
         Tool::GitStatus | Tool::ListTools => None,
+        // Phase 7–10. The detail is the one fact that tells two calls apart in
+        // the trace: a URL, a query, a position, a cell.
+        Tool::WebFetch { url, .. } => Some(clip_chars(url, 80)),
+        Tool::WebSearch { query, .. } => Some(clip_chars(query, 80)),
+        Tool::NotebookRead { path } | Tool::ReadMedia { path } => Some(path.clone()),
+        Tool::PublishArtifact { path, .. } => Some(path.clone()),
+        Tool::NotebookEdit { path, cell_id, .. } => Some(format!("{path} [{cell_id}]")),
+        Tool::DelegateTask { task, .. } => Some(clip_chars(task, 60)),
+        Tool::LspDiagnostics { path, .. } => {
+            Some(path.clone().unwrap_or_else(|| "workspace".into()))
+        }
+        Tool::LspDefinition {
+            path,
+            line,
+            character,
+        }
+        | Tool::LspReferences {
+            path,
+            line,
+            character,
+            ..
+        } => Some(format!("{path}:{line}:{character}")),
+        Tool::LspSymbols { path, query } => Some(
+            query
+                .clone()
+                .or_else(|| path.clone())
+                .unwrap_or_else(|| "workspace".into()),
+        ),
+        Tool::AskUser { question, .. } => Some(clip_chars(question, 60)),
+        Tool::ProposePlan { plan, .. } => Some(clip_chars(plan, 60)),
+        Tool::Monitor { path, command_id, .. } => match (path, command_id) {
+            (Some(p), _) => Some(p.clone()),
+            (None, Some(id)) => Some(format!("command #{id}")),
+            (None, None) => None,
+        },
+        Tool::Notify { title, .. } => Some(clip_chars(title, 60)),
+        Tool::EnterWorktree { name } => {
+            Some(name.clone().unwrap_or_else(|| "new worktree".into()))
+        }
+        Tool::ExitWorktree { action } => {
+            Some(action.clone().unwrap_or_else(|| "keep".into()))
+        }
+        Tool::ReportFindings { findings, .. } => Some(format!("{} finding(s)", findings.len())),
     }
 }
 
