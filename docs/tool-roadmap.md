@@ -3,14 +3,20 @@
 > The tool surface the web AI sees, phase by phase: what is **built**, what is
 > **planned**, and the invariants every new tool must uphold.
 >
-> Status date: 2026-09-10. **15 of 58 built.** Phase 1's *round trip* was
+> Status date: 2026-09-15. **58 of 58 built.** Phase 1's *round trip* was
 > reworked on 2026-09-10 (text + `structuredContent`, per-tool `outputSchema`,
 > typed error codes, paging by offset) — the tools and their arguments are
 > unchanged; what crosses the connector boundary is not. See invariant 9.
 >
-> **Completed:** Phase 0 ✅, Phase 1 ✅. **Not started:** Phases 2, 3, 5, 7, 8, 9, 10.
-> **Partial:** Phase 4 (0 tools shipped, 6 of 10 have built backing) and
-> Phase 6 (session-grants slice landed; persisted policy/config/expiry remain).
+> **Completed:** Phases 0 ✅, 1 ✅, 2 ✅, 3 ✅, 4 ✅, 5 ✅, 7 ✅, 8 ✅, 9 ✅, 10 ✅.
+> **Partial:** Phase 6 (session grants **and** the read-only gate landed;
+> persisted grant policies, per-tool configuration and grant expiry remain).
+>
+> Three tools are registered and honest about what they need: `web_fetch` and
+> `web_search` reach the network, the four `lsp_*` tools are best-effort and
+> degrade to `LSP_UNAVAILABLE` when no server is installed, and `delegate_task`
+> returns `AGENT_NOT_AVAILABLE` in this build because there is no sub-agent
+> runtime for it to hand work to. Everything else runs against local state.
 
 This is the capability roadmap for the coding-agent bridge. It is deliberately
 separate from `full-plan.md` §13, whose "Phase 0"–"Phase 7" describe the
@@ -92,15 +98,15 @@ grant made for a connector session never covers a desktop call.
 | — | original MVP tools | 5 | — | 5 | ✅ done |
 | 0 | registry + progressive disclosure | 5 | 2 | 7 | ✅ done |
 | 1 | files & editing | 8 (+1 early) | 8 | 15 | ✅ done |
-| 2 | search | 0 | 2 | 17 | ⏳ not started |
-| 3 | git | 0 | 10 | 27 | ⏳ not started |
-| 4 | project memory | 0 | 10 | 37 | 🔶 partial |
-| 5 | background commands | 0 | 3 | 40 | ⏳ not started |
+| 2 | search | 15 | 2 | 17 | ✅ done |
+| 3 | git | 17 | 10 | 27 | ✅ done |
+| 4 | project memory | 27 | 10 | 37 | ✅ done |
+| 5 | background commands | 37 | 3 | 40 | ✅ done |
 | 6 | approval policy engine | — | 0 | 40 | 🔶 partial |
-| 7 | web & long tail | 0 | 5 | 45 | ⏳ not started |
-| 8 | **code intelligence (LSP)** | 0 | 4 | 49 | ⏳ not started |
-| 9 | **the agent loop** | 0 | 4 | 53 | ⏳ not started |
-| 10 | **isolation & delivery** | 0 | 5 | 58 | ⏳ not started |
+| 7 | web & long tail | 40 | 5 | 45 | ✅ done |
+| 8 | **code intelligence (LSP)** | 45 | 4 | 49 | ✅ done |
+| 9 | **the agent loop** | 49 | 4 | 53 | ✅ done |
+| 10 | **isolation & delivery** | 53 | 5 | 58 | ✅ done |
 
 Of the 43 not yet built, **~18 are wiring over code that already exists** — all
 of Phase 3 (git.rs has every function), 6 of 10 in Phase 4 (the SQLite tables and

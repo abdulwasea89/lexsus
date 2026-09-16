@@ -35,6 +35,16 @@ rmcp = { version = "3.2", features = ["transport-streamable-http-server"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync"] }
 tokio-util = "0.7"
+regex = "1.13.1"
+glob = "0.3.4"
+# `web_fetch`. rustls rather than native-tls so the TLS stack is written in
+# Rust and does not depend on the system OpenSSL's version agreeing with us;
+# webpki-roots bundles the roots rather than reading a system store that may
+# not exist on a minimal install. `charset` is deliberately *not* enabled:
+# the body is decoded as UTF-8 and anything else says so rather than guessing.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-webpki-roots",
+] }
 # Signal the process *group* when cancelling a running command (unix only).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

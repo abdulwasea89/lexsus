@@ -179,21 +179,46 @@ thread_local! {
     /// The request id whose tool call is executing on *this* thread, if any.
     /// Set around execution so the PTY spawned deep inside `bridge::execute`
     /// can be attributed to the request without threading the id through every
-    /// layer. No caller supplies a non-`None` id today, so in practice this is
-    /// always unset.
+    /// layer — which is what makes `cancel_request` able to find a running
+    /// `run_command`, since `ProcessRegistry::by_owner` is keyed on it.
     static EXECUTION_OWNER: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-/// Attribute everything spawned on this thread to `owner` (a request id).
-/// Set before executing a tool call and cleared after; callers with no id
-/// leave it unset.
-pub fn set_execution_owner(owner: Option<String>) {
+fn set_execution_owner(owner: Option<String>) {
     EXECUTION_OWNER.with(|o| *o.borrow_mut() = owner);
 }
 
 /// The request id that owns whatever this thread is about to spawn.
 pub fn execution_owner() -> Option<String> {
     EXECUTION_OWNER.with(|o| o.borrow().clone())
+}
+
+/// Attribute everything spawned on this thread to `owner` (a request id) until
+/// the guard drops.
+///
+/// A guard rather than a set/clear pair, because the clear has to happen on
+/// *every* way out — and the region between the two is a whole tool call, with
+/// early returns and the possibility of a panic in it. A missed clear would
+/// leave the next call on this thread wearing the previous call's name, which
+/// is worse than no name at all: `cancel_request` would kill the wrong
+/// process. Restoration, not clearing, so the guard nests.
+pub fn own_current_thread(owner: Option<String>) -> OwnerGuard {
+    // `RefCell::replace`, not `Option::replace` — the latter is an inherent
+    // method on the `Option` the borrow derefs to, and would silently swap the
+    // value in place while returning it, leaving the cell unchanged.
+    let previous = EXECUTION_OWNER.with(|o| o.replace(owner));
+    OwnerGuard { previous }
+}
+
+/// Restores the thread's previous execution owner on drop.
+pub struct OwnerGuard {
+    previous: Option<String>,
+}
+
+impl Drop for OwnerGuard {
+    fn drop(&mut self) {
+        set_execution_owner(self.previous.take());
+    }
 }
 
 // --- signal handling ---------------------------------------------------------
@@ -316,9 +341,25 @@ mod tests {
     #[test]
     fn execution_owner_roundtrip() {
         assert!(execution_owner().is_none());
-        set_execution_owner(Some("req_9".into()));
-        assert_eq!(execution_owner().as_deref(), Some("req_9"));
-        set_execution_owner(None);
+        {
+            let _owned = own_current_thread(Some("req_9".into()));
+            assert_eq!(execution_owner().as_deref(), Some("req_9"));
+        }
+        assert!(execution_owner().is_none());
+    }
+
+    /// A nested owner restores the outer one rather than clearing it: an
+    /// inner call that un-owned the outer call's work would leave the outer
+    /// call's processes reachable by nobody.
+    #[test]
+    fn owning_a_thread_restores_what_was_there_before() {
+        let outer = own_current_thread(Some("outer".into()));
+        {
+            let _inner = own_current_thread(Some("inner".into()));
+            assert_eq!(execution_owner().as_deref(), Some("inner"));
+        }
+        assert_eq!(execution_owner().as_deref(), Some("outer"));
+        drop(outer);
         assert!(execution_owner().is_none());
     }
 }

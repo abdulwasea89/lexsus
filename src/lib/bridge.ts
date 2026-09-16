@@ -98,6 +98,18 @@ export function bridgeApprove(
   return invoke("bridge_approve", { id, allow, grant: grant ?? null });
 }
 
+/**
+ * Answer an `ask_user` / `propose_plan` card. The asking MCP call is blocked
+ * on this; `option` is the chosen label (or null for free text).
+ */
+export function bridgeAnswerQuestion(
+  id: number,
+  option: string | null,
+  answer: string,
+): Promise<void> {
+  return invoke("bridge_answer_question", { id, option, answer });
+}
+
 export function bridgeAudit(limit?: number): Promise<AuditEntry[]> {
   return invoke("bridge_audit", { limit });
 }

@@ -16,12 +16,14 @@ import GitView from "./views/GitView";
 import HandoffView from "./views/HandoffView";
 import MemoryView from "./views/MemoryView";
 import ProjectDialog from "./components/ProjectDialog";
+import QuestionBanner from "./components/QuestionBanner";
 import TraceView from "./views/TraceView";
 import Statusbar from "./components/Statusbar";
 import TerminalPane from "./components/TerminalPane";
 import Titlebar from "./components/Titlebar";
 import WorkbenchRail, { type View } from "./components/WorkbenchRail";
 import { useApprovals } from "./hooks/useApprovals";
+import { useQuestions } from "./hooks/useQuestions";
 import { Alert, AlertDescription, AlertTitle } from "./components/ui/alert";
 
 const RECENTS_KEY = "lexsus.recentProjects";
@@ -65,6 +67,7 @@ export default function App() {
   const [view, setView] = useState<View>(loadView);
   const [projectOpen, setProjectOpen] = useState(false);
   const { approvals, grantState, decide } = useApprovals();
+  const { questions, answer } = useQuestions();
 
   useEffect(() => {
     localStorage.setItem(VIEW_KEY, view);
@@ -147,6 +150,7 @@ export default function App() {
 
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <ApprovalBanner approvals={approvals} onDecide={decide} />
+        <QuestionBanner questions={questions} onAnswer={answer} />
         <GrantsBar grantState={grantState} />
         <FailoverBanner />
 

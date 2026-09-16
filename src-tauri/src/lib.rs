@@ -1,5 +1,7 @@
 pub mod archive;
 
+pub mod bgproc;
+
 pub mod bridge;
 
 pub mod db;
@@ -10,7 +12,13 @@ pub mod facts;
 
 pub mod git;
 
+pub mod lsp;
+
 pub mod mcp;
+
+pub mod media;
+
+pub mod notebook;
 
 pub mod pty;
 
@@ -22,11 +30,13 @@ pub mod transcript;
 
 pub mod watcher;
 
-use std::collections::VecDeque;
+pub mod web;
+
+use std::collections::{HashMap, VecDeque};
 
 use std::path::PathBuf;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use std::sync::{Arc, Mutex};
 
@@ -60,6 +70,74 @@ pub(crate) struct AppState {
     /// [`mcp::spawn_server`] once the listener is up, so the UI can tell
     /// "endpoint live" from "endpoint failed to bind".
     pub(crate) mcp_listening: Arc<AtomicBool>,
+    /// Commands started with `run_command_background` and not yet stopped.
+    ///
+    /// In state rather than in a global, unlike [`process::registry`], so a
+    /// command belongs to the app instance that started it: two instances
+    /// cannot see or stop each other's, and a test gets its own empty roster
+    /// instead of finding the previous test's strays in it.
+    pub(crate) bgproc: bgproc::Manager,
+    /// The worktree this session is currently working inside, if any.
+    ///
+    /// `enter_worktree` sets it and `exit_worktree` clears it; the bridge
+    /// substitutes it for `project_root` when resolving every path, so the
+    /// AI's edits land in the throwaway tree rather than the user's working
+    /// tree. In state rather than in a global so it dies with the app and a
+    /// second instance cannot inherit it.
+    pub(crate) active_worktree: Mutex<Option<PathBuf>>,
+    /// One lazily-started language server per workspace root.
+    ///
+    /// Keyed by root rather than a single slot so two open projects do not
+    /// tear each other's server down. Dropped — and so killed — with the app.
+    pub(crate) lsp_clients: Mutex<HashMap<PathBuf, lsp::Client>>,
+    /// The app handle, so a tool running on the blocking pool can raise an
+    /// event (a notification, or a question card) on the UI thread. Set once
+    /// in `setup`; `None` in tests, which is why the tools that need it say so
+    /// rather than pretending to have raised something.
+    pub(crate) app_handle: Mutex<Option<tauri::AppHandle>>,
+    /// Monotonic ids for `ask_user` / `propose_plan` question cards.
+    pub(crate) question_seq: AtomicU64,
+    /// Outstanding question cards, by id, each waiting on the answer the
+    /// desktop resolves through `bridge_answer_question`.
+    pub(crate) questions: Mutex<HashMap<u64, std::sync::mpsc::SyncSender<bridge::QuestionAnswer>>>,
+}
+
+/// A throwaway app state over a temporary database, for tests that need a
+/// tool context reaching further than a workspace root.
+///
+/// The real [`AppState`] is what `get_handoff` builds against, so a test that
+/// supplies one exercises the production path rather than a stub of it.
+#[cfg(test)]
+pub(crate) fn test_state(root: &std::path::Path) -> AppState {
+    // The database lives *outside* `root`, on purpose. Inside, it is a binary
+    // file in the workspace: a workspace-wide `grep` would have to walk it,
+    // and — as the git fixtures found — committing the tree and then checking
+    // out a branch without it deletes the file from under the live
+    // connection.
+    let db_path = root.parent().unwrap_or(root).join(format!(
+        ".lexsus-test-{}.sqlite3",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    AppState {
+        conn: Mutex::new(db::open_and_migrate(&db_path).unwrap()),
+        project_root: Mutex::new(Some(root.to_path_buf())),
+        fs_watcher: Mutex::new(None),
+        bridge: Mutex::new(bridge::Bridge::new()),
+        objective: Mutex::new(None),
+        recent_edits: Mutex::new(VecDeque::new()),
+        failover: Mutex::new(failover::ActivityMonitor::new()),
+        mcp_allow_write: Arc::new(AtomicBool::new(false)),
+        mcp_listening: Arc::new(AtomicBool::new(false)),
+        bgproc: bgproc::Manager::new(),
+        active_worktree: Mutex::new(None),
+        lsp_clients: Mutex::new(HashMap::new()),
+        app_handle: Mutex::new(None),
+        question_seq: AtomicU64::new(1),
+        questions: Mutex::new(HashMap::new()),
+    }
 }
 
 /// A trace step emitted to the UI (mirrors `TraceStep` in the frontend).
@@ -281,12 +359,16 @@ pub(crate) fn command_stream(app: &AppHandle) -> impl FnMut(bridge::CommandEvent
 pub(crate) fn tool_call(app: &AppHandle, tool: bridge::Tool, source: &str) -> bridge::ToolResult {
     let state = app.state::<AppState>();
     let root = state.project_root.lock().unwrap().clone();
+    // A full context, not just a root: a call may reach the database (the
+    // memory tools) or the desktop's live state (the handoff). It is built
+    // here, in one place, rather than at every call site.
+    let ctx = bridge::ToolCtx::with_state(root.as_deref(), &state);
     let (result, approval_id, authorized_by) =
         state
             .bridge
             .lock()
             .unwrap()
-            .submit_with_audit(tool.clone(), source, root.as_deref());
+            .submit_with_ctx(tool.clone(), source, &ctx);
     let Some(id) = approval_id else {
         // Auto-approved (or covered by a session grant): audit and trace.
         let _ = db::record_audit(
@@ -413,6 +495,29 @@ fn grant_state(state: &AppState) -> GrantState {
     }
 }
 
+/// Resolve a pending `ask_user` or `propose_plan` card.
+///
+/// The asker is blocked on a channel keyed by this id, exactly as a gated
+/// tool blocks on its approval; removing the entry before sending means a
+/// second answer for the same card finds nothing rather than resolving it
+/// twice.
+#[tauri::command]
+fn bridge_answer_question(
+    state: State<'_, AppState>,
+    id: u64,
+    option: Option<String>,
+    answer: String,
+) -> Result<(), String> {
+    let tx = state
+        .questions
+        .lock()
+        .unwrap()
+        .remove(&id)
+        .ok_or_else(|| "no such question".to_string())?;
+    tx.send(bridge::QuestionAnswer { option, answer })
+        .map_err(|_| "the asking call is no longer waiting".to_string())
+}
+
 /// Resolve a pending approval: execute (allow) or deny. With `grant`, also
 /// creates a session grant covering this class of call.
 #[tauri::command]
@@ -425,11 +530,16 @@ fn bridge_approve(
 ) -> Result<bridge::ToolResult, String> {
     let root = state.project_root.lock().unwrap().clone();
     let mut stream = command_stream(&app);
+    // Approving a call may execute any tool — including one that reaches the
+    // database or the desktop — so it resolves against the same context the
+    // request arrived with, not a bare root. This is the second of the two
+    // places that context is built.
+    let ctx = bridge::ToolCtx::with_state(root.as_deref(), &state);
     let (result, req) = state
         .bridge
         .lock()
         .unwrap()
-        .resolve(id, allow, root.as_deref(), Some(&mut stream))
+        .resolve_with_ctx(id, allow, &ctx, Some(&mut stream))
         .ok_or_else(|| "no such approval request".to_string())?;
     let _ = db::record_audit(
         &state.conn.lock().unwrap(),
@@ -501,13 +611,19 @@ fn bridge_audit(
     db::last_audit(&state.conn.lock().unwrap(), limit.unwrap_or(30)).map_err(|e| e.to_string())
 }
 
-/// Cancel a running tool call: kill every process its `run_command` spawned
-/// (SIGTERM to the process group, SIGKILL after a grace period). `owner` must
-/// match the id the process registered under (`process::ProcessEntry.owner`);
-/// a process registered with no owner is not reachable this way.
+/// Cancel a running tool call: kill every process it spawned (SIGTERM to the
+/// process group, SIGKILL after a grace period). `owner` must match the id the
+/// process registered under (`process::ProcessEntry.owner`); a process
+/// registered with no owner is not reachable this way.
+///
+/// Two registries, because a call can spawn two kinds of process: `run_command`
+/// registers with the global [`process::registry`], while
+/// `run_command_background` jobs live in this app instance's [`bgproc::Manager`].
+/// A cancel that reached only the first would leave the second running.
 #[tauri::command]
-fn cancel_request(owner: String) -> Result<usize, String> {
-    Ok(process::registry().kill_owner(&owner, Duration::from_millis(500)))
+fn cancel_request(state: State<'_, AppState>, owner: String) -> Result<usize, String> {
+    let grace = Duration::from_millis(500);
+    Ok(process::registry().kill_owner(&owner, grace) + state.bgproc.kill_owner(&owner))
 }
 
 /// Processes currently registered (live `run_command` executions).
@@ -578,14 +694,20 @@ fn now_millis() -> u64 {
 // --- MCP connector -----------------------------------------------------------
 
 /// The connector's live state as the desktop renders it: where the endpoint
-/// is, whether it bound, what workspace it can reach, and whether the write
-/// surface is currently exposed.
+/// is, whether it bound, what workspace it can reach, whether the write
+/// surface is currently exposed, and which `Host` values the endpoint accepts.
 #[derive(Clone, serde::Serialize)]
 struct McpStatus {
     listening: bool,
     endpoint: String,
     allow_write: bool,
     workspace: Option<String>,
+    /// Host authorities the DNS-rebinding guard accepts. Anything else is
+    /// answered with a bare `403` — which a remote connector reads as "no MCP
+    /// server here" and retries as OAuth. Reported here so a tunnel host that
+    /// is missing from `LEXSUS_MCP_ALLOWED_HOSTS` is visible in the UI rather
+    /// than only in the connector's misleading sign-in error.
+    allowed_hosts: Vec<String>,
 }
 
 fn mcp_status_of(state: &AppState) -> McpStatus {
@@ -599,6 +721,7 @@ fn mcp_status_of(state: &AppState) -> McpStatus {
             .unwrap()
             .clone()
             .map(|p| p.display().to_string()),
+        allowed_hosts: mcp::effective_allowed_hosts(),
     }
 }
 
@@ -988,8 +1111,20 @@ pub fn run() {
             // desktop flips it live (or `LEXSUS_MCP_ALLOW_WRITE` seeds it on).
             mcp_allow_write: Arc::new(AtomicBool::new(mcp_allow_write_seed())),
             mcp_listening: Arc::new(AtomicBool::new(false)),
+            bgproc: bgproc::Manager::new(),
+            active_worktree: Mutex::new(None),
+            lsp_clients: Mutex::new(HashMap::new()),
+            app_handle: Mutex::new(None),
+            question_seq: AtomicU64::new(1),
+            questions: Mutex::new(HashMap::new()),
         })
         .setup(|app| {
+            // Hand the app handle to the state so tools running on the
+            // blocking pool can raise UI events (notifications, questions).
+            {
+                let state = app.state::<AppState>();
+                *state.app_handle.lock().unwrap() = Some(app.handle().clone());
+            }
             // Auto-init: app-data SQLite, persisted settings, connector.
             let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -1030,6 +1165,7 @@ pub fn run() {
             start_watch,
             bridge_tool,
             bridge_approve,
+            bridge_answer_question,
             bridge_audit,
             bridge_grant_state,
             bridge_grant_revoke,
@@ -1050,12 +1186,19 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
-    app.run(|_handle, event| {
+    app.run(|handle, event| {
         // Never leave a spawned command behind: killing on ExitRequested
         // (not Exit — by then the process is torn down) lets the registry
         // TERM→KILL the process groups while we can still signal.
         if let tauri::RunEvent::ExitRequested { .. } = event {
             process::registry().kill_all(Duration::from_millis(500));
+            // Background commands are their own roster, in state rather than
+            // in the global registry above. State outlives this callback, so
+            // the manager's own `Drop` is not enough on its own: we may be
+            // exiting without ever running it.
+            if let Some(state) = handle.try_state::<AppState>() {
+                state.bgproc.kill_all();
+            }
         }
     });
 }

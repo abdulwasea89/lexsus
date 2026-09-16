@@ -95,6 +95,24 @@ export default function BridgeView() {
               </div>
               <div className="flex items-center justify-between gap-3">
                 <div className="flex min-w-0 flex-col">
+                  <span className="shrink-0 text-[11px] text-muted-foreground">
+                    Allowed hosts
+                  </span>
+                  <span className="text-[11px] leading-relaxed text-muted-foreground">
+                    A tunnel host must be listed here (via
+                    LEXSUS_MCP_ALLOWED_HOSTS), or its requests get a 403 that
+                    reads as a sign-in failure.
+                  </span>
+                </div>
+                <code
+                  className="shrink-0 truncate font-mono text-xs"
+                  title={connector?.allowed_hosts.join(", ")}
+                >
+                  {connector?.allowed_hosts.join(", ") || "—"}
+                </code>
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex min-w-0 flex-col">
                   <span className="text-xs font-medium">
                     Allow writes &amp; commands
                   </span>

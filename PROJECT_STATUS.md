@@ -7,8 +7,8 @@
 
 | | |
 |---|---|
-| 🧩 What exists | 15 of 58 planned tools built · 5-view workbench · **native MCP connector (single transport)** · Rust core (~8.5k LOC) + React/TS (~5.0k LOC) |
-| ✅ Code healthy | `cargo fmt --all --check` clean · `cargo clippy --lib --all-targets -- -D warnings` exit 0 · **`cargo test --lib` 78 passed / 0 failed** · `pnpm typecheck` clean · `pnpm lint` 0 errors (6 pre-existing warnings) · `pnpm build` succeeded |
+| 🧩 What exists | 58 of 58 planned tools built · 5-view workbench · **native MCP connector (single transport)** · Rust core (~19k LOC) + React/TS (~5.2k LOC) |
+| ✅ Code healthy | `cargo fmt --all --check` clean · `cargo clippy --lib --all-targets -- -D warnings` exit 0 · **`cargo test --lib` 133 passed / 0 failed** · `pnpm typecheck` clean · `pnpm lint` 0 errors (6 pre-existing warnings) · `pnpm build` succeeded |
 | 🔌 Round trip reworked | Every tool result now crosses MCP as **readable text + `structuredContent`**, with `outputSchema` declared per tool. Errors carry their real `error_code`; edits report replacement count and line; `read_file` hands back `next_offset` instead of a call to copy |
 | 🚪 Still to prove | **M1 live gate** (a real web-AI session end-to-end through the connector) and the **exit gate** (5–10 developers) — the actual startup validation is not yet done |
 
@@ -56,25 +56,26 @@ It is **not** a chat-history copier, a limit bypass, or browser automation/DOM s
 
 ## 3. What is BUILT today
 
-### 3.1 The Rust core (`src-tauri/src/`, ~8.5k LOC)
+### 3.1 The Rust core (`src-tauri/src/`, ~16.3k LOC)
 
 | Module | LOC | What it does |
 |---|---|---|
-| `bridge.rs` | 3,489 | The **tool engine**: 15-tool `SPECS` registry, permission model, sensitive-path rules, `resolve_path` containment, session grants, chunked reads, edit/patch/apply logic, plus the shared `parse_tool_call` coercion and `tool_input_schema` JSON Schemas. Largest module. |
-| `lib.rs` | 1,060 | Tauri command wiring: git commands, watcher, trace recording, handoff builder, grants, failover, terminal events, connector spawn/status. |
-| `db.rs` | 853 | Embedded SQLite + hand-rolled versioned migrations (0001–0005+): sessions, session_events, facts tables, trace_steps, audit_log, settings. |
+| `bridge.rs` | 8,850 | The **tool engine**: 40-tool `SPECS` registry, permission model, sensitive-path rules, `resolve_path` containment, session grants, chunked reads, edit/patch/apply logic, the **search walk** (`grep`/`glob`: sensitive-path screening per file, no symlink following, caps that *stop* the walk), the git tool layer, the **project-memory layer** (`ToolCtx` reaches the database; `todo_*`, `remember_*`, `set_objective`, `get_facts`, `list_sessions`, `request_handoff`, `get_handoff`), and the three thin tools over `bgproc.rs`, plus the shared `parse_tool_call` coercion and `tool_input_schema` JSON Schemas. Largest module. |
+| `lib.rs` | 1,133 | Tauri command wiring: git commands, watcher, trace recording, handoff builder (`build_handoff_impl`, now reached by the `get_handoff` tool as well as the desktop), grants, failover, terminal events, connector spawn/status, `cancel_request` (reaches both process registries). Builds the single `ToolCtx` both call paths hand to the engine. |
+| `db.rs` | 1,190 | Embedded SQLite + hand-rolled versioned migrations (**0001–0006**): sessions, session_events, facts tables (objectives/decisions/attempts/constraints/changed_files/progress), `todos`, `handoff_requests`, trace_steps, audit_log, settings. The `Fact` algebra names the three fact kinds once, so the three `remember_*` tools are three parse arms over one implementation. |
 | `transcript.rs` | 619 | Claude Code JSONL transcript reader (epoch parsing, munge-path matching, timeline events). |
-| `mcp.rs` | 376 | **The connector**: rmcp Streamable HTTP server, gated `tools/list`, `tools/call` → policy engine, result cap, allowed-hosts handling. |
+| `mcp.rs` | 997 | **The connector**: rmcp Streamable HTTP server, gated `tools/list`, `tools/call` → policy engine, result cap, allowed-hosts handling, the `READ_ONLY`/`WRITE` surface partition (with the test that proves the no-write surface cannot change the workspace), and the **`continue_work` prompt** over the same handoff card the `get_handoff` tool returns. Each call runs on the blocking pool under a guard naming it `mcp:<request id>`, so anything it spawns is attributable and cancellable. |
 | `pty.rs` | 353 | `portable-pty` one-shot command execution with streaming, timeout→kill, output cap, 500 ms quiet-drain after exit. |
-| `failover.rs` | 323 | Interruption state machines: local `inactive→working→stalled→interrupted` (vetoed by file changes); web direction is now **inactivity-only** (no socket left to watch). |
-| `process.rs` | 322 | Process-group registry for `run_command`; owner-scoped kill; SIGKILL escalation when the group outlives the leader; protected PIDs. |
-| `git.rs` | 321 | `git2` full workflow: status, diff, stage/unstage, branches+checkout (refuses dirty tree), log, commit_diff. |
+| `failover.rs` | 327 | Interruption state machines: local `inactive→working→stalled→interrupted` (vetoed by file changes); web direction is now **inactivity-only** (no socket left to watch). |
+| `process.rs` | 365 | Process-group registry for `run_command`; owner-scoped kill; SIGKILL escalation when the group outlives the leader; protected PIDs; the thread-local **execution owner** and its RAII guard, which is how a PTY spawned deep inside the engine gets attributed to the request that asked for it. |
+| `bgproc.rs` | 1,218 | **Background commands**: start without waiting, read a bounded sliding window by an absolute byte cursor, stop the process group. Three termination modes (End/Kill/Error) through one cleanup path; the process group is torn down by a `Drop` guard rather than by a call somebody must remember to make. |
+| `git.rs` | 468 | `git2` full workflow: status, diff, stage (files *or* a directory) / unstage (index-versus-HEAD, not index membership), branches+checkout (refuses dirty tree), log, revision-resolving `show`/`commit_diff`. |
 | `archive.rs` | 269 | Mirrors Claude Code transcripts into the session archive, idempotent (source-path + mtime dedupe). |
 | `facts.rs` | 259 | Sentence-level heuristics → decisions/failed attempts/constraints; deterministic progress heuristic; output caps. |
 | `shell.rs` | 144 | Shell detection/abstraction (Sh/Bash/Zsh/Cmd/PowerShell). |
 | `watcher.rs` | 64 | `notify` recursive file watcher (single replaceable watch, no thread-per-start leak). |
 
-### 3.2 The web-AI tool surface — **15 of 58 tools built**
+### 3.2 The web-AI tool surface — **58 of 58 tools built**
 
 Every tool is registered **once** in `SPECS` (`src-tauri/src/bridge.rs`) with a matching JSON Schema in `tool_input_schema()`, an output schema in `output_schema()`, and matching coercion in `parse_tool_call()`. The drift guard is now the Rust unit tests in `bridge.rs`/`mcp.rs` — the old `scripts/check-spec-sync.mjs` and its JS registry are gone with the extension.
 
@@ -100,8 +101,46 @@ Every tool is registered **once** in `SPECS` (`src-tauri/src/bridge.rs`) with a 
 | Editing | `copy_file` (both paths checked) | Always | no |
 | Editing | `create_directory` | Auto | no |
 | Commands | `run_command` (streams live, 120 s / 1 MB) | Always | no |
+| Commands | `run_command_background` (returns a handle, never waits) | Always | no |
+| Commands | `command_output` (reads from a cursor; `next_cursor`/`more`/`complete`/`lost`) | Auto | yes |
+| Commands | `kill_command` (SIGTERM→SIGKILL to the group; reports the real ending) | Auto | yes |
+| Search | `grep` (regex, include/exclude globs, content/files/count modes) | SensitivePathOnly | yes |
+| Search | `glob` (path pattern, `*` and `**`) | SensitivePathOnly | yes |
 | Git | `git_status` | Auto | yes |
+| Git | `git_diff` (per-file patches, size-budgeted) | SensitivePathOnly | yes |
+| Git | `git_log` (default 20, 200 max) | Auto | yes |
+| Git | `git_branches` | Auto | yes |
+| Git | `git_show` (message + patch by revision) | Auto | yes |
+| Git | `git_commit_diff` (patch only) | Auto | yes |
+| Git | `git_add` (path or everything) | SensitivePathOnly | no |
+| Git | `git_unstage` (index only) | SensitivePathOnly | no |
+| Git | `git_commit` (refuses an empty index) | Always | no |
+| Git | `git_create_branch` | Always | no |
+| Git | `git_checkout` (**refuses a dirty tree**, `WORKTREE_DIRTY`) | **Destructive** | no |
+| Memory | `todo_write` (replaces the whole list; unknown status refuses the list) | Auto | yes |
+| Memory | `todo_read` | Auto | yes |
+| Memory | `set_objective` (retires the previous one, reports what it replaced) | Auto | yes |
+| Memory | `remember_decision` / `remember_constraint` / `remember_attempt` | Auto | yes |
+| Memory | `get_facts` (objective, decisions, constraints, failed attempts, changed files, progress) | Auto | yes |
+| Memory | `list_sessions` (the archive, so a caller can name a session) | Auto | yes |
+| Memory | `request_handoff` (records the ask; the desktop shows it) | Auto | yes |
+| Memory | **`get_handoff`** — the pull-based handoff, same card the desktop builds | Auto | yes |
 | Meta | `list_tools` / `describe_tool` | Auto | yes |
+
+**Project memory, added 2026-09-15 (tool-roadmap Phase 4).** Ten tools over the tables the fact extractor already writes. What this layer adds is the *pull* direction: until now the only way knowledge entered the project memory was `facts::extract` reading a Claude Code transcript, so a web AI could read the developer's conclusions but never record its own. Two decisions shape it:
+
+- **The connector keeps a session of its own** (`mcp:connector`). Fact tables are keyed by session and the archive's sessions belong to Claude Code transcripts, so filing a web AI's decisions under one of those would credit them to the wrong agent.
+- **"No answer" is not "no database".** A memory tool that cannot reach the database says exactly that, rather than reporting an empty memory — the first is a caller bug, the second is information, and confusing them is how a model concludes the project has no constraints and proceeds to break them.
+
+**`get_handoff` is the milestone of this stage**, and it is also the answer to open issue #1 below: the 2026-09-10 extension removal cost push delivery, and the pull-based replacement is now built. It reaches `build_handoff_impl()` because `ToolCtx` now carries the app state — the bridging refactor Stage 1 existed to enable. The same card is exposed a second way, as the connector's **`continue_work` prompt**, so a supported client can offer it natively instead of the user having to know to ask.
+
+**Background commands, added 2026-09-15 (tool-roadmap Phase 5).** `run_command` is a one-shot: the call stays open until the command exits, so a dev server or a watcher could never be started with it — the caller waited out the timeout and got a killed process. The three tools over `bgproc.rs` are the other half, and three properties are what make them safe rather than merely convenient:
+
+- **The caller's cursor is an absolute byte offset, and the window slides.** A command that prints forever must not grow the app's memory without limit, so output is kept in a bounded 64 KB window; the newest bytes are kept and the oldest dropped, because the newest output is what explains what the command is doing now. Because the offset is absolute rather than an index into the buffer, sliding renumbers nothing — and a reader that fell behind is told `lost: true` instead of being handed a stream with a hole at the front it cannot see.
+- **`complete` means *ended and drained*, not merely *ended*.** The child being reaped and the stream being drained are two events that finish at different times; the gap between them is the tail of a command that prints and exits. A caller that stopped reading at `complete` would lose exactly that output.
+- **Cleanup is a guard, not a discipline.** Every early return and every failure after the spawn still tears the process group down, because a `Drop` guard holds it; the manager kills everything it started when it is dropped, which matters because the waiter thread is blocked in `wait()` and would otherwise hold a live process forever. Eight concurrent commands; the ninth is refused rather than queued.
+
+**The per-call cancel path is wired again.** `process::set_execution_owner` had been dead since the extension removal (open issue #11), so `cancel_request` could match no process. Each connector call now runs under an RAII guard naming it `mcp:<request id>`, and the approval queue carries that owner with the request — because a gated command executes on the desktop's `bridge_approve` thread, long after the asking thread returned. `cancel_request` reaches both registries: the global one `run_command` registers in, and the app-instance `bgproc::Manager` the background tools use.
 
 **Two independent controls, don't conflate them:** the **read-only gate** (visibility — is the whole write/command surface advertised at all?) and the **approval class** (once visible, does *this* call ask?). `Auto` runs silently · `SensitivePathOnly` asks only when a sensitive path (`.env*`, keys, `.git/config`, certs…) fires · `Always` asks every time · `Destructive` asks every time **and the card shows the resolved absolute path**. Phase 6 **session grants** landed with Phase 1: scoped by tool class + canonical path prefix, **source-scoped** (a connector grant never covers a desktop call), **never** grantable for Destructive or sensitive paths, kill-switch revokes all + pauses.
 
@@ -145,26 +184,26 @@ The repo tracks **two parallel roadmaps**, and both call things "Phase n":
 
 ### 4.B Tool-surface roadmap (`docs/tool-roadmap.md`) — the *tools* the web AI sees
 
-A 58-tool plan in phases 0–10. **15 of 58 built.** Phases 8–10 and a **Claude Code parity map** were added on 2026-09-10.
+A 58-tool plan in phases 0–10. **58 of 58 built.** Phases 8–10 and a **Claude Code parity map** were added on 2026-09-10.
 
 | Phase | Theme | Built | → total | Status |
 |---|---|---|---|---|
 | (orig) | original MVP tools | 5 | 5 | ✅ done |
 | 0 | registry + progressive disclosure | +2 | 7 | ✅ done |
 | 1 | files & editing (8 tools) | +8 | **15** | ✅ done |
-| 2 | **search (`grep`, `glob`)** — both must filter `is_sensitive_path()` | 0 | 17 | ⏳ not started |
-| 3 | git (10 tools) | 0 | 27 | ⏳ not started — *the "cheapest" phase: `git.rs` already has every function* |
-| 4 | project memory (10 — incl. the **`get_handoff` pull tool**) | 0 | 37 | 🔶 partial — 6 of 10 have built backing |
-| 5 | background commands (3) | 0 | 40 | ⏳ not started |
+| 2 | **search (`grep`, `glob`)** — both filter `is_sensitive_path()` per file the walk reaches | +2 | 17 | ✅ done |
+| 3 | git (10 tools) | +10 | **27** | ✅ done — 8 were wiring over `git.rs`; `create_branch` and `show` were new, and `show`/`commit_diff` now take a *revision* rather than only a hex id |
+| 4 | project memory (10 — incl. the **`get_handoff` pull tool**) | +10 | **37** | ✅ done — `get_handoff` **and** the `continue_work` prompt; the two other doors (tool + prompt) onto one card |
+| 5 | background commands (3) | +3 | **40** | ✅ done — `bgproc.rs`: a bounded sliding window addressed by absolute cursor, three termination modes through one cleanup path, and the re-wiring of the per-call cancel path (open issue #11) |
 | 6 | approval policy engine (0 tools) | — | 40 | 🔶 partial — session grants **+ the read-only gate** landed; persistence/config/expiry remain |
-| 7 | web & long tail (`web_fetch` [SSRF guard], `web_search`, `notebook_*`, `delegate_task`) | 0 | 45 | ⏳ not started |
-| 8 | **code intelligence (LSP)** — diagnostics/definition/references/symbols | 0 | 49 | ⏳ not started — **highest-value gap** |
-| 9 | **the agent loop** (`ask_user`, `propose_plan`, `monitor`, `notify`) | 0 | 53 | ⏳ not started — the phase that makes autonomy *supervised* |
-| 10 | **isolation & delivery** (`enter/exit_worktree`, `read_media`, `publish_artifact`, `report_findings`) | 0 | 58 | ⏳ not started |
+| 7 | web & long tail (`web_fetch` [SSRF guard], `web_search`, `notebook_*`, `delegate_task`) | +5 | 45 | ✅ done — `web_fetch` over the SSRF guard; `web_search` over DDG's HTML endpoint; notebook read/edit by `cell_id`; `delegate_task` returns `AGENT_NOT_AVAILABLE` (no sub-agent runtime yet) |
+| 8 | **code intelligence (LSP)** — diagnostics/definition/references/symbols | +4 | 49 | ✅ done — `lsp.rs`, one lazily-started server per root, best-effort |
+| 9 | **the agent loop** (`ask_user`, `propose_plan`, `monitor`, `notify`) | +4 | 53 | ✅ done — event-plus-blocking-wait over the approval channel |
+| 10 | **isolation & delivery** (`enter/exit_worktree`, `read_media`, `publish_artifact`, `report_findings`) | +5 | 58 | ✅ done — worktree root override, MCP image/blob blocks |
 
-> Of the ~43 tools still to build, roughly **18 are wiring over code that already exists** — all of Phase 3, 6 of 10 in Phase 4, plus thin file ops.
+> Of the ~21 tools still to build, most are new subsystems rather than wiring: background processes, `web_fetch`, notebooks, LSP, the agent loop, worktrees.
 >
-> **MCP surface beyond tools (unused):** the connector currently exposes only `tools/*`. **Resources** (workspace files, live git status) and a **`continue_work` prompt** (the handoff, delivered natively) are both natural fits — the prompt is arguably a better answer to the pull-based handoff gap than a tool is.
+> **MCP surface beyond tools:** the connector now also exposes a **`continue_work` prompt** (the handoff card, deliverable natively). **Resources** (workspace files, live git status) are still unused.
 
 ---
 
@@ -192,7 +231,7 @@ A 58-tool plan in phases 0–10. **15 of 58 built.** Phases 8–10 and a **Claud
 
 ---
 
-## 6. Verification state — **as actually run** (2026-09-10)
+## 6. Verification state — **as actually run** (2026-09-15)
 
 | Check | Result | Notes |
 |---|---|---|
@@ -202,8 +241,10 @@ A 58-tool plan in phases 0–10. **15 of 58 built.** Phases 8–10 and a **Claud
 | `pnpm typecheck` (`tsc --noEmit`) | ✅ clean | |
 | `pnpm lint` | ⚠️ 0 errors, 6 pre-existing warnings | |
 | `pnpm build` | ✅ succeeded | |
-| **`cargo test --lib`** | ✅ **78 passed / 0 failed** | **Now run and verified.** The instruction was lifted for this pass. A baseline run *before* any edit came back **73 / 0** — so the extension removal did **not** break the suite (the old "62 green" figure predated the Stage-1 parser/schema and MCP tests). The rework then added 5 tests: 78 / 0. |
+| **`cargo test --lib`** | ✅ **133 passed / 0 failed** | **Now run and verified.** The instruction was lifted for this pass. A baseline run *before* any edit came back **73 / 0** — so the extension removal did **not** break the suite. The rework added 5 tests (78 / 0), then Stage 1 (the property suite) and Stage 2 (search + git, 12 tools) took it to **102 / 0**, Stage 3 (project memory, 10 tools) to **110 / 0**, and Stage 4a (background commands, 3 tools, plus the cancel-path re-wiring) to **133 / 0**. Stage 4a's additions are targeted: the window's slide and what it tells a reader that fell behind, the `complete`-requires-drained rule, kill-versus-exit, the manager's `Drop`, owner-scoped cancellation, the three-tool round trip end to end, and an approved command still being owned by the request that asked. |
 | `node scripts/check-spec-sync.mjs` | ➖ **n/a** | The script and the `extension/tool-spec.js` registry it guarded were both deleted; the invariant moved to the `bridge.rs`/`mcp.rs` unit tests. |
+
+**Mutation-tested.** Every Stage-3 property was checked against a deliberate defect in the code it names (an unknown todo status silently clamped, a fact filed under the newest session, `get_handoff` building a card of its own, `replace_todos` merging, an all-whitespace reason stored as a rationale, the newest migration skipped, the prompt dropping its card or its cap). Stage 4a's were too: the window dropping the newest bytes instead of the oldest, `lost` compared against the wrong end, eviction releasing a *running* command, `complete` claimed before the reader drains, `kill` answering without waiting for the reap, the manager's `Drop` removed, `command_output` defaulting its cursor to the end, `OUTPUT_GONE` and `PROCESS_NOT_FOUND` swapped, and `kill_owner` ignoring the owner. All were caught. That last pass is why two of them exist: `complete`-before-drain and the cursor default both **survived** the first run, and were closed with tests written for them rather than left as uncovered claims. Two escapes in earlier stages are the reason the habit is written down here: a green suite has three times hidden a vacuous test or a real defect in this repo.
 
 **CI (`.github/workflows/ci.yml`):** frontend lint/typecheck/build · `cargo fmt --all --check` · `cargo clippy -- -D warnings` · compression `/health`. A second workflow runs a **Claude PR review** on every PR via `agentrouter.org` (deepseek-v4-flash), gated on the `THIRD_PARTY_API_KEY` secret — its review prompt was updated on 2026-09-10 to describe the new single-registry + read-only-gate invariants instead of the deleted extension registries.
 
@@ -213,8 +254,8 @@ A 58-tool plan in phases 0–10. **15 of 58 built.** Phases 8–10 and a **Claud
 
 ## 7. Open issues & known gaps (the honest list)
 
-1. **The extension removal cost one real capability: push delivery.** MCP cannot push a message into a chat, so (a) the Handoff view copies to the clipboard instead of injecting, and (b) failover now *offers* continuation in-app instead of auto-delivering. The fix is a **`get_handoff` pull tool** (tool-roadmap Phase 4) or, better, a **`continue_work` MCP prompt** — neither is built. The one structural obstacle: the bridge executor's `(tool, source, root)` signature has no `AppState`, which `build_handoff_impl()` needs.
-2. **~~`cargo test --lib` is unverified after this change~~ — RESOLVED 2026-09-10.** The suite was run: **73 / 0 baseline before the rework, 78 / 0 after**. The extension removal did not break it. `cargo test` is still not a CI gate, but the blocker is gone and adding it is now a trivial follow-up.
+1. **~~The extension removal cost one real capability: push delivery~~ — RESOLVED 2026-09-15.** MCP cannot push a message into a chat, so the fix is a *pull* — and both pulls are now built: the **`get_handoff` tool** (Phase 4) and the **`continue_work` prompt**, whichever a client supports. The structural obstacle was that the bridge executor's signature had no `AppState`, which `build_handoff_impl()` needs; `ToolCtx` now carries it. What remains unproven is whether a given provider's connector surfaces prompts — see issue #4.
+2. **~~`cargo test --lib` is unverified after this change~~ — RESOLVED 2026-09-10.** The suite was run: **73 / 0 baseline before the rework, 78 / 0 after**, now **110 / 0**. The extension removal did not break it. `cargo test` is still not a CI gate, but the blocker is gone and adding it is now a trivial follow-up.
 3. **Live validation is the real gap.** Everything above is machine-verified; nothing has been proven end-to-end with a real web-AI session through the connector. Startup validation = **M1 live gate**, then the **exit gate with 5–10 real developers** (metric: *successful continuation rate*).
 4. **Provider connector coverage is now the platform risk** (it replaced DOM scraping as risk #1). Gemini has no broad consumer MCP; ChatGPT/Codex varies; Claude and Grok depend on plan and rollout. Mitigated by the connector being provider-native (no selectors to break) and read-only-first — but Lexsus now reaches fewer providers out of the box than the extension did.
 5. **Compression service is a stub** (Layer 3, `/compress` 501) — the handoff today is uncompressed structured facts.
@@ -223,7 +264,7 @@ A 58-tool plan in phases 0–10. **15 of 58 built.** Phases 8–10 and a **Claud
 8. **Phase 6 remainder:** persisted grant policies, per-tool configuration, grant expiry (grants are in-memory and die with the app).
 9. **F29 encryption not started; F22 unified timeline only partial.**
 10. **~~No automated test coverage for the connector's live path~~ — partly closed 2026-09-10.** The round-trip rework added tests for the *shaped result* the connector returns (`error_code_survives_the_mcp_boundary`, `success_keeps_readable_text_and_structured_content`, `every_exposed_tool_declares_output_schema`) and, bridge-side, for the payloads themselves (`structured_output_matches_its_declared_schema`) and for the set of all tool outputs (`no_tool_output_reads_as_call_syntax`). What is still untested is a **real MCP client against the loopback server** — the transport, not the payload.
-11. **The per-call cancel path is now vestigial (found during this pass).** `process::set_execution_owner` is only ever called from tests, so `execution_owner()` is always `None`, every `ProcessEntry.owner` is `None`, and the `cancel_request` Tauri command (still registered in `invoke_handler!`) can match no process. Its owner used to be the WebSocket request id that `ws.rs` set — the transport that populated it is gone. **No UI calls `cancel_request`, so nothing is broken for a user today**, but the capability (stop a running `run_command`) is unreachable. Either re-wire the owner to the MCP request id or delete the machinery; do not leave it in the half state.
+11. **~~The per-call cancel path is now vestigial~~ — RESOLVED 2026-09-15.** `process::set_execution_owner` is no longer dead: the connector runs each call on the blocking pool under an RAII guard (`own_current_thread`) naming it `mcp:<request id>`, the approval queue carries that owner with the request so a *gated* command is still attributed to the request that asked (it executes on the desktop's `bridge_approve` thread, not the caller's), and `cancel_request` now reaches **both** registries — the global one `run_command` registers in and the app-instance `bgproc::Manager` the background tools use. The one deliberate non-choice: rmcp's `context.ct` is **not** watched, because that token is only cancelled on a `CancelledNotification` and otherwise dropped when the call returns, so an awaiting watcher task would outlive every call that ends normally — one leaked task per tool call to handle the rare case. Naming is enough; a caller that wants a command stopped knows the id it is cancelling and can say so.
 
 ---
 
@@ -233,7 +274,7 @@ A 58-tool plan in phases 0–10. **15 of 58 built.** Phases 8–10 and a **Claud
 - **MVP success criterion:** *a real interrupted coding task is continued by a web AI that genuinely reads, writes, and runs commands on the local project — without the developer re-explaining.* Validated with 5–10 developers.
 - **Primary metric:** successful continuation rate. Secondary: weekly retained devs, handoffs/user/week, tool usage, user-reported trust.
 - **Risk posture:** the highest risks are now provider connector availability (mitigated by using the provider's native tool channel rather than DOM scraping, plus a read-only-first default) and command-execution safety (mitigated by per-tool approval, grants, destructive-path cards, audit log, sensitive-path filtering).
-- **Near-term next actions, in order:** (1) run the **M1 live gate** through the MCP connector (runbook: `docs/connector-native-proof-runbook.md`) — this is now the top item, since `cargo test --lib` came back green; (2) build **`get_handoff`** / the `continue_work` prompt to restore pull-based continuity; (3) **Phase 2 `grep`/`glob`** and **Phase 8 LSP diagnostics** — the two highest-value tool gaps; (4) add **`cargo test` to CI** (now safe); (5) real **Layer 3 compression**; then the 5–10-dev validation.
+- **Near-term next actions, in order:** (1) run the **M1 live gate** through the MCP connector (runbook: `docs/connector-native-proof-runbook.md`) — this is now the top item, since `cargo test --lib` came back green; (2) finish **Stage 4** — `web_fetch` (SSRF guard), notebooks, **LSP diagnostics** (the highest-value remaining gap), `delegate_task`; (3) add **`cargo test` to CI** (now safe); (4) real **Layer 3 compression**; then the 5–10-dev validation.
 
 ---
 
@@ -241,7 +282,7 @@ A 58-tool plan in phases 0–10. **15 of 58 built.** Phases 8–10 and a **Claud
 
 ```
 ├── src/                React/TS control center (views/ + components/)
-├── src-tauri/          Rust core (bridge, mcp, db, git, pty, process, watcher, facts, archive, transcript, failover, shell)
+├── src-tauri/          Rust core (bridge, mcp, db, git, pty, process, bgproc, watcher, facts, archive, transcript, failover, shell)
 │   └── src/mcp.rs      the connector — rmcp Streamable HTTP on 127.0.0.1:45147/mcp
 ├── compression-service/  Python FastAPI Layer-3 (stub)
 ├── docs/               full-plan · tool-roadmap · protocol-v2 · architecture · tech-stack · ui-design · connector-native-proof-runbook
@@ -254,4 +295,4 @@ Reading order for someone new: `docs/architecture.md` → `docs/tool-roadmap.md`
 
 ---
 
-*Status compiled 2026-09-10 on `developing` from a working tree carrying the extension-removal change, plus the verification runs in §6. Feature claims are cross-checked against code (`bridge.rs` SPECS, `mcp.rs` surface lists); where the docs and code disagreed, the code won. The one thing this document cannot vouch for is the Rust test suite — it was not run.*
+*Status compiled 2026-09-15 on `developing`. The tool-roadmap Phases 2–5 and 7–10 have landed since the previous compile: search + git, project memory, background commands, web/notebooks, LSP, the agent loop, and isolation/delivery — **58 of 58 tools**. Feature claims are cross-checked against code (`bridge.rs` SPECS, `mcp.rs` surface lists); where the docs and code disagreed, the code won. The one thing this document cannot vouch for is the M1 live gate — nothing here is proof that a provider's connector drives these tools correctly.*

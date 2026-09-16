@@ -16,8 +16,9 @@
 
 use crate::bridge;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams,
+    GetPromptResponse, GetPromptResult, ListPromptsResult, ListToolsResult, PaginatedRequestParams,
+    Prompt, PromptMessage, Role, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
 };
 use rmcp::service::{MaybeSendFuture, RequestContext};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -26,7 +27,7 @@ use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 /// Loopback bind address for the connector's MCP endpoint. Bound to loopback
 /// only, which is the security posture; reaching it from anywhere else is an
@@ -49,7 +50,37 @@ const READ_ONLY: &[&str] = &[
     "read_file",
     "list_directory",
     "read_many_files",
+    "grep",
+    "glob",
     "git_status",
+    "git_diff",
+    "git_log",
+    "git_branches",
+    "git_show",
+    "git_commit_diff",
+    // Reading the project memory changes nothing: the task list, the facts
+    // and the session archive are all reads.
+    "todo_read",
+    "get_facts",
+    "list_sessions",
+    "get_handoff",
+    // Phase 7–10 reads. The web pair reaches the network but changes nothing
+    // local; the language-server four answer questions; the agent-loop pair
+    // talk to the human rather than the workspace; and the media/finding
+    // tools only report what is already there.
+    "web_fetch",
+    "web_search",
+    "notebook_read",
+    "lsp_diagnostics",
+    "lsp_definition",
+    "lsp_references",
+    "lsp_symbols",
+    "ask_user",
+    "propose_plan",
+    "monitor",
+    "notify",
+    "read_media",
+    "report_findings",
 ];
 
 /// Everything that mutates the workspace (or runs shell), gated behind
@@ -64,6 +95,36 @@ const WRITE: &[&str] = &[
     "copy_file",
     "create_directory",
     "run_command",
+    "run_command_background",
+    // Gated with the two that bracket it, even though it only reads. What it
+    // reads is a *process's* output, not the workspace: text a command chose
+    // to print, which the read-only promise says nothing about. And with
+    // write off there cannot be a command for it to report on, so exposing it
+    // would be a handle to nothing.
+    "command_output",
+    "kill_command",
+    "git_add",
+    "git_unstage",
+    "git_commit",
+    "git_checkout",
+    "git_create_branch",
+    // Recording a fact or a task list writes to the database rather than the
+    // workspace, but it is still a write: it changes what the next reader —
+    // the developer, in the desktop UI — will see.
+    "todo_write",
+    "set_objective",
+    "remember_decision",
+    "remember_constraint",
+    "remember_attempt",
+    "request_handoff",
+    // Phase 7–10 writes. A notebook edit rewrites a document; a worktree is
+    // created and removed through git; an artifact is a written file; and a
+    // delegated task is gated because it can do any of the above.
+    "notebook_edit",
+    "delegate_task",
+    "enter_worktree",
+    "exit_worktree",
+    "publish_artifact",
 ];
 
 /// Canonical tool names the server exposes for a given `allow_write` state.
@@ -142,7 +203,13 @@ struct LexsusServer {
 
 impl ServerHandler for LexsusServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .build(),
+        )
+        .with_instructions(
             "Lexsus local-workspace tools. Reads run automatically unless the path is \
              sensitive (then the desktop app must approve). Write and command tools are \
              hidden until write access is enabled, and always require the desktop \
@@ -163,16 +230,61 @@ impl ServerHandler for LexsusServer {
         async move { Ok(ListToolsResult::with_all_items(tools)) }
     }
 
+    fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListPromptsResult, McpError>> + MaybeSendFuture + '_ {
+        let prompts = prompt_descriptors();
+        async move { Ok(ListPromptsResult::with_all_items(prompts)) }
+    }
+
+    fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<GetPromptResponse, McpError>> + MaybeSendFuture + '_ {
+        let name = request.name.clone();
+        let app = self.app.clone();
+        async move {
+            if name != CONTINUE_WORK_PROMPT {
+                return Err(McpError::invalid_params(
+                    format!("no such prompt: {name}"),
+                    None,
+                ));
+            }
+            // Building the card reads the transcript and the database, so it
+            // goes on the blocking pool rather than a runtime worker.
+            let prompt = tokio::task::spawn_blocking(move || continue_work_prompt(&app))
+                .await
+                .map_err(|_| McpError::internal_error("handoff task failed", None))??;
+            Ok(prompt.into())
+        }
+    }
+
     fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CallToolResponse, McpError>> + MaybeSendFuture + '_ {
         let name = request.name.to_string();
         let allow_write = self.allow_write.load(Ordering::SeqCst);
         // Arguments arrive as a JSON object; the parser takes a serde Value.
         let args = serde_json::Value::Object(request.arguments.clone().unwrap_or_default());
         let app = self.app.clone();
+        // The id of *this* call, so anything it spawns is registered under it
+        // and `cancel_request` can find it. Namespaced because the desktop
+        // path owns its processes by approval id, and the two id spaces must
+        // not be able to collide.
+        //
+        // Naming the call rather than watching rmcp's `context.ct` is
+        // deliberate. That token is only cancelled on a `CancelledNotification`
+        // and is otherwise dropped when the call returns, so a watcher task
+        // awaiting it would outlive every call that ends normally — one leaked
+        // task per tool call, to handle the rare case. Naming is enough: a
+        // caller that wants a running command stopped knows the id it is
+        // cancelling and can say so.
+        let owner = format!("mcp:{}", context.id);
         async move {
             // Not exposed under the current write policy → a caller-visible
             // tool error, not a protocol error: the tool *is* known, just
@@ -198,6 +310,11 @@ impl ServerHandler for LexsusServer {
             // decision, so never hold a runtime worker — run it on the
             // blocking pool.
             let result = tokio::task::spawn_blocking(move || {
+                // Anything this call spawns is registered under the call's own
+                // id, so `processes_list` attributes it and `cancel_request`
+                // can reach it. The guard clears it on the way out, including
+                // when the call panics.
+                let _owner = crate::process::own_current_thread(Some(owner));
                 crate::tool_call(&app, tool, bridge::SOURCE_MCP)
             })
             .await
@@ -208,6 +325,66 @@ impl ServerHandler for LexsusServer {
     }
 }
 
+/// The one prompt this server offers: carry on from where the last session
+/// stopped.
+///
+/// A prompt *as well as* the `get_handoff` tool, because a connector can
+/// surface a prompt natively — the user gets "Continue work" in the composer
+/// instead of having to know to ask for a handoff. The two are doors onto the
+/// same card, not two implementations of it: both go through
+/// [`crate::build_handoff_impl`], and both render it with
+/// [`bridge::render_handoff`], so they cannot disagree about what was
+/// happening.
+pub const CONTINUE_WORK_PROMPT: &str = "continue_work";
+
+/// What `prompts/list` advertises. A pure function of nothing, which is the
+/// point: the handler above is then plumbing, and this is what a test
+/// asserts.
+fn prompt_descriptors() -> Vec<Prompt> {
+    vec![Prompt::new(
+        CONTINUE_WORK_PROMPT,
+        Some(
+            "Load the handoff card from the interrupted session and carry the \
+             task on from its next step.",
+        ),
+        None,
+    )]
+}
+
+/// Compose the prompt's text from a handoff card.
+///
+/// Pure: a card in, text out. Everything hard about this prompt is in the
+/// composition — what to tell a model to *do* with a card — so keeping the
+/// app handle out of it is what makes that assertable without a session, a
+/// database or a desktop.
+///
+/// The cap lives here rather than at the call site because the card's size is
+/// a property of the *card*: `objective` and `files` come from the session, so
+/// an unusually busy one produces an unusually large prompt. Capping where the
+/// text is made means there is no path that returns an uncapped one.
+fn continue_work_text(handoff: &crate::Handoff) -> String {
+    cap_text(&format!(
+        "An earlier session on this project was interrupted. This is the \
+         handoff card it left:\n\n{}\n\n\
+         Carry the task on from the next step above. Do not retry anything \
+         under \"failed attempts\" — those were already tried and did not \
+         work. Anything under \"decisions\" is settled: do not re-open it \
+         without saying why.",
+        bridge::render_handoff(handoff)
+    ))
+}
+
+/// Build the `continue_work` prompt — the effectful half of the pair.
+fn continue_work_prompt(app: &AppHandle) -> Result<GetPromptResult, McpError> {
+    let state = app.state::<crate::AppState>();
+    let handoff = crate::build_handoff_impl(&state)
+        .map_err(|e| McpError::internal_error(format!("could not build the handoff: {e}"), None))?;
+    Ok(GetPromptResult::new(vec![PromptMessage::new_text(
+        Role::User,
+        continue_work_text(&handoff),
+    )]))
+}
+
 /// Turn a finished bridge call into the wire response.
 ///
 /// Split out of `call_tool` so the shaped result can be asserted directly,
@@ -215,7 +392,27 @@ impl ServerHandler for LexsusServer {
 fn call_tool_response(result: bridge::ToolResult) -> CallToolResult {
     if result.ok {
         let text = cap_text(result.output.as_deref().unwrap_or_default());
-        let mut response = CallToolResult::success(vec![ContentBlock::text(text)]);
+        let mut blocks = vec![ContentBlock::text(text)];
+        // A media result carries its bytes out of band, in `result.media`,
+        // because base64 in the text or the structured half would be capped
+        // into something unopenable. The caption above still says what it is.
+        if let Some(media) = &result.media {
+            if media.kind == "image" {
+                blocks.push(ContentBlock::image(
+                    media.base64.clone(),
+                    media.media_type.clone(),
+                ));
+            } else {
+                // A PDF is not an image; it crosses as an embedded blob
+                // resource, which is the block the spec defines for exactly
+                // this case.
+                blocks.push(ContentBlock::resource(
+                    rmcp::model::ResourceContents::blob(media.base64.clone(), "lexsus://media")
+                        .with_mime_type(media.media_type.clone()),
+                ));
+            }
+        }
+        let mut response = CallToolResult::success(blocks);
         // Assigned to the field directly, never via
         // `CallToolResult::structured()`: that constructor sets `content` to a
         // raw `value.to_string()` dump, which would throw away the readable
@@ -276,6 +473,29 @@ fn allowed_hosts_from_env() -> Vec<String> {
         .collect()
 }
 
+/// The config the endpoint actually runs with: JSON request/response for
+/// stateless calls (SEP-2567) rather than text/event-stream where possible,
+/// plus whichever hosts the DNS-rebinding guard should accept.
+///
+/// Rebuilt on demand rather than shared, so [`effective_allowed_hosts`] can
+/// report the enforced list without a second, hand-maintained copy of rmcp's
+/// loopback defaults drifting away from the ones `serve` passes in.
+fn server_config() -> StreamableHttpServerConfig {
+    let mut config = StreamableHttpServerConfig::default();
+    config.json_response = true;
+    config.allowed_hosts.extend(allowed_hosts_from_env());
+    config
+}
+
+/// Host authorities the DNS-rebinding guard accepts, in the order rmcp checks
+/// them. Surfaced through `mcp_status` because a tunnel whose host is missing
+/// here is answered with a bare `403` — which a connector reads as "no MCP
+/// server here" and falls back to OAuth, blaming the sign-in service for what
+/// is really a Host mismatch.
+pub fn effective_allowed_hosts() -> Vec<String> {
+    server_config().allowed_hosts
+}
+
 /// Bind and serve the MCP endpoint forever. Runs on its own tokio runtime on
 /// a detached thread (the same pattern as the rest of the core's background
 /// work) so it never interferes with the Tauri event loop, and its
@@ -301,12 +521,7 @@ async fn serve(
     allow_write: Arc<AtomicBool>,
     listening: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
-    // Default already supplies a fresh cancellation token + loopback-only
-    // allowed hosts; we just prefer JSON request/response for stateless calls
-    // (SEP-2567) over text/event-stream where possible.
-    let mut config = StreamableHttpServerConfig::default();
-    config.json_response = true;
-    config.allowed_hosts.extend(allowed_hosts_from_env());
+    let config = server_config();
     // A fresh handler per connection/session, each sharing the live flag and
     // the app handle.
     let factory = move || {
@@ -420,6 +635,65 @@ mod tests {
         assert!(!tool_visible("run_command", false));
     }
 
+    /// The prompt is advertised under the name a connector will show, and its
+    /// text carries the card rather than a second rendering of the state.
+    ///
+    /// This is the pure half of the pair — `continue_work_prompt`'s only
+    /// remaining job is to fetch a `Handoff` and hand it here — which is what
+    /// lets the composition be checked without a session, a database or a
+    /// desktop.
+    #[test]
+    fn continue_work_carries_the_handoff_card() {
+        assert_eq!(
+            prompt_descriptors()
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![CONTINUE_WORK_PROMPT]
+        );
+
+        let handoff = crate::Handoff {
+            objective: "finish the memory tools".into(),
+            progress_percent: 40,
+            files_changed: 2,
+            errors_remaining: 1,
+            next_step: Some("wire the prompt".into()),
+            files: vec!["src/mcp.rs".into()],
+            context: None,
+            end_reason: Some("the session ended".into()),
+            decisions: vec!["one connector session".into()],
+            failed_attempts: vec!["filing under the newest session".into()],
+            constraints: vec!["no new dependencies".into()],
+            generated_at: "0".into(),
+        };
+
+        let card = bridge::render_handoff(&handoff);
+        let text = continue_work_text(&handoff);
+        assert_eq!(
+            text.matches(&card).count(),
+            1,
+            "the prompt must contain the card exactly once:\n{text}"
+        );
+        assert!(text.contains("finish the memory tools"), "{text}");
+        // The two instructions that make the card actionable rather than
+        // decorative: a model handed a card and nothing else will happily
+        // repeat the failed attempt it just read about.
+        assert!(text.contains("failed attempts"), "{text}");
+        assert!(text.contains("decisions"), "{text}");
+
+        // The card is unbounded — the objective and `files` both come from the
+        // session — so the prompt goes through the same cap a tool result
+        // does. A connector handed 200k chars has the request killed by the
+        // provider instead of getting a truncated answer.
+        let huge = crate::Handoff {
+            objective: "x".repeat(RESULT_CHAR_CAP + 100),
+            ..handoff.clone()
+        };
+        let capped = continue_work_text(&huge);
+        assert!(capped.chars().count() <= RESULT_CHAR_CAP + 100);
+        assert!(capped.contains("output truncated at"));
+    }
+
     #[test]
     fn result_cap_truncates_and_marks() {
         let short = "hello";
@@ -435,9 +709,27 @@ mod tests {
 
     #[test]
     fn unknown_tool_never_in_exposed_surface() {
-        for name in ["nope", "grep", "read_fil", ""] {
+        // Names that are near misses, not roadmap tools: a name that is *on*
+        // the roadmap stops being a near miss the day it is implemented, so
+        // this list holds misspellings and the empty string instead.
+        for name in ["nope", "read_fil", "read-file", "GREP ", ""] {
             assert!(!tool_visible(name, false), "{name}");
             assert!(!tool_visible(name, true), "{name}");
+        }
+    }
+
+    /// The loopback defaults are the guard's floor, and
+    /// `LEXSUS_MCP_ALLOWED_HOSTS` may only add to them — never replace them.
+    /// `mcp_status.allowed_hosts` reports exactly this list, so pinning it
+    /// keeps the UI honest about which `Host` values the endpoint answers.
+    #[test]
+    fn loopback_hosts_are_always_allowed() {
+        let hosts = effective_allowed_hosts();
+        for loopback in ["localhost", "127.0.0.1", "::1"] {
+            assert!(
+                hosts.iter().any(|h| h == loopback),
+                "loopback host {loopback} missing from {hosts:?}"
+            );
         }
     }
 
@@ -528,5 +820,223 @@ mod tests {
         );
         let structured = response.structured_content.expect("structured content");
         assert_eq!(structured["first_line"], 4);
+    }
+    /// **A tool that always asks, or that can destroy work, is never on the
+    /// surface while writes are off.**
+    ///
+    /// `surface_partitions_all_spec_tools` bounds the surface, and
+    /// `read_only_surface_has_no_write_tools` bounds the read-only half — but
+    /// that second test walks `READ_ONLY` and checks each entry is benign. It
+    /// therefore cannot see the dangerous omission: a *new* tool declared
+    /// `Always` or `Destructive` and forgotten in `WRITE`. Here the tool's
+    /// own approval class decides, so leaving it out of `WRITE` fails the
+    /// build instead of shipping a destructive tool into a read-only session.
+    ///
+    /// Quantified over `SPECS`, so every future tool is covered on declaration.
+    #[test]
+    fn every_always_or_destructive_tool_is_write_gated() {
+        let mut gated = 0usize;
+        for spec in bridge::SPECS {
+            let asks = matches!(
+                spec.approval,
+                bridge::Approval::Always | bridge::Approval::Destructive
+            );
+            if !asks {
+                continue;
+            }
+            gated += 1;
+            assert!(
+                !tool_visible(spec.name, false),
+                "{} requires {:?} approval but is exposed while writes are off",
+                spec.name,
+                spec.approval
+            );
+            assert!(
+                !exposed_names(false).contains(&spec.name),
+                "{} requires {:?} approval but is listed in the no-write surface",
+                spec.name,
+                spec.approval
+            );
+            // ...and turning writes on must expose it, or the gate is not a
+            // gate but a blacklist.
+            assert!(
+                tool_visible(spec.name, true),
+                "{} requires {:?} approval but is not exposed even with writes on",
+                spec.name,
+                spec.approval
+            );
+        }
+        assert!(
+            gated >= 6,
+            "only {gated} always/destructive tools found — the approval classes \
+             have drifted and this test is no longer covering the gate"
+        );
+    }
+
+    /// A snapshot of the workspace tree: every entry, by path.
+    ///
+    /// A directory is recorded as `"rel/"` with no bytes, because
+    /// `create_directory` mutates by adding an empty one — a files-only
+    /// snapshot would let it through. File contents are compared, not mtimes:
+    /// a rewrite that restores the same bytes is not a mutation the promise
+    /// cares about, and mtime resolution would only add flakiness.
+    fn tree_snapshot(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+        fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                // `.git` is excluded: `git_status` legitimately touches refs,
+                // packs and the index, and none of that is workspace content.
+                if rel == ".git" || rel.starts_with(".git/") {
+                    continue;
+                }
+                if path.is_dir() {
+                    out.push((format!("{rel}/"), Vec::new()));
+                    walk(&path, base, out);
+                } else if let Ok(bytes) = std::fs::read(&path) {
+                    out.push((rel, bytes));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out.sort();
+        out
+    }
+
+    /// **The no-write surface cannot change the workspace.**
+    ///
+    /// This is the promise `allow_write == false` makes to whoever owns the
+    /// folder, and `read_only_surface_has_no_write_tools` only *infers* it
+    /// from the approval class. That inference is not sound: the class says
+    /// how loudly a call asks, not what it does — `edit_file` and `multi_edit`
+    /// are `SensitivePathOnly`, and `create_directory` is `Auto`, yet all
+    /// three mutate and are correctly gated behind `WRITE`. So the surface is
+    /// checked by running it rather than by reasoning about it: every exposed
+    /// tool is driven over a real workspace, and the tree is compared byte for
+    /// byte before and after.
+    ///
+    /// Quantified over [`exposed_names`], so a read tool added later is
+    /// covered on declaration.
+    #[test]
+    fn the_no_write_surface_cannot_change_the_workspace() {
+        let dir = std::env::temp_dir().join(format!("mcp-readonly-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "one\ntwo\n").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/nested.txt"), "nested\n").unwrap();
+        // A repository with a commit, not just `.git`: `git_log`, `git_show`
+        // and `git_commit_diff` all need history, and on a bare `init` they
+        // would fail — which this test reads as a missing fixture rather than
+        // as the read-only violation it is looking for.
+        let repo = git2::Repository::init(&dir).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Lexsus Test").unwrap();
+            cfg.set_str("user.email", "test@example.invalid").unwrap();
+        }
+        repo.index()
+            .unwrap()
+            .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        {
+            let mut index = repo.index().unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = repo.signature().unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "fixtures", &tree, &[])
+                .unwrap();
+        }
+
+        let before = tree_snapshot(&dir);
+        // The database lives outside `dir` (see `test_state`), so a memory
+        // tool writing to it cannot perturb the workspace snapshot below.
+        let state = crate::test_state(&dir);
+        let ctx = bridge::ToolCtx::with_state(Some(&dir), &state);
+
+        let mut ran = 0usize;
+        for name in exposed_names(false) {
+            // Args shaped to *succeed*, so the test cannot pass by having
+            // every call rejected before it does anything. `None` means this
+            // fixture does not know the tool — and since the loop demands
+            // every exposed name be driven, an unlisted tool fails here by
+            // name rather than as a puzzling argument error.
+            let args = match name {
+                "read_file" => Some(serde_json::json!({"path": "a.txt"})),
+                "list_directory" => Some(serde_json::json!({"path": "."})),
+                "read_many_files" => {
+                    Some(serde_json::json!({"paths": ["a.txt", "sub/nested.txt"]}))
+                }
+                "describe_tool" => Some(serde_json::json!({"name": "read_file"})),
+                "grep" => Some(serde_json::json!({"pattern": "a", "path": "."})),
+                "glob" => Some(serde_json::json!({"pattern": "*.txt", "path": "."})),
+                "git_diff" => Some(serde_json::json!({})),
+                "git_log" => Some(serde_json::json!({"limit": 5})),
+                "git_show" | "git_commit_diff" => Some(serde_json::json!({"oid": "HEAD"})),
+                "list_tools" | "git_status" | "git_branches" => Some(serde_json::json!({})),
+                // The memory *reads*. They answer from the database, so the
+                // fixture supplies one — an empty state would drive them all
+                // down their "no database" error path and the test would pass
+                // without ever exercising the tools.
+                "todo_read" | "get_facts" | "list_sessions" | "get_handoff" => {
+                    Some(serde_json::json!({}))
+                }
+                other => panic!(
+                    "{other} is on the no-write surface but this test has no \
+                     fixture for it — add one, and check it is really read-only"
+                ),
+            }
+            .expect("fixture");
+            let tool =
+                bridge::parse_tool_call(name, &args).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let result = bridge::execute_in(&tool, &ctx, None);
+            assert!(
+                result.ok,
+                "{name} failed on the read surface: {:?}",
+                result.error
+            );
+            assert!(
+                result.pending.is_none(),
+                "{name} is on the no-write surface but needed approval"
+            );
+            ran += 1;
+        }
+
+        let after = tree_snapshot(&dir);
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "the read-only surface added or removed a file: {:?} -> {:?}",
+            before.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+            after.iter().map(|(p, _)| p).collect::<Vec<_>>()
+        );
+        for ((bp, bb), (ap, ab)) in before.iter().zip(&after) {
+            assert_eq!(bp, ap, "the read-only surface renamed a file");
+            assert_eq!(
+                bb, ab,
+                "the read-only surface rewrote {bp} — writes must not be                  reachable while allow_write is off"
+            );
+        }
+
+        assert_eq!(
+            ran,
+            exposed_names(false).len(),
+            "not every exposed tool was driven"
+        );
+        assert!(
+            ran >= 5,
+            "only {ran} read tools exercised — surface shrank?"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

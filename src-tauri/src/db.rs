@@ -152,6 +152,35 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
             ON session_events(session_id, ts_ms);
         "#,
     ),
+    (
+        "0006_todos_and_handoff_requests",
+        r#"
+        CREATE TABLE IF NOT EXISTS todos (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id  INTEGER REFERENCES sessions(id),
+            position    INTEGER NOT NULL,   -- the caller's ordering
+            content     TEXT NOT NULL,
+            status      TEXT NOT NULL,      -- pending | in_progress | completed
+            active_form TEXT,               -- present-continuous form, for the UI
+            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_todos_session
+            ON todos(session_id, position);
+
+        CREATE TABLE IF NOT EXISTS handoff_requests (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id   INTEGER REFERENCES sessions(id),
+            reason       TEXT NOT NULL,
+            next_step    TEXT,
+            acknowledged INTEGER NOT NULL DEFAULT 0,
+            created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_handoff_requests_session
+            ON handoff_requests(session_id, id);
+        "#,
+    ),
 ];
 
 /// Open (or create) the database and apply any pending migrations.
@@ -671,6 +700,195 @@ fn fact_column_where(
     rows.collect()
 }
 
+// --- Stage 3: the fact kinds a *connector* records --------------------------
+//
+// The tables below already hold facts the extractor derives from a Claude Code
+// transcript. These are the other direction: a fact a caller states outright,
+// through a tool. Same tables, same session key — the difference is who
+// decided the fact was worth keeping.
+
+/// A durable fact a session chose to record.
+///
+/// Three tables with the same shape — a session, a line of text, a timestamp —
+/// and one operation over them. Naming the operation rather than the tables
+/// means the three tools that expose it are three parse arms over one
+/// implementation, and a fourth kind would be a variant, not a function.
+pub enum Fact<'a> {
+    Decision {
+        summary: &'a str,
+        reason: Option<&'a str>,
+    },
+    Constraint {
+        text: &'a str,
+    },
+    Attempt {
+        description: &'a str,
+        succeeded: bool,
+    },
+}
+
+impl Fact<'_> {
+    /// The line of text this fact records.
+    pub fn text(&self) -> &str {
+        match self {
+            Fact::Decision { summary, .. } => summary,
+            Fact::Constraint { text } => text,
+            Fact::Attempt { description, .. } => description,
+        }
+    }
+
+    /// The wire name of this kind — the same word the tool and the answer use.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Fact::Decision { .. } => "decision",
+            Fact::Constraint { .. } => "constraint",
+            Fact::Attempt { .. } => "attempt",
+        }
+    }
+}
+
+/// Insert one fact against a session, returning its row id.
+pub fn record_fact(conn: &Connection, session_id: i64, fact: &Fact<'_>) -> rusqlite::Result<i64> {
+    match fact {
+        Fact::Decision { summary, reason } => conn.execute(
+            "INSERT INTO decisions (session_id, summary, reason) VALUES (?1, ?2, ?3)",
+            rusqlite::params![session_id, summary, reason],
+        )?,
+        Fact::Constraint { text } => conn.execute(
+            "INSERT INTO constraints (session_id, text) VALUES (?1, ?2)",
+            rusqlite::params![session_id, text],
+        )?,
+        Fact::Attempt {
+            description,
+            succeeded,
+        } => conn.execute(
+            "INSERT INTO attempts (session_id, description, succeeded) VALUES (?1, ?2, ?3)",
+            rusqlite::params![session_id, description, i64::from(*succeeded)],
+        )?,
+    };
+    Ok(conn.last_insert_rowid())
+}
+
+/// Set the session's objective, retiring whatever was active.
+///
+/// Both statements run in one transaction because "exactly one active
+/// objective" is the invariant `get_facts` relies on — it reads the newest
+/// active row. A crash between the two would leave either none or two.
+/// Returns the objective it replaced, so the caller can see what it displaced.
+pub fn set_objective(
+    conn: &Connection,
+    session_id: i64,
+    text: &str,
+) -> rusqlite::Result<Option<String>> {
+    let previous = conn
+        .query_row(
+            "SELECT text FROM objectives WHERE session_id = ?1 AND active = 1
+             ORDER BY id DESC LIMIT 1",
+            [session_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE objectives SET active = 0 WHERE session_id = ?1 AND active = 1",
+        [session_id],
+    )?;
+    tx.execute(
+        "INSERT INTO objectives (session_id, text, active) VALUES (?1, ?2, 1)",
+        rusqlite::params![session_id, text],
+    )?;
+    tx.commit()?;
+    Ok(previous)
+}
+
+/// The session row connector tool calls record into.
+///
+/// Fact tables are keyed by session, and the archive's sessions belong to
+/// *Claude Code* transcripts. Filing a connector's decisions under one of
+/// those would attribute them to the wrong agent, so the connector keeps a
+/// session of its own — one row, found or created, never refreshed.
+pub fn connector_session_id(conn: &Connection) -> rusqlite::Result<i64> {
+    if let Some(id) = find_session_by_source(conn, CONNECTOR_SESSION_SOURCE)? {
+        return Ok(id);
+    }
+    conn.execute(
+        "INSERT INTO sessions (agent, source, cwd, source_mtime) VALUES (?1, ?2, NULL, 0)",
+        rusqlite::params!["web-ai", CONNECTOR_SESSION_SOURCE],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// The `sessions.source` marker for the connector's own session. A `source`
+/// that cannot collide with a transcript path: 0005 makes the column UNIQUE,
+/// so this is also what keeps `connector_session_id` single-row.
+pub const CONNECTOR_SESSION_SOURCE: &str = "mcp:connector";
+
+/// One item on the session's task list.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Todo {
+    pub content: String,
+    pub status: String,
+    pub active_form: Option<String>,
+}
+
+/// Replace the whole task list.
+///
+/// Replace, not merge: the caller sends the list it believes in, so a
+/// completed item disappearing is a deliberate act rather than a lost update.
+/// The delete and the inserts share a transaction for the same reason a
+/// half-written list would be worse than either version.
+pub fn replace_todos(
+    conn: &Connection,
+    session_id: i64,
+    todos: &[Todo],
+) -> rusqlite::Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM todos WHERE session_id = ?1", [session_id])?;
+    for (i, t) in todos.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO todos (session_id, position, content, status, active_form)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![session_id, i as i64, t.content, t.status, t.active_form],
+        )?;
+    }
+    tx.commit()?;
+    Ok(todos.len())
+}
+
+/// The session's task list, in the order it was written.
+pub fn read_todos(conn: &Connection, session_id: i64) -> rusqlite::Result<Vec<Todo>> {
+    let mut stmt = conn.prepare(
+        "SELECT content, status, active_form FROM todos
+         WHERE session_id = ?1 ORDER BY position",
+    )?;
+    let rows = stmt.query_map([session_id], |row| {
+        Ok(Todo {
+            content: row.get(0)?,
+            status: row.get(1)?,
+            active_form: row.get(2)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Note that the caller wants to hand back to the developer.
+///
+/// Recorded rather than acted on: the engine has no channel to interrupt the
+/// desktop with, and inventing one here would put a policy decision in a tool.
+/// The row is what the desktop reads to show the request.
+pub fn record_handoff_request(
+    conn: &Connection,
+    session_id: i64,
+    reason: &str,
+    next_step: Option<&str>,
+) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT INTO handoff_requests (session_id, reason, next_step) VALUES (?1, ?2, ?3)",
+        rusqlite::params![session_id, reason, next_step],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,6 +900,124 @@ mod tests {
             conn.execute_batch(sql).unwrap();
         }
         conn
+    }
+
+    /// A newly added migration upgrades a database that already has the older
+    /// ones — the path a real installation takes.
+    ///
+    /// Every test above builds its database from an empty file, so all of them
+    /// apply the migrations in one clean sweep. That is not what happens on a
+    /// developer's machine: their database already exists, already has rows,
+    /// and has already recorded 0001–0005 as applied. This is the only test
+    /// that runs a migration against that, which is why it exists — the
+    /// failure it guards (a migration that assumes an empty table, or one that
+    /// re-runs because the version row was not written) is invisible to every
+    /// other test in this file.
+    #[test]
+    fn the_newest_migration_upgrades_a_populated_database() {
+        let dir = std::env::temp_dir().join(format!("lexsus-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("app.sqlite3");
+
+        // An installed database: every migration but the newest, applied the
+        // way the runner applies them.
+        let (newest, _) = MIGRATIONS.last().expect("at least one migration");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version     TEXT PRIMARY KEY,
+                applied_at  TEXT NOT NULL DEFAULT (datetime('now'))
+             );",
+        )
+        .unwrap();
+        for (version, sql) in MIGRATIONS {
+            if version == newest {
+                break;
+            }
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (version) VALUES (?1)",
+                [version],
+            )
+            .unwrap();
+        }
+        let session = upsert_session(
+            &conn,
+            &NewSession {
+                agent: "claude",
+                source: "/t/old.jsonl",
+                cwd: None,
+                source_mtime: 0,
+                objective: Some("an objective from before the upgrade"),
+            },
+        )
+        .unwrap();
+        // And facts in the tables the new migration does not touch, since a
+        // migration that happened to re-run one of the older steps would show
+        // up here first.
+        set_objective(&conn, session, "a stated objective from before the upgrade").unwrap();
+        record_fact(
+            &conn,
+            session,
+            &Fact::Decision {
+                summary: "decided before the upgrade",
+                reason: None,
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        // The upgrade.
+        let conn = open_and_migrate(&path).unwrap();
+
+        let survived: (String, Option<String>) = conn
+            .query_row(
+                "SELECT agent, objective FROM sessions WHERE id = ?1",
+                [session],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("the upgrade lost the developer's session");
+        assert_eq!(survived.0, "claude");
+        assert_eq!(
+            survived.1.as_deref(),
+            Some("an objective from before the upgrade")
+        );
+        let facts = get_facts(&conn, session).unwrap();
+        assert_eq!(
+            facts.objective.as_deref(),
+            Some("a stated objective from before the upgrade"),
+            "the upgrade dropped a live objective"
+        );
+        assert_eq!(
+            facts.decisions,
+            vec!["decided before the upgrade".to_string()]
+        );
+
+        // The new tables are there and empty, and every version is recorded
+        // exactly once.
+        for table in ["todos", "handoff_requests"] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap_or_else(|e| panic!("{table} does not exist after the upgrade: {e}"));
+            assert_eq!(n, 0, "{table} came up non-empty");
+        }
+        let applied: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(applied as usize, MIGRATIONS.len());
+        drop(conn);
+
+        // And running it again is a no-op — the runner is idempotent, so a
+        // second launch must not re-run the ALTERs in 0005.
+        let conn = open_and_migrate(&path).unwrap();
+        let applied: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(applied as usize, MIGRATIONS.len());
+        drop(conn);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

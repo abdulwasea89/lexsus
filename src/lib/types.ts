@@ -198,6 +198,12 @@ export interface McpStatus {
   allow_write: boolean;
   /** The bound workspace — the connector's whole blast radius. */
   workspace: string | null;
+  /**
+   * Host authorities the endpoint accepts. A tunnel whose host is missing
+   * from this list gets a bare 403, which a remote connector misreads as a
+   * sign-in problem.
+   */
+  allowed_hosts: string[];
 }
 
 // --- failover ----------------------------------------------------------------

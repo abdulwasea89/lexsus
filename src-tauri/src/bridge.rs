@@ -6,14 +6,16 @@
 //! and command execution always require an explicit user approval. All calls
 //! are audited to SQLite.
 
-use crate::{git, pty, shell::Shell};
+use crate::{bgproc, db, git, lsp, media, notebook, pty, shell::Shell, web, AppState};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// One replacement inside a `multi_edit` batch.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -81,19 +83,345 @@ pub enum Tool {
     ReadManyFiles {
         paths: Vec<String>,
     },
+    /// Regex content search over the workspace.
+    ///
+    /// The first tool whose cost is proportional to the tree rather than to
+    /// its arguments, so it is capped by *stopping* the walk rather than by
+    /// truncating what the walk produced.
+    Grep {
+        pattern: String,
+        /// File or directory to search. Absent → the workspace root.
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        include: Option<String>,
+        #[serde(default)]
+        exclude: Option<String>,
+        /// Absent → [`GrepMode::Content`].
+        #[serde(default)]
+        mode: Option<GrepMode>,
+        #[serde(default)]
+        max_results: Option<u32>,
+    },
+    /// Find files whose *path* matches a glob.
+    Glob {
+        pattern: String,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        max_results: Option<u32>,
+    },
     RunCommand {
         command: String,
+    },
+    /// Start a command and return without waiting for it.
+    ///
+    /// `run_command` holds the call open until the command exits, so anything
+    /// meant to keep running — a dev server, a watcher, a tail — cannot be
+    /// started with it without consuming its whole timeout. This is the half
+    /// that hands the caller a handle instead.
+    RunCommandBackground {
+        command: String,
+    },
+    /// Read what a background command has written since a cursor.
+    CommandOutput {
+        /// The handle `run_command_background` returned.
+        id: u64,
+        /// Absolute byte offset to read from. Absent → 0, which is the start
+        /// of what is still kept.
+        #[serde(default)]
+        cursor: Option<u64>,
+    },
+    /// Stop a background command and everything it spawned.
+    KillCommand {
+        id: u64,
     },
     ListDirectory {
         path: String,
     },
     GitStatus,
+    /// Working-tree diff against HEAD (staged + unstaged, untracked included).
+    GitDiff {
+        /// Restrict to one path. Absent → every changed file.
+        #[serde(default)]
+        path: Option<String>,
+    },
+    GitLog {
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+    /// Stage a path, or everything when `path` is absent.
+    GitAdd {
+        #[serde(default)]
+        path: Option<String>,
+    },
+    GitUnstage {
+        path: String,
+    },
+    GitCommit {
+        message: String,
+    },
+    GitBranches,
+    /// Switch branch. Refuses on a dirty tree — never forces.
+    GitCheckout {
+        name: String,
+    },
+    GitCreateBranch {
+        name: String,
+        /// Revision to branch from. Absent → HEAD.
+        #[serde(default)]
+        base: Option<String>,
+        #[serde(default)]
+        checkout: Option<bool>,
+    },
+    /// One commit in full: message, author, and patch.
+    GitShow {
+        oid: String,
+    },
+    /// The patch alone for one commit.
+    GitCommitDiff {
+        oid: String,
+    },
+    /// Replace the session's task list.
+    TodoWrite {
+        todos: Vec<TodoItem>,
+    },
+    /// Read the session's task list back.
+    TodoRead,
+    /// Set the session's objective, retiring the previous one.
+    SetObjective {
+        text: String,
+    },
+    /// Record a decision, and optionally the reason for it.
+    RememberDecision {
+        summary: String,
+        reason: Option<String>,
+    },
+    /// Record a constraint the work has to respect.
+    RememberConstraint {
+        text: String,
+    },
+    /// Record an attempt, so a failed one is not repeated.
+    RememberAttempt {
+        description: String,
+        succeeded: Option<bool>,
+    },
+    /// Read back what a session has recorded.
+    GetFacts {
+        /// Absent → the connector's own session.
+        session_id: Option<i64>,
+    },
+    /// List archived sessions, newest first.
+    ListSessions {
+        limit: Option<u32>,
+    },
+    /// Note that the caller wants to hand back to the developer.
+    RequestHandoff {
+        reason: String,
+        next_step: Option<String>,
+    },
+    /// Pull the handoff card, built from the desktop's live state.
+    GetHandoff,
+
+    // --- Phase 7: web & the long tail -------------------------------------
+    /// Fetch a URL and return it as readable text. SSRF-guarded: the URL is
+    /// planned, every address it resolves to is checked, and each redirect
+    /// hop is re-checked and pinned to the address that was cleared.
+    WebFetch {
+        url: String,
+        /// Read cap in bytes. Absent → the tool's default; clamped to its max.
+        #[serde(default)]
+        max_bytes: Option<u64>,
+    },
+    /// Search the web. The only tool whose result is not local-first, so it
+    /// is the only one that needs to leave the machine besides `web_fetch`.
+    WebSearch {
+        query: String,
+        #[serde(default)]
+        max_results: Option<u32>,
+    },
+    /// Read a Jupyter notebook as structured cells rather than raw JSON.
+    NotebookRead {
+        path: String,
+    },
+    /// Replace one cell's source in a notebook, by `cell_id`.
+    NotebookEdit {
+        path: String,
+        cell_id: String,
+        new_source: String,
+        /// Optional cell type (`code` | `markdown`); absent → unchanged.
+        #[serde(default)]
+        cell_type: Option<String>,
+    },
+    /// Hand a bounded sub-task to a nested agent turn and collect its result.
+    DelegateTask {
+        task: String,
+        #[serde(default)]
+        context: Option<String>,
+    },
+
+    // --- Phase 8: code intelligence (LSP) ---------------------------------
+    /// What is broken in a file (or the workspace) right now.
+    LspDiagnostics {
+        #[serde(default)]
+        path: Option<String>,
+        /// `error` | `warning` | `information` | `hint`; absent → errors and warnings.
+        #[serde(default)]
+        severity: Option<String>,
+    },
+    /// Where a symbol at a position is defined.
+    LspDefinition {
+        path: String,
+        /// 1-based line, matching `read_file`.
+        line: u32,
+        /// 1-based column.
+        character: u32,
+    },
+    /// What else references the symbol at a position — the rename-safety question.
+    LspReferences {
+        path: String,
+        line: u32,
+        character: u32,
+        #[serde(default)]
+        include_declaration: Option<bool>,
+    },
+    /// The symbols in a file, or matching a query across the workspace.
+    LspSymbols {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        query: Option<String>,
+    },
+
+    // --- Phase 9: the agent loop ------------------------------------------
+    /// Ask the developer a structured question and block until they answer.
+    AskUser {
+        question: String,
+        /// 2–4 labelled choices. Empty → free text only.
+        #[serde(default)]
+        options: Vec<String>,
+    },
+    /// Submit a plan and wait for approval before acting on it.
+    ProposePlan {
+        plan: String,
+        #[serde(default)]
+        steps: Vec<String>,
+    },
+    /// Wait for a path to change or a background command to match a pattern.
+    Monitor {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        command_id: Option<u64>,
+        #[serde(default)]
+        pattern: Option<String>,
+        #[serde(default)]
+        timeout_ms: Option<u32>,
+    },
+    /// Raise a desktop notification.
+    Notify {
+        title: String,
+        body: String,
+        /// `info` | `success` | `warning` | `error`; absent → `info`.
+        #[serde(default)]
+        level: Option<String>,
+    },
+
+    // --- Phase 10: isolation & delivery -----------------------------------
+    /// Create a throwaway git worktree and point this session at it.
+    EnterWorktree {
+        /// Directory name; absent → a generated one.
+        #[serde(default)]
+        name: Option<String>,
+    },
+    /// Leave the current worktree, keeping or discarding its changes.
+    ExitWorktree {
+        /// `keep` | `discard`; absent → `keep` (refuses if dirty).
+        #[serde(default)]
+        action: Option<String>,
+    },
+    /// Return an image (or PDF) as a real media block rather than text.
+    ReadMedia {
+        path: String,
+    },
+    /// Hand a file to the user as a first-class artifact.
+    PublishArtifact {
+        path: String,
+        #[serde(default)]
+        title: Option<String>,
+    },
+    /// A structured review result: file, line, severity, claim, evidence.
+    ReportFindings {
+        findings: Vec<Finding>,
+        #[serde(default)]
+        summary: Option<String>,
+    },
+
     /// Meta: the full argument schema for one tool. Needs no project root.
     DescribeTool {
         name: String,
     },
     /// Meta: every available tool, grouped. Needs no project root.
     ListTools,
+}
+
+/// One entry in a session's task list, as it crosses the wire.
+///
+/// Only `content` is required. A model that sends a bare list of strings means
+/// the same thing as one that sends objects with no status, and both mean
+/// "pending" — so the lenient form is the parser's job, and this type records
+/// what actually arrived.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TodoItem {
+    pub content: String,
+    /// `pending` | `in_progress` | `completed`; absent → `pending`.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Present-continuous form for the UI ("Running the tests").
+    #[serde(default)]
+    pub active_form: Option<String>,
+}
+
+/// One entry in a `report_findings` result.
+///
+/// A review is only actionable when each claim names *where* it is and *how
+/// bad* it is, so both are required; `evidence` is the one line that lets the
+/// reader check the claim without re-reading the file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Finding {
+    pub path: String,
+    /// 1-based line the finding is about.
+    pub line: u32,
+    /// `error` | `warning` | `info`.
+    pub severity: String,
+    pub claim: String,
+    #[serde(default)]
+    pub evidence: Option<String>,
+}
+
+/// A card `ask_user` or `propose_plan` puts on the desktop, and the answer.
+///
+/// The same event-plus-blocking-wait shape as an approval, deliberately: the
+/// infrastructure already exists, and a second concurrency model for "block
+/// on a human" would be one more thing to get wrong. `kind` tells the UI
+/// which card to draw — a question with options, or a plan to approve.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QuestionCard {
+    pub id: u64,
+    /// `question` | `plan`.
+    pub kind: String,
+    pub title: String,
+    pub body: String,
+    pub options: Vec<String>,
+    pub source: String,
+}
+
+/// What the desktop sends back for a question card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionAnswer {
+    /// The chosen label, or `None` when the answer was free text.
+    pub option: Option<String>,
+    pub answer: String,
 }
 
 /// When a tool call requires an explicit user decision.
@@ -139,7 +467,17 @@ pub struct ToolSpec {
 
 /// Manifest group order.
 pub const GROUPS: &[&str] = &[
-    "Reading", "Editing", "Commands", "Search", "Git", "Planning", "Meta",
+    "Reading",
+    "Editing",
+    "Commands",
+    "Search",
+    "Git",
+    "Memory",
+    "Planning",
+    "Code",
+    "Web",
+    "Isolation",
+    "Meta",
 ];
 
 /// Caller/transport labels. Recorded in audits and grants, and compared so a
@@ -272,6 +610,42 @@ pub const SPECS: &[ToolSpec] = &[
         group: "Reading",
     },
     ToolSpec {
+        name: "grep",
+        aliases: &[
+            "search",
+            "search_files",
+            "rg",
+            "ripgrep",
+            "search_content",
+            "find_in_files",
+            "grep_search",
+        ],
+        args: "pattern, path?, include?, exclude?, mode?, max_results?",
+        summary: "Search file contents by regex, with glob filters",
+        approval: Approval::SensitivePathOnly,
+        trace_kind: Some("reading"),
+        timeout_ms: 20_000,
+        auto_insert: true,
+        group: "Search",
+    },
+    ToolSpec {
+        name: "glob",
+        aliases: &[
+            "find_files",
+            "file_pattern",
+            "find_by_name",
+            "list_files",
+            "search_files_by_name",
+        ],
+        args: "pattern, path?, max_results?",
+        summary: "Find files by path pattern (* and ** supported)",
+        approval: Approval::SensitivePathOnly,
+        trace_kind: Some("reading"),
+        timeout_ms: 20_000,
+        auto_insert: true,
+        group: "Search",
+    },
+    ToolSpec {
         name: "run_command",
         aliases: &["bash", "shell", "execute", "terminal", "sh"],
         args: "command",
@@ -279,6 +653,45 @@ pub const SPECS: &[ToolSpec] = &[
         approval: Approval::Always,
         trace_kind: Some("running"),
         timeout_ms: 120_000,
+        auto_insert: false,
+        group: "Commands",
+    },
+    ToolSpec {
+        name: "run_command_background",
+        aliases: &["bash_background", "start_command", "run_async", "spawn"],
+        args: "command",
+        summary: "Start a command without waiting for it, and return a handle",
+        approval: Approval::Always,
+        trace_kind: Some("running"),
+        // Short: starting is the fast half. The caller waits for the command
+        // with `command_output`, which has its own timeout.
+        timeout_ms: 20_000,
+        auto_insert: false,
+        group: "Commands",
+    },
+    ToolSpec {
+        name: "command_output",
+        aliases: &["read_output", "command_log", "tail_command", "get_output"],
+        args: "id, cursor?",
+        summary: "Read what a background command has written since a cursor",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 10_000,
+        auto_insert: false,
+        group: "Commands",
+    },
+    ToolSpec {
+        name: "kill_command",
+        aliases: &["stop_command", "kill_background", "command_kill"],
+        args: "id",
+        summary: "Stop a background command and everything it spawned",
+        // Auto, not Always: the user already approved starting this command,
+        // and stopping it is strictly less powerful than that. Making the
+        // stop wait for a card would keep a runaway process alive until
+        // somebody noticed.
+        approval: Approval::Auto,
+        trace_kind: Some("running"),
+        timeout_ms: 20_000,
         auto_insert: false,
         group: "Commands",
     },
@@ -292,6 +705,226 @@ pub const SPECS: &[ToolSpec] = &[
         timeout_ms: 10_000,
         auto_insert: true,
         group: "Git",
+    },
+    ToolSpec {
+        name: "git_diff",
+        aliases: &["diff", "show_changes", "git_d", "uncommitted"],
+        args: "path?",
+        summary: "Show the working-tree diff against HEAD",
+        approval: Approval::SensitivePathOnly,
+        trace_kind: None,
+        timeout_ms: 20_000,
+        auto_insert: true,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_log",
+        aliases: &["log", "history", "git_history", "commits"],
+        args: "limit?",
+        summary: "List recent commits, newest first",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 10_000,
+        auto_insert: true,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_add",
+        aliases: &["stage", "git_stage", "stage_file"],
+        args: "path?",
+        summary: "Stage a path, or everything when path is omitted",
+        approval: Approval::SensitivePathOnly,
+        trace_kind: Some("editing"),
+        timeout_ms: 15_000,
+        auto_insert: false,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_unstage",
+        aliases: &["unstage_file", "git_reset", "unstage_path"],
+        args: "path",
+        summary: "Unstage a path, leaving the working tree untouched",
+        approval: Approval::SensitivePathOnly,
+        trace_kind: Some("editing"),
+        timeout_ms: 15_000,
+        auto_insert: false,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_commit",
+        aliases: &["commit", "git_ci", "create_commit"],
+        args: "message",
+        summary: "Commit the staged changes",
+        approval: Approval::Always,
+        trace_kind: Some("editing"),
+        timeout_ms: 30_000,
+        auto_insert: false,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_branches",
+        aliases: &["branches", "list_branches", "git_branch_list"],
+        args: "",
+        summary: "List branches, marking the current one",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 10_000,
+        auto_insert: true,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_checkout",
+        aliases: &["checkout", "switch_branch", "git_switch"],
+        args: "name",
+        summary: "Switch branch; refuses when the tree has uncommitted changes",
+        approval: Approval::Destructive,
+        trace_kind: Some("editing"),
+        timeout_ms: 30_000,
+        auto_insert: false,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_create_branch",
+        aliases: &["branch", "new_branch", "create_branch"],
+        args: "name, base?, checkout?",
+        summary: "Create a branch, optionally from a revision and checked out",
+        approval: Approval::Always,
+        trace_kind: Some("editing"),
+        timeout_ms: 15_000,
+        auto_insert: false,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_show",
+        aliases: &["show_commit", "git_show_commit", "inspect_commit"],
+        args: "oid",
+        summary: "Show one commit's message, author and patch",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 20_000,
+        auto_insert: true,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "git_commit_diff",
+        aliases: &["commit_diff", "git_diff_commit", "patch_for_commit"],
+        args: "oid",
+        summary: "Show the patch for one commit",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 20_000,
+        auto_insert: true,
+        group: "Git",
+    },
+    ToolSpec {
+        name: "todo_write",
+        aliases: &["todos", "write_todos", "set_todos", "plan_tasks"],
+        args: "todos",
+        summary: "Replace the session's task list",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 5_000,
+        auto_insert: true,
+        group: "Memory",
+    },
+    ToolSpec {
+        name: "todo_read",
+        aliases: &["read_todos", "get_todos", "list_todos"],
+        args: "",
+        summary: "Read the session's task list",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 5_000,
+        auto_insert: true,
+        group: "Memory",
+    },
+    ToolSpec {
+        name: "set_objective",
+        aliases: &["objective", "set_goal", "declare_objective"],
+        args: "text",
+        summary: "Set the objective for this work, retiring the previous one",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 5_000,
+        auto_insert: true,
+        group: "Memory",
+    },
+    ToolSpec {
+        name: "remember_decision",
+        aliases: &["record_decision", "log_decision", "decide"],
+        args: "summary, reason?",
+        summary: "Record a decision, and optionally why it was made",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 5_000,
+        auto_insert: true,
+        group: "Memory",
+    },
+    ToolSpec {
+        name: "remember_constraint",
+        aliases: &["record_constraint", "add_constraint"],
+        args: "text",
+        summary: "Record a constraint the work must respect",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 5_000,
+        auto_insert: true,
+        group: "Memory",
+    },
+    ToolSpec {
+        name: "remember_attempt",
+        aliases: &["record_attempt", "log_attempt", "tried"],
+        args: "description, succeeded?",
+        summary: "Record an attempt, so a failed one is not repeated",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 5_000,
+        auto_insert: true,
+        group: "Memory",
+    },
+    ToolSpec {
+        name: "get_facts",
+        aliases: &["facts", "read_facts", "project_memory", "what_do_you_know"],
+        args: "session_id?",
+        summary: "Read the objective, decisions, constraints and failed attempts",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 5_000,
+        auto_insert: true,
+        group: "Memory",
+    },
+    ToolSpec {
+        name: "list_sessions",
+        aliases: &["sessions", "session_history", "recent_sessions"],
+        args: "limit?",
+        summary: "List archived coding sessions, newest first",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 5_000,
+        auto_insert: true,
+        group: "Memory",
+    },
+    ToolSpec {
+        name: "request_handoff",
+        aliases: &["hand_back", "request_takeover", "ask_for_handoff"],
+        args: "reason, next_step?",
+        summary: "Ask the developer to take over, recording why",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 5_000,
+        auto_insert: true,
+        group: "Memory",
+    },
+    ToolSpec {
+        name: "get_handoff",
+        aliases: &["handoff", "where_were_we", "catch_up", "resume_context"],
+        args: "",
+        summary: "Pull the handoff card: objective, progress, files and next step",
+        approval: Approval::Auto,
+        trace_kind: None,
+        timeout_ms: 10_000,
+        auto_insert: true,
+        group: "Memory",
     },
     ToolSpec {
         name: "describe_tool",
@@ -315,6 +948,208 @@ pub const SPECS: &[ToolSpec] = &[
         auto_insert: true,
         group: "Meta",
     },
+    // --- Phase 7: web & long tail -----------------------------------------
+    ToolSpec {
+        name: "web_fetch",
+        aliases: &["fetch", "fetch_url", "http_get", "read_url"],
+        args: "url, max_bytes?",
+        summary: "Fetch a URL and return its readable text (SSRF-guarded)",
+        approval: Approval::Auto,
+        trace_kind: Some("web"),
+        timeout_ms: 30_000,
+        auto_insert: true,
+        group: "Web",
+    },
+    ToolSpec {
+        name: "web_search",
+        aliases: &["search_web", "google", "search_internet"],
+        args: "query, max_results?",
+        summary: "Search the web and return titled results",
+        approval: Approval::Auto,
+        trace_kind: Some("web"),
+        timeout_ms: 30_000,
+        auto_insert: true,
+        group: "Web",
+    },
+    ToolSpec {
+        name: "notebook_read",
+        aliases: &["read_notebook", "nb_read", "ipynb_read"],
+        args: "path",
+        summary: "Read a Jupyter notebook (.ipynb) as structured cells",
+        approval: Approval::Auto,
+        trace_kind: Some("reading"),
+        timeout_ms: 10_000,
+        auto_insert: true,
+        group: "Reading",
+    },
+    ToolSpec {
+        name: "notebook_edit",
+        aliases: &["edit_notebook", "nb_edit", "ipynb_edit"],
+        args: "path, cell_id, new_source, cell_type?",
+        summary: "Replace one notebook cell's source, by cell_id",
+        approval: Approval::Always,
+        trace_kind: Some("editing"),
+        timeout_ms: 15_000,
+        auto_insert: false,
+        group: "Editing",
+    },
+    ToolSpec {
+        name: "delegate_task",
+        aliases: &["spawn_task", "subtask", "delegate"],
+        args: "task, context?",
+        summary: "Hand a bounded sub-task to a nested agent turn",
+        approval: Approval::Always,
+        trace_kind: Some("agent"),
+        timeout_ms: 30_000,
+        auto_insert: false,
+        group: "Planning",
+    },
+    // --- Phase 8: code intelligence (LSP) ---------------------------------
+    ToolSpec {
+        name: "lsp_diagnostics",
+        aliases: &["diagnostics", "errors", "problems", "lint"],
+        args: "path?, severity?",
+        summary: "Errors and warnings a language server reports right now",
+        approval: Approval::Auto,
+        trace_kind: Some("reading"),
+        timeout_ms: 20_000,
+        auto_insert: true,
+        group: "Code",
+    },
+    ToolSpec {
+        name: "lsp_definition",
+        aliases: &["goto_definition", "definition", "go_to_def"],
+        args: "path, line, character",
+        summary: "Where the symbol at a position is defined",
+        approval: Approval::Auto,
+        trace_kind: Some("reading"),
+        timeout_ms: 20_000,
+        auto_insert: true,
+        group: "Code",
+    },
+    ToolSpec {
+        name: "lsp_references",
+        aliases: &["references", "find_references", "callers"],
+        args: "path, line, character, include_declaration?",
+        summary: "Every place the symbol at a position is referenced",
+        approval: Approval::Auto,
+        trace_kind: Some("reading"),
+        timeout_ms: 20_000,
+        auto_insert: true,
+        group: "Code",
+    },
+    ToolSpec {
+        name: "lsp_symbols",
+        aliases: &["symbols", "document_symbols", "workspace_symbols", "outline"],
+        args: "path?, query?",
+        summary: "Symbols in a file, or matching a query across the workspace",
+        approval: Approval::Auto,
+        trace_kind: Some("reading"),
+        timeout_ms: 20_000,
+        auto_insert: true,
+        group: "Code",
+    },
+    // --- Phase 9: the agent loop ------------------------------------------
+    ToolSpec {
+        name: "ask_user",
+        aliases: &["ask", "question", "clarify"],
+        args: "question, options[]",
+        summary: "Ask the developer a question and wait for the answer",
+        approval: Approval::Auto,
+        trace_kind: Some("planning"),
+        timeout_ms: 300_000,
+        auto_insert: true,
+        group: "Planning",
+    },
+    ToolSpec {
+        name: "propose_plan",
+        aliases: &["plan", "submit_plan", "propose"],
+        args: "plan, steps[]",
+        summary: "Submit a plan and wait for approval before acting",
+        approval: Approval::Always,
+        trace_kind: Some("planning"),
+        timeout_ms: 300_000,
+        auto_insert: true,
+        group: "Planning",
+    },
+    ToolSpec {
+        name: "monitor",
+        aliases: &["watch", "wait_for", "tail"],
+        args: "path?, command_id?, pattern?, timeout_ms?",
+        summary: "Wait for a path to change or a command to match a pattern",
+        approval: Approval::Auto,
+        trace_kind: Some("planning"),
+        timeout_ms: 300_000,
+        auto_insert: true,
+        group: "Planning",
+    },
+    ToolSpec {
+        name: "notify",
+        aliases: &["notification", "alert", "ping"],
+        args: "title, body, level?",
+        summary: "Raise a desktop notification",
+        approval: Approval::Auto,
+        trace_kind: Some("planning"),
+        timeout_ms: 5_000,
+        auto_insert: false,
+        group: "Planning",
+    },
+    // --- Phase 10: isolation & delivery -----------------------------------
+    ToolSpec {
+        name: "enter_worktree",
+        aliases: &["create_worktree", "worktree_enter", "new_worktree"],
+        args: "name?",
+        summary: "Create a throwaway git worktree and work inside it",
+        approval: Approval::Always,
+        trace_kind: Some("editing"),
+        timeout_ms: 30_000,
+        auto_insert: false,
+        group: "Isolation",
+    },
+    ToolSpec {
+        name: "exit_worktree",
+        aliases: &["leave_worktree", "worktree_exit", "remove_worktree"],
+        args: "action?",
+        summary: "Leave the current worktree, keeping or discarding changes",
+        approval: Approval::Always,
+        trace_kind: Some("editing"),
+        timeout_ms: 30_000,
+        auto_insert: false,
+        group: "Isolation",
+    },
+    ToolSpec {
+        name: "read_media",
+        aliases: &["read_image", "view_image", "read_binary"],
+        args: "path",
+        summary: "Return an image or PDF as a real media block, not text",
+        approval: Approval::Auto,
+        trace_kind: Some("reading"),
+        timeout_ms: 15_000,
+        auto_insert: true,
+        group: "Reading",
+    },
+    ToolSpec {
+        name: "publish_artifact",
+        aliases: &["artifact", "send_file", "deliver_file"],
+        args: "path, title?",
+        summary: "Hand a file to the user as a first-class artifact",
+        approval: Approval::Always,
+        trace_kind: Some("editing"),
+        timeout_ms: 15_000,
+        auto_insert: false,
+        group: "Isolation",
+    },
+    ToolSpec {
+        name: "report_findings",
+        aliases: &["findings", "review", "report"],
+        args: "findings[], summary?",
+        summary: "Report a structured code review as actionable findings",
+        approval: Approval::Auto,
+        trace_kind: Some("planning"),
+        timeout_ms: 10_000,
+        auto_insert: true,
+        group: "Planning",
+    },
 ];
 
 /// Canonical name of a tool variant.
@@ -331,8 +1166,51 @@ pub fn tool_name(tool: &Tool) -> &'static str {
         Tool::CreateDirectory { .. } => "create_directory",
         Tool::ReadManyFiles { .. } => "read_many_files",
         Tool::RunCommand { .. } => "run_command",
+        Tool::RunCommandBackground { .. } => "run_command_background",
+        Tool::CommandOutput { .. } => "command_output",
+        Tool::KillCommand { .. } => "kill_command",
         Tool::ListDirectory { .. } => "list_directory",
+        Tool::Grep { .. } => "grep",
+        Tool::Glob { .. } => "glob",
         Tool::GitStatus => "git_status",
+        Tool::GitDiff { .. } => "git_diff",
+        Tool::GitLog { .. } => "git_log",
+        Tool::GitAdd { .. } => "git_add",
+        Tool::GitUnstage { .. } => "git_unstage",
+        Tool::GitCommit { .. } => "git_commit",
+        Tool::GitBranches => "git_branches",
+        Tool::GitCheckout { .. } => "git_checkout",
+        Tool::GitCreateBranch { .. } => "git_create_branch",
+        Tool::GitShow { .. } => "git_show",
+        Tool::GitCommitDiff { .. } => "git_commit_diff",
+        Tool::TodoWrite { .. } => "todo_write",
+        Tool::TodoRead => "todo_read",
+        Tool::SetObjective { .. } => "set_objective",
+        Tool::RememberDecision { .. } => "remember_decision",
+        Tool::RememberConstraint { .. } => "remember_constraint",
+        Tool::RememberAttempt { .. } => "remember_attempt",
+        Tool::GetFacts { .. } => "get_facts",
+        Tool::ListSessions { .. } => "list_sessions",
+        Tool::RequestHandoff { .. } => "request_handoff",
+        Tool::GetHandoff => "get_handoff",
+        Tool::WebFetch { .. } => "web_fetch",
+        Tool::WebSearch { .. } => "web_search",
+        Tool::NotebookRead { .. } => "notebook_read",
+        Tool::NotebookEdit { .. } => "notebook_edit",
+        Tool::DelegateTask { .. } => "delegate_task",
+        Tool::LspDiagnostics { .. } => "lsp_diagnostics",
+        Tool::LspDefinition { .. } => "lsp_definition",
+        Tool::LspReferences { .. } => "lsp_references",
+        Tool::LspSymbols { .. } => "lsp_symbols",
+        Tool::AskUser { .. } => "ask_user",
+        Tool::ProposePlan { .. } => "propose_plan",
+        Tool::Monitor { .. } => "monitor",
+        Tool::Notify { .. } => "notify",
+        Tool::EnterWorktree { .. } => "enter_worktree",
+        Tool::ExitWorktree { .. } => "exit_worktree",
+        Tool::ReadMedia { .. } => "read_media",
+        Tool::PublishArtifact { .. } => "publish_artifact",
+        Tool::ReportFindings { .. } => "report_findings",
         Tool::DescribeTool { .. } => "describe_tool",
         Tool::ListTools => "list_tools",
     }
@@ -478,6 +1356,15 @@ pub fn parse_tool_call(tool_name: &str, args: &serde_json::Value) -> Result<Tool
             .or_else(|| args[key].as_str().and_then(|s| s.trim().parse().ok()))
             .map(|n| n.min(u32::MAX as u64) as u32)
     };
+    // A handle or a cursor: same quoting tolerance as the offsets above, but
+    // the full 64-bit range — a byte offset into a long-running command's
+    // output has no reason to stop at 4 GiB, and truncating one would silently
+    // read from the wrong place.
+    let u64_arg = |key: &str| -> Option<u64> {
+        args[key]
+            .as_u64()
+            .or_else(|| args[key].as_str().and_then(|s| s.trim().parse().ok()))
+    };
     // Bools get the same quoting treatment as offsets.
     let bool_arg = |key: &str| -> Option<bool> {
         args[key].as_bool().or_else(|| {
@@ -500,6 +1387,60 @@ pub fn parse_tool_call(tool_name: &str, args: &serde_json::Value) -> Result<Tool
             serde_json::Value::String(s) => Some(vec![s.clone()]),
             _ => None,
         }
+    };
+    // `mode` arrives as a string; a model may spell it the way the schema
+    // documents it or the way the enum is named in Rust.
+    let grep_mode_arg = |key: &str| -> Option<GrepMode> {
+        match args[key].as_str()?.trim().to_ascii_lowercase().as_str() {
+            "content" | "lines" | "matches" | "grep" => Some(GrepMode::Content),
+            "files_with_matches" | "files" | "paths" | "fileswithmatches" => {
+                Some(GrepMode::FilesWithMatches)
+            }
+            "count" | "counts" => Some(GrepMode::Count),
+            _ => None,
+        }
+    };
+    // A task list arrives as objects, and leniently: a bare string is an item
+    // with no status, and `tasks` is accepted for `todos`. What it must not do
+    // is quietly guess at a status — `normalise_todos` refuses those, after
+    // this has recorded what actually arrived.
+    let todos_arg = |key: &str| -> Result<Vec<TodoItem>, String> {
+        let raw = match args[key]
+            .as_array()
+            .or_else(|| args["tasks"].as_array())
+            .or_else(|| args["items"].as_array())
+        {
+            Some(a) => a,
+            // Required, and refused rather than defaulted. An empty list
+            // clears the task list, so "no list at all" and "an empty list"
+            // must not mean the same thing: one is a caller that forgot, the
+            // other is a deliberate act, and only the caller knows which.
+            None => return Err(format!("missing '{key}' argument")),
+        };
+        raw.iter()
+            .map(|v| match v {
+                serde_json::Value::String(s) => Ok(TodoItem {
+                    content: s.clone(),
+                    status: None,
+                    active_form: None,
+                }),
+                serde_json::Value::Object(o) => {
+                    let content = ["content", "text", "task", "title"]
+                        .iter()
+                        .find_map(|k| o.get(*k).and_then(|v| v.as_str()))
+                        .ok_or("each todo needs a `content` string")?;
+                    Ok(TodoItem {
+                        content: content.to_string(),
+                        status: o.get("status").and_then(|v| v.as_str()).map(str::to_string),
+                        active_form: ["active_form", "activeForm"]
+                            .iter()
+                            .find_map(|k| o.get(*k).and_then(|v| v.as_str()))
+                            .map(str::to_string),
+                    })
+                }
+                _ => Err("each todo must be an object or a string".to_string()),
+            })
+            .collect()
     };
     let edits_arg = |key: &str| -> Result<Vec<Edit>, String> {
         let items = match args.get(key) {
@@ -575,19 +1516,229 @@ pub fn parse_tool_call(tool_name: &str, args: &serde_json::Value) -> Result<Tool
             paths: string_array_arg("paths")
                 .ok_or_else(|| "missing 'paths' argument".to_string())?,
         }),
+        "grep" => Ok(Tool::Grep {
+            pattern: str_arg_any(&["pattern", "query", "regex", "search"])?,
+            // `path` is optional and means "the whole workspace" when absent.
+            path: args["path"].as_str().map(str::to_string),
+            include: str_arg_any(&["include", "glob", "file_pattern"]).ok(),
+            exclude: str_arg_any(&["exclude", "exclude_glob"]).ok(),
+            mode: grep_mode_arg("mode"),
+            max_results: u32_arg("max_results"),
+        }),
+        "glob" => Ok(Tool::Glob {
+            pattern: str_arg_any(&["pattern", "glob", "query"])?,
+            path: args["path"].as_str().map(str::to_string),
+            max_results: u32_arg("max_results"),
+        }),
         "run_command" => Ok(Tool::RunCommand {
             command: str_arg("command")?,
+        }),
+        "run_command_background" => Ok(Tool::RunCommandBackground {
+            command: str_arg_any(&["command", "cmd", "script"])?,
+        }),
+        "command_output" => Ok(Tool::CommandOutput {
+            // Required: a read has to say which command it is reading. There
+            // is no "the one you meant" that is not a guess, and guessing
+            // wrong reads a different process's output as though it were the
+            // one asked for.
+            id: u64_arg("id").ok_or("missing 'id' argument")?,
+            cursor: u64_arg("cursor"),
+        }),
+        "kill_command" => Ok(Tool::KillCommand {
+            id: u64_arg("id").ok_or("missing 'id' argument")?,
         }),
         "list_directory" => Ok(Tool::ListDirectory {
             path: str_arg("path")?,
         }),
         "git_status" => Ok(Tool::GitStatus),
+        "git_diff" => Ok(Tool::GitDiff {
+            path: args["path"].as_str().map(str::to_string),
+        }),
+        "git_log" => Ok(Tool::GitLog {
+            limit: u32_arg("limit"),
+        }),
+        "git_add" => Ok(Tool::GitAdd {
+            path: args["path"].as_str().map(str::to_string),
+        }),
+        "git_unstage" => Ok(Tool::GitUnstage {
+            path: str_arg("path")?,
+        }),
+        "git_commit" => Ok(Tool::GitCommit {
+            message: str_arg_any(&["message", "commit_message", "summary", "subject"])?,
+        }),
+        "git_branches" => Ok(Tool::GitBranches),
+        "git_checkout" => Ok(Tool::GitCheckout {
+            name: str_arg_any(&["name", "branch", "branch_name"])?,
+        }),
+        "git_create_branch" => Ok(Tool::GitCreateBranch {
+            name: str_arg_any(&["name", "branch", "branch_name"])?,
+            base: args["base"]
+                .as_str()
+                .or_else(|| args["from"].as_str())
+                .map(str::to_string),
+            checkout: bool_arg("checkout"),
+        }),
+        "git_show" => Ok(Tool::GitShow {
+            oid: str_arg_any(&["oid", "commit", "sha", "ref"])?,
+        }),
+        "git_commit_diff" => Ok(Tool::GitCommitDiff {
+            oid: str_arg_any(&["oid", "commit", "sha", "ref"])?,
+        }),
+        "todo_write" => Ok(Tool::TodoWrite {
+            todos: todos_arg("todos")?,
+        }),
+        "todo_read" => Ok(Tool::TodoRead),
+        "set_objective" => Ok(Tool::SetObjective {
+            text: str_arg_any(&["text", "objective", "goal"])?,
+        }),
+        "remember_decision" => Ok(Tool::RememberDecision {
+            summary: str_arg_any(&["summary", "decision", "text"])?,
+            reason: str_arg_any(&["reason", "why"]).ok(),
+        }),
+        "remember_constraint" => Ok(Tool::RememberConstraint {
+            text: str_arg_any(&["text", "constraint", "summary"])?,
+        }),
+        "remember_attempt" => Ok(Tool::RememberAttempt {
+            description: str_arg_any(&["description", "attempt", "text"])?,
+            succeeded: args["succeeded"].as_bool(),
+        }),
+        "get_facts" => Ok(Tool::GetFacts {
+            session_id: args["session_id"].as_i64(),
+        }),
+        "list_sessions" => Ok(Tool::ListSessions {
+            limit: u32_arg("limit"),
+        }),
+        "request_handoff" => Ok(Tool::RequestHandoff {
+            reason: str_arg_any(&["reason", "why", "summary"])?,
+            next_step: str_arg_any(&["next_step", "next"]).ok(),
+        }),
+        "get_handoff" => Ok(Tool::GetHandoff),
         "describe_tool" => Ok(Tool::DescribeTool {
             name: str_arg("name")?,
         }),
         "list_tools" => Ok(Tool::ListTools),
+        "web_fetch" => Ok(Tool::WebFetch {
+            url: str_arg_any(&["url", "link", "href"])?,
+            max_bytes: u64_arg("max_bytes"),
+        }),
+        "web_search" => Ok(Tool::WebSearch {
+            query: str_arg_any(&["query", "q", "search", "text"])?,
+            max_results: u32_arg("max_results"),
+        }),
+        "notebook_read" => Ok(Tool::NotebookRead {
+            path: str_arg("path")?,
+        }),
+        "notebook_edit" => Ok(Tool::NotebookEdit {
+            path: str_arg("path")?,
+            cell_id: str_arg_any(&["cell_id", "cell", "id"])?,
+            new_source: str_arg_any(&["new_source", "source", "content", "code"])?,
+            cell_type: str_arg_any(&["cell_type", "type"]).ok(),
+        }),
+        "delegate_task" => Ok(Tool::DelegateTask {
+            task: str_arg_any(&["task", "prompt", "description"])?,
+            context: str_arg_any(&["context", "background"]).ok(),
+        }),
+        "lsp_diagnostics" => Ok(Tool::LspDiagnostics {
+            path: args["path"].as_str().map(str::to_string),
+            severity: str_arg_any(&["severity", "level"]).ok(),
+        }),
+        "lsp_definition" => Ok(Tool::LspDefinition {
+            path: str_arg("path")?,
+            line: u32_arg("line").ok_or("missing 'line' argument")?,
+            character: u32_arg("character").ok_or("missing 'character' argument")?,
+        }),
+        "lsp_references" => Ok(Tool::LspReferences {
+            path: str_arg("path")?,
+            line: u32_arg("line").ok_or("missing 'line' argument")?,
+            character: u32_arg("character").ok_or("missing 'character' argument")?,
+            include_declaration: bool_arg("include_declaration"),
+        }),
+        "lsp_symbols" => Ok(Tool::LspSymbols {
+            path: args["path"].as_str().map(str::to_string),
+            query: str_arg_any(&["query", "q", "name"]).ok(),
+        }),
+        "ask_user" => Ok(Tool::AskUser {
+            question: str_arg_any(&["question", "prompt", "text"])?,
+            options: string_array_arg("options").unwrap_or_default(),
+        }),
+        "propose_plan" => Ok(Tool::ProposePlan {
+            plan: str_arg_any(&["plan", "text", "summary"])?,
+            steps: string_array_arg("steps").unwrap_or_default(),
+        }),
+        "monitor" => Ok(Tool::Monitor {
+            path: args["path"].as_str().map(str::to_string),
+            command_id: u64_arg("command_id"),
+            pattern: str_arg_any(&["pattern", "match", "regex"]).ok(),
+            timeout_ms: u32_arg("timeout_ms"),
+        }),
+        "notify" => Ok(Tool::Notify {
+            title: str_arg_any(&["title", "heading"])?,
+            body: str_arg_any(&["body", "message", "text"])?,
+            level: str_arg_any(&["level", "severity"]).ok(),
+        }),
+        "enter_worktree" => Ok(Tool::EnterWorktree {
+            name: str_arg_any(&["name", "branch", "dir"]).ok(),
+        }),
+        "exit_worktree" => Ok(Tool::ExitWorktree {
+            action: str_arg_any(&["action", "mode"]).ok(),
+        }),
+        "read_media" => Ok(Tool::ReadMedia {
+            path: str_arg("path")?,
+        }),
+        "publish_artifact" => Ok(Tool::PublishArtifact {
+            path: str_arg("path")?,
+            title: str_arg_any(&["title", "name"]).ok(),
+        }),
+        "report_findings" => Ok(Tool::ReportFindings {
+            findings: findings_arg(args)?,
+            summary: str_arg_any(&["summary", "overview"]).ok(),
+        }),
         other => Err(format!("tool not implemented: {other}")),
     }
+}
+
+/// Parse a `report_findings` list leniently but not silently.
+///
+/// `severity` is folded to the three levels the renderer understands; an
+/// unrecognised one is refused rather than downgraded, because a review that
+/// says `severity: "blocker"` and is rendered as `info` has lost the one
+/// thing the reader needed.
+fn findings_arg(args: &serde_json::Value) -> Result<Vec<Finding>, String> {
+    let items = args["findings"]
+        .as_array()
+        .ok_or("missing 'findings' argument")?;
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let path = item["path"].as_str().ok_or("a finding is missing 'path'")?;
+        let line = item["line"]
+            .as_u64()
+            .or_else(|| item["line"].as_str().and_then(|s| s.trim().parse().ok()))
+            .ok_or("a finding is missing 'line'")?;
+        let severity = match item["severity"]
+            .as_str()
+            .unwrap_or("warning")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "error" | "err" | "high" => "error",
+            "warning" | "warn" | "medium" => "warning",
+            "info" | "information" | "low" | "note" => "info",
+            other => return Err(format!("unknown finding severity: {other}")),
+        };
+        let claim = item["claim"]
+            .as_str()
+            .or_else(|| item["message"].as_str())
+            .ok_or("a finding is missing 'claim'")?;
+        out.push(Finding {
+            path: path.to_string(),
+            line: line.min(u32::MAX as u64) as u32,
+            severity: severity.to_string(),
+            claim: claim.to_string(),
+            evidence: item["evidence"].as_str().map(str::to_string),
+        });
+    }
+    Ok(out)
 }
 
 /// JSON Schema (object form) for one tool's arguments — the source for the
@@ -705,6 +1856,33 @@ pub fn tool_input_schema(tool_name: &str) -> Option<serde_json::Value> {
             "required": ["paths"],
             "additionalProperties": false
         }),
+        "grep" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string", "description": "Regular expression to search for" },
+                "path": { "type": "string", "description": "File or directory to search, relative to the workspace (default: the whole workspace)" },
+                "include": { "type": "string", "description": "Only search files whose path matches this glob, e.g. '*.rs'" },
+                "exclude": { "type": "string", "description": "Skip files whose path matches this glob, e.g. '*.min.js'" },
+                "mode": {
+                    "type": "string",
+                    "enum": ["content", "files_with_matches", "count"],
+                    "description": "content = matching lines (default), files_with_matches = paths only, count = matches per file"
+                },
+                "max_results": { "type": "integer", "description": "Stop after this many matches (default 200, and 200 is the ceiling)" }
+            },
+            "required": ["pattern"],
+            "additionalProperties": false
+        }),
+        "glob" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string", "description": "Glob to match paths against, e.g. '**/*.rs' or '*.md'" },
+                "path": { "type": "string", "description": "Directory to search under (default: the whole workspace)" },
+                "max_results": { "type": "integer", "description": "Stop after this many paths (default 500, and 500 is the ceiling)" }
+            },
+            "required": ["pattern"],
+            "additionalProperties": false
+        }),
         "run_command" => serde_json::json!({
             "type": "object",
             "properties": {
@@ -713,7 +1891,211 @@ pub fn tool_input_schema(tool_name: &str) -> Option<serde_json::Value> {
             "required": ["command"],
             "additionalProperties": false
         }),
+        "run_command_background" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string", "description": "Shell command, run in the project root and left running" }
+            },
+            "required": ["command"],
+            "additionalProperties": false
+        }),
+        "command_output" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "integer", "description": "Handle from run_command_background" },
+                "cursor": {
+                    "type": "integer",
+                    "description": "Byte offset from a previous read's next_cursor; absent → from the start of what is kept"
+                }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        }),
+        "kill_command" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "integer", "description": "Handle from run_command_background" }
+            },
+            "required": ["id"],
+            "additionalProperties": false
+        }),
         "git_status" => serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+        "git_diff" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Restrict the diff to one path (default: every changed file)" }
+            },
+            "required": [],
+            "additionalProperties": false
+        }),
+        "git_log" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": { "type": "integer", "description": "How many commits to list (default 20, 200 maximum)" }
+            },
+            "required": [],
+            "additionalProperties": false
+        }),
+        "git_add" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Path to stage; omit to stage every change" }
+            },
+            "required": [],
+            "additionalProperties": false
+        }),
+        "git_unstage" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Path to unstage; the working tree is left alone" }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        "git_commit" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "message": { "type": "string", "description": "Commit message; the first line is the subject" }
+            },
+            "required": ["message"],
+            "additionalProperties": false
+        }),
+        "git_branches" => serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+        "git_checkout" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Branch to switch to (local branches only)" }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        }),
+        "git_create_branch" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Name of the new branch" },
+                "base": { "type": "string", "description": "Revision to branch from (default: HEAD)" },
+                "checkout": { "type": "boolean", "description": "Switch to it after creating (default false)" }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        }),
+        "git_show" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "oid": { "type": "string", "description": "Commit id or revision, e.g. 'HEAD~1'" }
+            },
+            "required": ["oid"],
+            "additionalProperties": false
+        }),
+        "git_commit_diff" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "oid": { "type": "string", "description": "Commit id or revision" }
+            },
+            "required": ["oid"],
+            "additionalProperties": false
+        }),
+        "todo_write" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "description": "The complete list, in order. It replaces the previous list.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": { "type": "string", "description": "What the task is" },
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"],
+                                "description": "Defaults to pending"
+                            },
+                            "active_form": { "type": "string", "description": "Present-continuous form for the UI, e.g. 'Running the tests'" }
+                        },
+                        "required": ["content"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["todos"],
+            "additionalProperties": false
+        }),
+        "todo_read" => serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+        "set_objective" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "text": { "type": "string", "description": "What this work is trying to achieve" }
+            },
+            "required": ["text"],
+            "additionalProperties": false
+        }),
+        "remember_decision" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "summary": { "type": "string", "description": "The decision, in one line" },
+                "reason": { "type": "string", "description": "Why it was chosen — the part a future reader cannot reconstruct" }
+            },
+            "required": ["summary"],
+            "additionalProperties": false
+        }),
+        "remember_constraint" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "text": { "type": "string", "description": "The constraint, e.g. 'must run on Python 3.9'" }
+            },
+            "required": ["text"],
+            "additionalProperties": false
+        }),
+        "remember_attempt" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "description": { "type": "string", "description": "What was tried" },
+                "succeeded": { "type": "boolean", "description": "Whether it worked; only failures are surfaced in the handoff" }
+            },
+            "required": ["description"],
+            "additionalProperties": false
+        }),
+        "get_facts" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "session_id": { "type": "integer", "description": "Which session to read (default: the connector's own; see list_sessions)" }
+            },
+            "required": [],
+            "additionalProperties": false
+        }),
+        "list_sessions" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": { "type": "integer", "description": "How many sessions (default 20, 100 maximum)" }
+            },
+            "required": [],
+            "additionalProperties": false
+        }),
+        "request_handoff" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "reason": { "type": "string", "description": "Why the developer is needed" },
+                "next_step": { "type": "string", "description": "What they should do first" }
+            },
+            "required": ["reason"],
+            "additionalProperties": false
+        }),
+        "get_handoff" => serde_json::json!({
             "type": "object",
             "properties": {},
             "required": [],
@@ -731,6 +2113,184 @@ pub fn tool_input_schema(tool_name: &str) -> Option<serde_json::Value> {
             "type": "object",
             "properties": {},
             "required": [],
+            "additionalProperties": false
+        }),
+        "web_fetch" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "Absolute http(s) URL to fetch" },
+                "max_bytes": { "type": "integer", "description": "Read cap in bytes (clamped to the tool's maximum)" }
+            },
+            "required": ["url"],
+            "additionalProperties": false
+        }),
+        "web_search" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Search query" },
+                "max_results": { "type": "integer", "description": "How many results (default 8, 20 maximum)" }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        }),
+        "notebook_read" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": ".ipynb file to read" }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        "notebook_edit" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": ".ipynb file to edit" },
+                "cell_id": { "type": "string", "description": "The cell's id (as returned by notebook_read)" },
+                "new_source": { "type": "string", "description": "Replacement source for the cell" },
+                "cell_type": { "type": "string", "enum": ["code", "markdown"], "description": "Change the cell type; absent → unchanged" }
+            },
+            "required": ["path", "cell_id", "new_source"],
+            "additionalProperties": false
+        }),
+        "delegate_task" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task": { "type": "string", "description": "The sub-task to hand off" },
+                "context": { "type": "string", "description": "Context the sub-task needs" }
+            },
+            "required": ["task"],
+            "additionalProperties": false
+        }),
+        "lsp_diagnostics" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File to check (default: every file the server has opened)" },
+                "severity": { "type": "string", "enum": ["error", "warning", "information", "hint"], "description": "Minimum severity to report (default: error and warning)" }
+            },
+            "required": [],
+            "additionalProperties": false
+        }),
+        "lsp_definition" | "lsp_references" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File the position is in" },
+                "line": { "type": "integer", "minimum": 1, "description": "1-based line" },
+                "character": { "type": "integer", "minimum": 1, "description": "1-based column" },
+                "include_declaration": { "type": "boolean", "description": "references only: include the declaration itself (default true)" }
+            },
+            "required": ["path", "line", "character"],
+            "additionalProperties": false
+        }),
+        "lsp_symbols" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Document to outline; absent → search the workspace" },
+                "query": { "type": "string", "description": "Workspace symbols matching this query" }
+            },
+            "required": [],
+            "additionalProperties": false
+        }),
+        "ask_user" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "question": { "type": "string", "description": "The question to put to the developer" },
+                "options": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "2–4 labelled choices; empty means a free-text answer"
+                }
+            },
+            "required": ["question"],
+            "additionalProperties": false
+        }),
+        "propose_plan" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "plan": { "type": "string", "description": "What you intend to do, in prose" },
+                "steps": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "The discrete steps, in order"
+                }
+            },
+            "required": ["plan"],
+            "additionalProperties": false
+        }),
+        "monitor" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File or directory to watch for changes" },
+                "command_id": { "type": "integer", "description": "Background command whose output to watch" },
+                "pattern": { "type": "string", "description": "Regular expression the new output or path must match" },
+                "timeout_ms": { "type": "integer", "description": "How long to wait before giving up (default 60000)" }
+            },
+            "required": [],
+            "additionalProperties": false
+        }),
+        "notify" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "title": { "type": "string", "description": "Notification title" },
+                "body": { "type": "string", "description": "Notification body" },
+                "level": { "type": "string", "enum": ["info", "success", "warning", "error"], "description": "Severity (default info)" }
+            },
+            "required": ["title", "body"],
+            "additionalProperties": false
+        }),
+        "enter_worktree" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Worktree directory name (default: a generated one)" }
+            },
+            "required": [],
+            "additionalProperties": false
+        }),
+        "exit_worktree" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["keep", "discard"], "description": "keep (default, refuses if dirty) or discard" }
+            },
+            "required": [],
+            "additionalProperties": false
+        }),
+        "read_media" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Image or PDF file to return as media" }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        "publish_artifact" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "File to hand to the user" },
+                "title": { "type": "string", "description": "Display title for the artifact" }
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        "report_findings" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "summary": { "type": "string", "description": "One-line summary of the review" },
+                "findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "line": { "type": "integer", "minimum": 1 },
+                            "severity": { "type": "string", "enum": ["error", "warning", "info"] },
+                            "claim": { "type": "string" },
+                            "evidence": { "type": "string" }
+                        },
+                        "required": ["path", "line", "severity", "claim"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["findings"],
             "additionalProperties": false
         }),
         _ => return None,
@@ -800,6 +2360,80 @@ pub fn output_schema(tool_name: &str) -> Option<serde_json::Value> {
                 }
             },
             "required": ["requested", "shown", "files"],
+            "additionalProperties": false
+        }),
+        "grep" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["content", "files_with_matches", "count"],
+                    "description": "Which output shape was produced"
+                },
+                "matches": {
+                    "type": "array",
+                    "description": "Matching lines — populated in content mode, empty otherwise",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Workspace-relative path" },
+                            "line": { "type": "integer", "description": "1-based line number" },
+                            "text": { "type": "string", "description": "The matching line, clipped to 400 characters" }
+                        },
+                        "required": ["path", "line", "text"],
+                        "additionalProperties": false
+                    }
+                },
+                "files": {
+                    "type": "array",
+                    "description": "Files with at least one match — populated in files_with_matches and count modes",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Workspace-relative path" },
+                            "count": { "type": "integer", "description": "Matching lines in that file" }
+                        },
+                        "required": ["path", "count"],
+                        "additionalProperties": false
+                    }
+                },
+                "scanned": { "type": "integer", "description": "Files actually read" },
+                "truncated": {
+                    "type": "boolean",
+                    "description": "True when the result cap stopped the search before the tree was exhausted"
+                },
+                "failures": {
+                    "type": "array",
+                    "description": "Paths that could not be searched; the walk continued past them",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "reason": { "type": "string", "description": "Why it could not be read" }
+                        },
+                        "required": ["path", "reason"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["mode", "matches", "files", "scanned", "truncated", "failures"],
+            "additionalProperties": false
+        }),
+        "glob" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Workspace-relative paths that matched"
+                },
+                "scanned": { "type": "integer", "description": "Files examined" },
+                "truncated": {
+                    "type": "boolean",
+                    "description": "True when the result cap stopped the walk before the tree was exhausted"
+                }
+            },
+            "required": ["paths", "scanned", "truncated"],
             "additionalProperties": false
         }),
         "list_directory" => serde_json::json!({
@@ -945,6 +2579,69 @@ pub fn output_schema(tool_name: &str) -> Option<serde_json::Value> {
             "required": ["command", "exit_code", "timed_out", "truncated"],
             "additionalProperties": false
         }),
+        "run_command_background" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "integer", "description": "Handle for command_output and kill_command" },
+                "pid": { "type": ["integer", "null"] },
+                "command": { "type": "string" }
+            },
+            "required": ["id", "pid", "command"],
+            "additionalProperties": false
+        }),
+        "command_output" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "integer" },
+                "status": {
+                    "type": "string",
+                    "enum": ["running", "exited", "killed", "failed"],
+                    "description": "How the command is doing: killed = stopped by kill_command"
+                },
+                "exit_code": {
+                    "type": ["integer", "null"],
+                    "description": "Process exit status; null while running, and for a command the runtime never started"
+                },
+                "cursor": { "type": "integer", "description": "Where this read started" },
+                "next_cursor": {
+                    "type": "integer",
+                    "description": "Pass back as `cursor` to read only what is new"
+                },
+                "lost": {
+                    "type": "boolean",
+                    "description": "Output was dropped before you read it — the command outran what is kept"
+                },
+                "more": { "type": "boolean", "description": "Output is waiting past this read" },
+                "complete": {
+                    "type": "boolean",
+                    "description": "Ended and fully drained; false while output may still be arriving"
+                },
+                "elapsed_ms": { "type": "integer" }
+            },
+            "required": [
+                "id", "status", "exit_code", "cursor", "next_cursor",
+                "lost", "more", "complete", "elapsed_ms"
+            ],
+            "additionalProperties": false
+        }),
+        "kill_command" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "integer" },
+                "status": {
+                    "type": "string",
+                    "enum": ["running", "exited", "killed", "failed"],
+                    "description": "How the command ended"
+                },
+                "exit_code": { "type": ["integer", "null"] },
+                "already_finished": {
+                    "type": "boolean",
+                    "description": "True when it had stopped on its own, so nothing was signalled"
+                }
+            },
+            "required": ["id", "status", "exit_code", "already_finished"],
+            "additionalProperties": false
+        }),
         "list_tools" => serde_json::json!({
             "type": "object",
             "properties": {
@@ -957,6 +2654,232 @@ pub fn output_schema(tool_name: &str) -> Option<serde_json::Value> {
             "required": ["tools"],
             "additionalProperties": false
         }),
+        "git_diff" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "count": { "type": "integer", "description": "Changed files reported" },
+                "truncated": { "type": "boolean", "description": "True when a patch was omitted for size" },
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Workspace-relative path" },
+                            "status": { "type": "string", "description": "untracked | modified | deleted | renamed" },
+                            "added": { "type": "integer", "description": "Lines added" },
+                            "deleted": { "type": "integer", "description": "Lines deleted" },
+                            "patch": { "type": "string", "description": "Unified diff; empty when omitted for size" },
+                            "patch_omitted": { "type": "boolean", "description": "True when the patch did not fit the result budget" }
+                        },
+                        "required": ["path", "status", "added", "deleted", "patch", "patch_omitted"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["count", "truncated", "files"],
+            "additionalProperties": false
+        }),
+        "git_log" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "count": { "type": "integer", "description": "Commits returned" },
+                "commits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "oid": { "type": "string", "description": "Full commit id" },
+                            "summary": { "type": "string", "description": "First line of the message" },
+                            "author": { "type": "string" },
+                            "timestamp": { "type": "integer", "description": "Unix seconds" }
+                        },
+                        "required": ["oid", "summary", "author", "timestamp"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["count", "commits"],
+            "additionalProperties": false
+        }),
+        "git_branches" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "current": { "type": ["string", "null"], "description": "Checked-out branch, null when detached" },
+                "count": { "type": "integer" },
+                "branches": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "is_current": { "type": "boolean" }
+                        },
+                        "required": ["name", "is_current"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["current", "count", "branches"],
+            "additionalProperties": false
+        }),
+        "git_add" | "git_unstage" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "scoped_to": { "type": ["string", "null"], "description": "The path acted on; null means every change" }
+            },
+            "required": ["scoped_to"],
+            "additionalProperties": false
+        }),
+        "git_commit" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "oid": { "type": "string", "description": "The new commit's id" },
+                "summary": { "type": "string", "description": "First line of the message" }
+            },
+            "required": ["oid", "summary"],
+            "additionalProperties": false
+        }),
+        "git_checkout" | "git_create_branch" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "branch": { "type": "string", "description": "The branch that was switched to or created" },
+                "created": { "type": "boolean", "description": "True when this call created it" },
+                "checked_out": { "type": "boolean", "description": "True when it is now the current branch" }
+            },
+            "required": ["branch", "created", "checked_out"],
+            "additionalProperties": false
+        }),
+        "git_show" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "oid": { "type": "string" },
+                "summary": { "type": "string", "description": "First line of the message" },
+                "author": { "type": "string" },
+                "email": { "type": ["string", "null"] },
+                "timestamp": { "type": "integer", "description": "Unix seconds" },
+                "patch": { "type": "string", "description": "Unified diff against the parent; empty when omitted for size" },
+                "patch_omitted": { "type": "boolean" }
+            },
+            "required": ["oid", "summary", "author", "email", "timestamp", "patch", "patch_omitted"],
+            "additionalProperties": false
+        }),
+        "git_commit_diff" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "oid": { "type": "string" },
+                "patch": { "type": "string", "description": "Unified diff against the parent; empty when omitted for size" },
+                "patch_omitted": { "type": "boolean" }
+            },
+            "required": ["oid", "patch", "patch_omitted"],
+            "additionalProperties": false
+        }),
+        "todo_write" | "todo_read" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "count": { "type": "integer", "description": "Items in the list" },
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": { "type": "string" },
+                            "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] },
+                            "active_form": { "type": ["string", "null"] }
+                        },
+                        "required": ["content", "status", "active_form"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["count", "todos"],
+            "additionalProperties": false
+        }),
+        "set_objective" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "objective": { "type": "string", "description": "The objective now in force" },
+                "previous": { "type": ["string", "null"], "description": "What it replaced, if anything" }
+            },
+            "required": ["objective", "previous"],
+            "additionalProperties": false
+        }),
+        "remember_decision" | "remember_constraint" | "remember_attempt" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "integer", "description": "Row id of the recorded fact" },
+                "kind": { "type": "string", "enum": ["decision", "constraint", "attempt"] },
+                "session_id": { "type": "integer" }
+            },
+            "required": ["id", "kind", "session_id"],
+            "additionalProperties": false
+        }),
+        "get_facts" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "session_id": { "type": "integer", "description": "The session that was read" },
+                "objective": { "type": ["string", "null"] },
+                "progress_percent": { "type": "integer" },
+                "decisions": { "type": "array", "items": { "type": "string" } },
+                "failed_attempts": { "type": "array", "items": { "type": "string" } },
+                "constraints": { "type": "array", "items": { "type": "string" } },
+                "changed_files": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": [
+                "session_id", "objective", "progress_percent", "decisions",
+                "failed_attempts", "constraints", "changed_files"
+            ],
+            "additionalProperties": false
+        }),
+        "list_sessions" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "count": { "type": "integer" },
+                "sessions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "integer" },
+                            "agent": { "type": "string" },
+                            "objective": { "type": ["string", "null"] },
+                            "started_at": { "type": "string" },
+                            "events": { "type": "integer" }
+                        },
+                        "required": ["id", "agent", "objective", "started_at", "events"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["count", "sessions"],
+            "additionalProperties": false
+        }),
+        "request_handoff" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "integer", "description": "Row id of the request" },
+                "objective": { "type": ["string", "null"], "description": "The objective in force when it was made" }
+            },
+            "required": ["id", "objective"],
+            "additionalProperties": false
+        }),
+        "get_handoff" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "objective": { "type": "string" },
+                "progress_percent": { "type": "integer" },
+                "files_changed": { "type": "integer" },
+                "errors_remaining": { "type": "integer" },
+                "next_step": { "type": ["string", "null"] },
+                "files": { "type": "array", "items": { "type": "string" } },
+                "context": { "type": ["string", "null"] },
+                "end_reason": { "type": ["string", "null"] },
+                "decisions": { "type": "array", "items": { "type": "string" } },
+                "failed_attempts": { "type": "array", "items": { "type": "string" } },
+                "constraints": { "type": "array", "items": { "type": "string" } },
+                "generated_at": { "type": "string" }
+            },
+            "additionalProperties": false
+        }),
         "describe_tool" => serde_json::json!({
             "type": "object",
             "properties": {
@@ -966,6 +2889,265 @@ pub fn output_schema(tool_name: &str) -> Option<serde_json::Value> {
                 "approval": { "type": "string", "description": "When the desktop app must approve this tool" }
             },
             "required": ["name", "summary", "args", "approval"],
+            "additionalProperties": false
+        }),
+        "web_fetch" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "The URL the bytes actually came from (after redirects)" },
+                "status": { "type": "integer", "description": "HTTP status code" },
+                "content_type": { "type": "string" },
+                "bytes": { "type": "integer", "description": "Body bytes read before text reduction" },
+                "truncated": { "type": "boolean" },
+                "reduced_html": { "type": "boolean", "description": "True when the body was HTML and was reduced to text" },
+                "redirects": { "type": "array", "items": { "type": "string" } }
+            },
+            "required": ["url", "status", "content_type", "bytes", "truncated", "reduced_html", "redirects"],
+            "additionalProperties": false
+        }),
+        "web_search" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string" },
+                "results": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": { "type": "string" },
+                            "url": { "type": "string" },
+                            "snippet": { "type": "string" }
+                        },
+                        "required": ["title", "url", "snippet"],
+                        "additionalProperties": false
+                    }
+                },
+                "truncated": { "type": "boolean" }
+            },
+            "required": ["query", "results", "truncated"],
+            "additionalProperties": false
+        }),
+        "notebook_read" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "kernel": { "type": ["string", "null"] },
+                "cells": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "cell_id": { "type": "string" },
+                            "cell_type": { "type": "string" },
+                            "source": { "type": "string" },
+                            "outputs": { "type": "integer" }
+                        },
+                        "required": ["cell_id", "cell_type", "source", "outputs"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["path", "kernel", "cells"],
+            "additionalProperties": false
+        }),
+        "notebook_edit" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "cell_id": { "type": "string" },
+                "cell_type": { "type": "string" },
+                "bytes_written": { "type": "integer" }
+            },
+            "required": ["path", "cell_id", "cell_type", "bytes_written"],
+            "additionalProperties": false
+        }),
+        "delegate_task" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task": { "type": "string" },
+                "accepted": { "type": "boolean" },
+                "token": { "type": ["string", "null"], "description": "Handle the parent can poll for the result" },
+                "note": { "type": "string" }
+            },
+            "required": ["task", "accepted", "token", "note"],
+            "additionalProperties": false
+        }),
+        "lsp_diagnostics" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "server": { "type": ["string", "null"], "description": "Language server that answered, or null when none is available" },
+                "scanned": { "type": "integer", "description": "Files checked" },
+                "diagnostics": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "line": { "type": "integer" },
+                            "character": { "type": "integer" },
+                            "severity": { "type": "string" },
+                            "message": { "type": "string" },
+                            "source": { "type": "string" }
+                        },
+                        "required": ["path", "line", "character", "severity", "message", "source"],
+                        "additionalProperties": false
+                    }
+                },
+                "truncated": { "type": "boolean" },
+                "unavailable": { "type": "boolean", "description": "True when no server for this project could be started" }
+            },
+            "required": ["server", "scanned", "diagnostics", "truncated", "unavailable"],
+            "additionalProperties": false
+        }),
+        "lsp_definition" | "lsp_references" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "server": { "type": ["string", "null"] },
+                "locations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "line": { "type": "integer" },
+                            "character": { "type": "integer" }
+                        },
+                        "required": ["path", "line", "character"],
+                        "additionalProperties": false
+                    }
+                },
+                "truncated": { "type": "boolean" },
+                "unavailable": { "type": "boolean" }
+            },
+            "required": ["server", "locations", "truncated", "unavailable"],
+            "additionalProperties": false
+        }),
+        "lsp_symbols" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "server": { "type": ["string", "null"] },
+                "symbols": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "kind": { "type": "string" },
+                            "path": { "type": "string" },
+                            "line": { "type": "integer" },
+                            "container": { "type": ["string", "null"] }
+                        },
+                        "required": ["name", "kind", "path", "line", "container"],
+                        "additionalProperties": false
+                    }
+                },
+                "truncated": { "type": "boolean" },
+                "unavailable": { "type": "boolean" }
+            },
+            "required": ["server", "symbols", "truncated", "unavailable"],
+            "additionalProperties": false
+        }),
+        "ask_user" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "question": { "type": "string" },
+                "option": { "type": ["string", "null"], "description": "The chosen label, or null when the answer is free text" },
+                "answer": { "type": "string", "description": "The developer's answer" },
+                "timed_out": { "type": "boolean" }
+            },
+            "required": ["question", "option", "answer", "timed_out"],
+            "additionalProperties": false
+        }),
+        "propose_plan" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "approved": { "type": "boolean" },
+                "comment": { "type": ["string", "null"], "description": "The reviewer's note on allow or deny" },
+                "steps": { "type": "integer", "description": "Steps pinned into the trace" },
+                "timed_out": { "type": "boolean" }
+            },
+            "required": ["approved", "comment", "steps", "timed_out"],
+            "additionalProperties": false
+        }),
+        "monitor" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "matched": { "type": "boolean" },
+                "reason": { "type": "string", "description": "What fired: path change, pattern match, or timeout" },
+                "detail": { "type": ["string", "null"] },
+                "elapsed_ms": { "type": "integer" }
+            },
+            "required": ["matched", "reason", "detail", "elapsed_ms"],
+            "additionalProperties": false
+        }),
+        "notify" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "title": { "type": "string" },
+                "level": { "type": "string" },
+                "raised": { "type": "boolean" }
+            },
+            "required": ["title", "level", "raised"],
+            "additionalProperties": false
+        }),
+        "enter_worktree" | "exit_worktree" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "worktree": { "type": ["string", "null"], "description": "Absolute path of the worktree" },
+                "branch": { "type": ["string", "null"] },
+                "active": { "type": "boolean", "description": "Whether the session is now inside a worktree" },
+                "removed": { "type": "boolean" }
+            },
+            "required": ["worktree", "branch", "active", "removed"],
+            "additionalProperties": false
+        }),
+        "read_media" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "media_type": { "type": "string", "description": "MIME type of the returned block" },
+                "bytes": { "type": "integer" },
+                "kind": { "type": "string", "enum": ["image", "pdf", "text"] }
+            },
+            "required": ["path", "media_type", "bytes", "kind"],
+            "additionalProperties": false
+        }),
+        "publish_artifact" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "artifact": { "type": "string", "description": "Absolute path of the published copy" },
+                "title": { "type": "string" },
+                "bytes": { "type": "integer" },
+                "media_type": { "type": "string" }
+            },
+            "required": ["path", "artifact", "title", "bytes", "media_type"],
+            "additionalProperties": false
+        }),
+        "report_findings" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "summary": { "type": ["string", "null"] },
+                "count": { "type": "integer" },
+                "errors": { "type": "integer" },
+                "warnings": { "type": "integer" },
+                "findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "line": { "type": "integer" },
+                            "severity": { "type": "string" },
+                            "claim": { "type": "string" },
+                            "evidence": { "type": ["string", "null"] }
+                        },
+                        "required": ["path", "line", "severity", "claim", "evidence"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": ["summary", "count", "errors", "warnings", "findings"],
             "additionalProperties": false
         }),
         _ => return None,
@@ -993,11 +3175,66 @@ pub fn tool_paths(tool: &Tool) -> Vec<&str> {
         Tool::MoveFile { from, to } | Tool::CopyFile { from, to } => {
             vec![from.as_str(), to.as_str()]
         }
+        // A search screens its `path` argument here, and every file the walk
+        // then reaches is screened again by `walk_files`. Both are needed:
+        // this covers the path the caller named, that one covers the files it
+        // did not. `pattern` is not a path and is deliberately absent.
+        Tool::Grep { path, .. } | Tool::Glob { path, .. } => {
+            path.iter().map(String::as_str).collect()
+        }
+        // The index-level git tools take a path, so they screen like any
+        // other path-bearing tool: staging `.env` asks, exactly as reading it
+        // would. (The *revision* arguments — `base`, `oid`, `name` — name
+        // commits and branches, not files, and are deliberately absent.)
+        Tool::GitAdd { path } => path.iter().map(String::as_str).collect(),
+        Tool::GitUnstage { path } => vec![path.as_str()],
+        Tool::GitDiff { path } => path.iter().map(String::as_str).collect(),
+        // Phase 7–10 paths. A `url` is not a filesystem path and a worktree
+        // `name` is not one either, so neither appears here; the notebook,
+        // media, artifact, monitor and LSP tools all name a file.
+        Tool::NotebookRead { path }
+        | Tool::NotebookEdit { path, .. }
+        | Tool::LspDefinition { path, .. }
+        | Tool::LspReferences { path, .. }
+        | Tool::ReadMedia { path }
+        | Tool::PublishArtifact { path, .. } => vec![path.as_str()],
+        Tool::LspDiagnostics { path, .. }
+        | Tool::LspSymbols { path, .. }
+        | Tool::Monitor { path, .. } => path.iter().map(String::as_str).collect(),
         // A batch's paths are filtered individually at execution; the trace
         // carries the count instead (see `detail`).
         Tool::ReadManyFiles { .. }
         | Tool::RunCommand { .. }
+        | Tool::RunCommandBackground { .. }
+        | Tool::CommandOutput { .. }
+        | Tool::KillCommand { .. }
         | Tool::GitStatus
+        | Tool::GitLog { .. }
+        | Tool::GitCommit { .. }
+        | Tool::GitBranches
+        | Tool::GitCheckout { .. }
+        | Tool::GitCreateBranch { .. }
+        | Tool::GitShow { .. }
+        | Tool::GitCommitDiff { .. }
+        | Tool::TodoWrite { .. }
+        | Tool::TodoRead
+        | Tool::SetObjective { .. }
+        | Tool::RememberDecision { .. }
+        | Tool::RememberConstraint { .. }
+        | Tool::RememberAttempt { .. }
+        | Tool::GetFacts { .. }
+        | Tool::ListSessions { .. }
+        | Tool::RequestHandoff { .. }
+        | Tool::GetHandoff
+        | Tool::WebFetch { .. }
+        | Tool::WebSearch { .. }
+        | Tool::DelegateTask { .. }
+        | Tool::AskUser { .. }
+        | Tool::ProposePlan { .. }
+        | Tool::Notify { .. }
+        | Tool::EnterWorktree { .. }
+        | Tool::ExitWorktree { .. }
+        | Tool::ReportFindings { .. }
         | Tool::DescribeTool { .. }
         | Tool::ListTools => vec![],
     }
@@ -1032,6 +3269,48 @@ pub fn detail(tool: &Tool) -> Option<String> {
         Tool::CreateDirectory { path } => Some(path.clone()),
         Tool::ReadManyFiles { paths } => Some(format!("{} files", paths.len())),
         Tool::RunCommand { command } => Some(command.clone()),
+        Tool::RunCommandBackground { command } => Some(command.clone()),
+        // The handle rather than the command: two reads of the same command
+        // are told apart by which one they are reading, and `kill_command`
+        // has nothing else to say about itself.
+        Tool::CommandOutput { id, .. } | Tool::KillCommand { id } => Some(format!("#{id}")),
+        // The pattern and where it was looked for — the two facts that make
+        // two greps in a row distinguishable in the trace.
+        Tool::Grep { pattern, path, .. } => {
+            Some(format!("{pattern} in {}", path.as_deref().unwrap_or(".")))
+        }
+        Tool::Glob { pattern, path, .. } => {
+            Some(format!("{pattern} in {}", path.as_deref().unwrap_or(".")))
+        }
+        Tool::GitDiff { path } => Some(path.clone().unwrap_or_else(|| "all changes".into())),
+        Tool::GitLog { limit } => Some(format!("last {}", limit.unwrap_or(50))),
+        Tool::GitAdd { path } => Some(path.clone().unwrap_or_else(|| "everything".into())),
+        Tool::GitUnstage { path } => Some(path.clone()),
+        // Only the first line: a commit message is multi-line, and the trace
+        // row is one line.
+        Tool::GitCommit { message } => Some(message.lines().next().unwrap_or("").to_string()),
+        Tool::GitCheckout { name } => Some(name.clone()),
+        Tool::GitCreateBranch { name, base, .. } => Some(match base {
+            Some(b) => format!("{name} from {b}"),
+            None => name.clone(),
+        }),
+        Tool::GitShow { oid } | Tool::GitCommitDiff { oid } => Some(oid.clone()),
+        Tool::GitBranches => None,
+        // The text that was recorded *is* the distinguishing fact — two
+        // `remember_decision` calls differ only in their summary, and the
+        // audit line is worth more with it than without.
+        Tool::TodoWrite { todos } => Some(format!("{} item(s)", todos.len())),
+        Tool::SetObjective { text } => Some(clip_chars(text, 60)),
+        Tool::RememberDecision { summary, .. } => Some(clip_chars(summary, 60)),
+        Tool::RememberConstraint { text } => Some(clip_chars(text, 60)),
+        Tool::RememberAttempt { description, .. } => Some(clip_chars(description, 60)),
+        Tool::GetFacts { session_id } => Some(match session_id {
+            Some(id) => format!("session {id}"),
+            None => "this session".to_string(),
+        }),
+        Tool::ListSessions { limit } => limit.map(|n| format!("{n} max")),
+        Tool::RequestHandoff { reason, .. } => Some(clip_chars(reason, 60)),
+        Tool::TodoRead | Tool::GetHandoff => None,
         Tool::DescribeTool { name } => Some(name.clone()),
         Tool::GitStatus | Tool::ListTools => None,
     }
@@ -1055,48 +3334,90 @@ pub enum CommandEvent {
     },
 }
 
-/// Structured error code for tool call failures.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ErrorCode {
-    FileNotFound,
-    FileIsBinary,
-    FileTooLarge,
-    PathEscapesRoot,
-    PermissionDenied,
-    SensitivePath,
-    InvalidArguments,
-    StringNotFound,
-    AmbiguousMatch,
-    PatchDoesNotApply,
-    BridgePaused,
-    ExecutionFailed,
-    CommandTimeout,
-    UnknownTool,
-    InternalError,
-    Denied,
+/// The error vocabulary, declared once.
+///
+/// Three things must agree about every code: the Rust variant, the name on
+/// the wire (serde's `SCREAMING_SNAKE_CASE` rename), and the name `Display`
+/// prints. Keeping those as three hand-maintained lists is how they drift, so
+/// this macro takes one list and derives all three — including
+/// [`ErrorCode::ALL`], which the exhaustive tests quantify over. Adding a code
+/// is one line, and there is no way to add one that `ALL` does not know about.
+///
+/// The identifier and the wire string are both spelled out rather than
+/// computed because serde derives the second from the first; the
+/// `every_error_code_is_named_consistently` test asserts the two never
+/// disagree.
+macro_rules! error_codes {
+    ($($variant:ident => $wire:literal),* $(,)?) => {
+        /// Structured error code for tool call failures.
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+        pub enum ErrorCode {
+            $($variant),*
+        }
+
+        impl ErrorCode {
+            /// Every variant, in declaration order.
+            pub const ALL: &'static [ErrorCode] = &[$(ErrorCode::$variant),*];
+
+            /// The wire name — the one place a code's spelling is written.
+            pub const fn name(&self) -> &'static str {
+                match self {
+                    $(ErrorCode::$variant => $wire),*
+                }
+            }
+        }
+    };
+}
+
+error_codes! {
+    // Files and paths.
+    FileNotFound => "FILE_NOT_FOUND",
+    FileIsBinary => "FILE_IS_BINARY",
+    FileTooLarge => "FILE_TOO_LARGE",
+    PathEscapesRoot => "PATH_ESCAPES_ROOT",
+    PermissionDenied => "PERMISSION_DENIED",
+    SensitivePath => "SENSITIVE_PATH",
+    NotADirectory => "NOT_A_DIRECTORY",
+    NotAFile => "NOT_A_FILE",
+    // Arguments, edits and diffs.
+    InvalidArguments => "INVALID_ARGUMENTS",
+    StringNotFound => "STRING_NOT_FOUND",
+    AmbiguousMatch => "AMBIGUOUS_MATCH",
+    PatchDoesNotApply => "PATCH_DOES_NOT_APPLY",
+    InvalidDiff => "INVALID_DIFF",
+    // Search.
+    RegexInvalid => "REGEX_INVALID",
+    GlobInvalid => "GLOB_INVALID",
+    // Git.
+    NotAGitRepo => "NOT_A_GIT_REPO",
+    WorktreeDirty => "WORKTREE_DIRTY",
+    // Commands and processes.
+    BridgePaused => "BRIDGE_PAUSED",
+    ExecutionFailed => "EXECUTION_FAILED",
+    CommandTimeout => "COMMAND_TIMEOUT",
+    ProcessNotFound => "PROCESS_NOT_FOUND",
+    OutputGone => "OUTPUT_GONE",
+    TooManyProcesses => "TOO_MANY_PROCESSES",
+    // Language servers.
+    LspUnavailable => "LSP_UNAVAILABLE",
+    LspProtocolError => "LSP_PROTOCOL_ERROR",
+    // Network.
+    NetworkBlocked => "NETWORK_BLOCKED",
+    // Notebooks.
+    NotebookInvalid => "NOTEBOOK_INVALID",
+    // The agent loop and delegation.
+    AgentNotAvailable => "AGENT_NOT_AVAILABLE",
+    DelegateBudgetExhausted => "DELEGATE_BUDGET_EXHAUSTED",
+    // Dispatch.
+    UnknownTool => "UNKNOWN_TOOL",
+    InternalError => "INTERNAL_ERROR",
+    Denied => "DENIED",
 }
 
 impl std::fmt::Display for ErrorCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ErrorCode::FileNotFound => write!(f, "FILE_NOT_FOUND"),
-            ErrorCode::FileIsBinary => write!(f, "FILE_IS_BINARY"),
-            ErrorCode::FileTooLarge => write!(f, "FILE_TOO_LARGE"),
-            ErrorCode::PathEscapesRoot => write!(f, "PATH_ESCAPES_ROOT"),
-            ErrorCode::PermissionDenied => write!(f, "PERMISSION_DENIED"),
-            ErrorCode::SensitivePath => write!(f, "SENSITIVE_PATH"),
-            ErrorCode::InvalidArguments => write!(f, "INVALID_ARGUMENTS"),
-            ErrorCode::StringNotFound => write!(f, "STRING_NOT_FOUND"),
-            ErrorCode::AmbiguousMatch => write!(f, "AMBIGUOUS_MATCH"),
-            ErrorCode::PatchDoesNotApply => write!(f, "PATCH_DOES_NOT_APPLY"),
-            ErrorCode::BridgePaused => write!(f, "BRIDGE_PAUSED"),
-            ErrorCode::ExecutionFailed => write!(f, "EXECUTION_FAILED"),
-            ErrorCode::CommandTimeout => write!(f, "COMMAND_TIMEOUT"),
-            ErrorCode::UnknownTool => write!(f, "UNKNOWN_TOOL"),
-            ErrorCode::InternalError => write!(f, "INTERNAL_ERROR"),
-            ErrorCode::Denied => write!(f, "DENIED"),
-        }
+        f.write_str(self.name())
     }
 }
 
@@ -1127,6 +3448,26 @@ pub struct ToolResult {
     /// results with nothing to structure (errors the caller can't act on,
     /// approval pendings).
     pub structured: Option<serde_json::Value>,
+    /// Binary content (an image, or a PDF) that must cross the MCP boundary as
+    /// a real content block rather than as text or as a JSON string.
+    ///
+    /// Kept out of `structured` on purpose: base64 expands by a third and the
+    /// connector caps a text result at 140,000 characters, so an image in the
+    /// structured half would be truncated into something unopenable. The MCP
+    /// layer reads this field and emits the right block; the desktop ignores
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<MediaPayload>,
+}
+
+/// A media block, ready for the MCP boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaPayload {
+    /// `image/png`, `application/pdf`, …
+    pub media_type: String,
+    pub base64: String,
+    /// `image` | `pdf` — which content block to emit.
+    pub kind: String,
 }
 
 impl ToolResult {
@@ -1138,6 +3479,7 @@ impl ToolResult {
             error_code: None,
             pending: None,
             structured: None,
+            media: None,
         }
     }
 
@@ -1152,6 +3494,20 @@ impl ToolResult {
             error_code: None,
             pending: None,
             structured: Some(structured),
+            media: None,
+        }
+    }
+
+    /// A successful call whose payload is media plus a short readable caption.
+    pub fn ok_media(output: String, structured: serde_json::Value, media: MediaPayload) -> Self {
+        Self {
+            ok: true,
+            output: Some(output),
+            error: None,
+            error_code: None,
+            pending: None,
+            structured: Some(structured),
+            media: Some(media),
         }
     }
 
@@ -1163,6 +3519,7 @@ impl ToolResult {
             error_code: None,
             pending: None,
             structured: None,
+            media: None,
         }
     }
     pub fn err_code(code: ErrorCode, message: impl Into<String>) -> Self {
@@ -1173,6 +3530,7 @@ impl ToolResult {
             error_code: Some(code),
             pending: None,
             structured: None,
+            media: None,
         }
     }
     pub fn pending<S: Into<String>>(summary: S) -> Self {
@@ -1183,6 +3541,7 @@ impl ToolResult {
             error_code: None,
             pending: Some(summary.into()),
             structured: None,
+            media: None,
         }
     }
 }
@@ -1242,11 +3601,12 @@ pub struct ApprovalRequest {
     pub tool: Tool,
     pub summary: String,
     pub source: String, // web | desktop
-    /// The request id that asked for this tool, when the caller carried one
-    /// (nothing sets one today — see `process::execution_owner`). A gated
-    /// `run_command` executes on the desktop's `bridge_approve` thread, not
-    /// the caller's — carrying the owner here is what lets the spawned PTY
-    /// still be attributed to (and cancellable by) the original request.
+    /// The request id that asked for this tool, captured from
+    /// `process::execution_owner()` at submit time. A gated `run_command`
+    /// executes on the desktop's `bridge_approve` thread, not the caller's —
+    /// carrying the owner here is what lets the spawned PTY still be
+    /// attributed to (and cancellable by) the original request. `None` when
+    /// the call came from a caller that owns nothing (every desktop call).
     pub owner: Option<String>,
 }
 
@@ -1285,11 +3645,25 @@ impl Bridge {
 
     /// As [`submit`], but also reports how an auto-execution was authorized
     /// ("auto" or "grant:<scope>[:<prefix>]") for the audit log.
+    ///
+    /// The root-only form; [`submit_with_ctx`](Self::submit_with_ctx) is the
+    /// context-aware one that the memory and agent-loop tools need.
     pub fn submit_with_audit(
         &self,
         tool: Tool,
         source: &str,
         root: Option<&Path>,
+    ) -> (ToolResult, Option<u64>, String) {
+        self.submit_with_ctx(tool, source, &ToolCtx::root_only(root))
+    }
+
+    /// As [`submit_with_audit`](Self::submit_with_audit), against an explicit
+    /// [`ToolCtx`] — which is how a tool reaches the database or the desktop.
+    pub(crate) fn submit_with_ctx(
+        &self,
+        tool: Tool,
+        source: &str,
+        ctx: &ToolCtx,
     ) -> (ToolResult, Option<u64>, String) {
         if self.paused.load(Ordering::SeqCst) {
             return (
@@ -1302,22 +3676,22 @@ impl Bridge {
             );
         }
         match needs_approval(&tool) {
-            None => (execute(&tool, root, None), None, "auto".to_string()),
+            None => (execute_in(&tool, ctx, None), None, "auto".to_string()),
             Some(reason) => {
                 if let Some(grant) = self
                     .grants
                     .lock()
                     .unwrap()
                     .iter()
-                    .find(|g| grant_matches(g, &tool, source, root))
+                    .find(|g| grant_matches(g, &tool, source, ctx.root))
                 {
                     let label = grant_label(grant);
-                    return (execute(&tool, root, None), None, label);
+                    return (execute_in(&tool, ctx, None), None, label);
                 }
                 let id = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;
                 self.pending.lock().unwrap().push(ApprovalRequest {
                     id,
-                    summary: describe_for_approval(&tool, root),
+                    summary: describe_for_approval(&tool, ctx.root),
                     tool,
                     source: source.to_string(),
                     owner: crate::process::execution_owner(),
@@ -1335,11 +3709,28 @@ impl Bridge {
     /// delivers the result to any waiting remote caller, and returns the
     /// result plus the resolved request (for auditing). `on_event`
     /// receives command stream events while a `run_command` executes.
+    ///
+    /// The root-only form; [`resolve_with_ctx`](Self::resolve_with_ctx) is
+    /// the context-aware one.
     pub fn resolve(
         &self,
         id: u64,
         allow: bool,
         root: Option<&Path>,
+        on_event: Option<&mut dyn FnMut(CommandEvent)>,
+    ) -> Option<(ToolResult, ApprovalRequest)> {
+        self.resolve_with_ctx(id, allow, &ToolCtx::root_only(root), on_event)
+    }
+
+    /// As [`resolve`](Self::resolve), against an explicit [`ToolCtx`]. The
+    /// approval card can approve a call to *any* tool, including one that
+    /// needs the database, so the resolving caller must supply the same
+    /// context the request came in with.
+    pub(crate) fn resolve_with_ctx(
+        &self,
+        id: u64,
+        allow: bool,
+        ctx: &ToolCtx,
         on_event: Option<&mut dyn FnMut(CommandEvent)>,
     ) -> Option<(ToolResult, ApprovalRequest)> {
         let mut pending = self.pending.lock().unwrap();
@@ -1350,12 +3741,11 @@ impl Bridge {
         let result = if allow {
             // Execute attributed to the original request (see
             // `ApprovalRequest::owner`), so a cancel for that request can
-            // kill a `run_command` spawned here on the desktop's thread.
-            let prev = crate::process::execution_owner();
-            crate::process::set_execution_owner(req.owner.clone());
-            let result = execute(&req.tool, root, on_event);
-            crate::process::set_execution_owner(prev);
-            result
+            // kill a `run_command` spawned here on the desktop's thread —
+            // this thread is Tauri's command runner, which the caller has
+            // long since stopped being.
+            let _owner = crate::process::own_current_thread(req.owner.clone());
+            execute_in(&req.tool, ctx, on_event)
         } else {
             ToolResult::err_code(
                 ErrorCode::Denied,
@@ -2072,11 +4462,69 @@ fn apply_hunks(lines: &[String], hunks: &[Hunk]) -> Result<Vec<String>, ToolErro
 const MANY_FILES_MAX: usize = 20;
 const MANY_BYTES_BUDGET: usize = 20 * 1024;
 
+/// Everything a tool may need beyond its own arguments.
+///
+/// Almost every tool needs only `root`. The rest are escape hatches for the
+/// tools that reach further: the memory tools (SQLite), the handoff tools
+/// (`build_handoff_impl`, which needs the whole `AppState`), and the
+/// agent-loop tools (which must reach the desktop to ask a question or
+/// raise a notification).
+///
+/// What a tool needs beyond its own arguments.
+///
+/// Today that is only the workspace root. The point of the type is the
+/// seam it creates: a tool is handed its context rather than reaching for
+/// a global, so the tools that will need more — the memory tools (SQLite),
+/// the handoff tools (the app's state), the agent-loop tools (the desktop)
+/// — extend *this* type instead of every call site. See
+/// [`execute_in`], which is what such a tool is executed through.
+///
+/// `pub(crate)`, not `pub`: this is internal plumbing. The root-only
+/// [`execute`] stays `pub` as the stable surface.
+pub(crate) struct ToolCtx<'a> {
+    pub(crate) root: Option<&'a Path>,
+    /// The app's shared state, when the caller has it.
+    ///
+    /// Workspace-only tools ignore it. The memory and handoff tools have
+    /// nowhere to read or write without it, and say exactly that rather than
+    /// answering "no history" — which is not the same answer as "no
+    /// database", and only one of them is information.
+    pub(crate) state: Option<&'a AppState>,
+}
+
+impl<'a> ToolCtx<'a> {
+    /// A context carrying only a workspace root — what the tests and every
+    /// caller that is not the desktop uses.
+    pub(crate) fn root_only(root: Option<&'a Path>) -> Self {
+        Self { root, state: None }
+    }
+
+    pub(crate) fn with_state(root: Option<&'a Path>, state: &'a AppState) -> Self {
+        Self {
+            root,
+            state: Some(state),
+        }
+    }
+}
+
 /// Execute a tool call locally. `root: None` → tool requires the root.
 /// `on_event` streams command events while a `run_command` executes.
+///
+/// A thin shim over [`execute_in`] for callers that have a workspace and
+/// nothing else — the desktop sandbox and most tests. Tools that need the
+/// database or the desktop go through [`execute_in`] with a full [`ToolCtx`].
 pub fn execute(
     tool: &Tool,
     root: Option<&Path>,
+    on_event: Option<&mut dyn FnMut(CommandEvent)>,
+) -> ToolResult {
+    execute_in(tool, &ToolCtx::root_only(root), on_event)
+}
+
+/// Execute a tool call against an explicit context.
+pub(crate) fn execute_in(
+    tool: &Tool,
+    ctx: &ToolCtx,
     mut on_event: Option<&mut dyn FnMut(CommandEvent)>,
 ) -> ToolResult {
     // Meta-tools answer from the spec table, so they work before a project
@@ -2109,6 +4557,60 @@ pub fn execute(
         _ => {}
     }
 
+    // Memory tools answer from the database rather than the workspace, so
+    // they run before the project-root check: a task list has to be reachable
+    // with no project open, and a handoff is precisely what you want when
+    // nothing is.
+    match tool {
+        Tool::TodoWrite { .. }
+        | Tool::TodoRead
+        | Tool::SetObjective { .. }
+        | Tool::RememberDecision { .. }
+        | Tool::RememberConstraint { .. }
+        | Tool::RememberAttempt { .. }
+        | Tool::GetFacts { .. }
+        | Tool::ListSessions { .. }
+        | Tool::RequestHandoff { .. }
+        | Tool::GetHandoff => return run_memory_tool(tool, ctx),
+        _ => {}
+    }
+
+    // Phases 7–10. Dispatched together because each one carries its own root
+    // and state handling: the web tools need no workspace, the LSP and
+    // isolation tools need the app state for a cached server or the active
+    // worktree, and the agent-loop tools need the desktop. Folding them into
+    // one entry point keeps that decision in one place instead of spreading
+    // it across the big match below.
+    match tool {
+        Tool::WebFetch { .. }
+        | Tool::WebSearch { .. }
+        | Tool::NotebookRead { .. }
+        | Tool::NotebookEdit { .. }
+        | Tool::DelegateTask { .. }
+        | Tool::LspDiagnostics { .. }
+        | Tool::LspDefinition { .. }
+        | Tool::LspReferences { .. }
+        | Tool::LspSymbols { .. }
+        | Tool::AskUser { .. }
+        | Tool::ProposePlan { .. }
+        | Tool::Monitor { .. }
+        | Tool::Notify { .. }
+        | Tool::EnterWorktree { .. }
+        | Tool::ExitWorktree { .. }
+        | Tool::ReadMedia { .. }
+        | Tool::PublishArtifact { .. }
+        | Tool::ReportFindings { .. } => return run_phase_tool(tool, ctx),
+        _ => {}
+    }
+
+    // Inside a worktree the session's root is the worktree, not the project
+    // the user opened: every path-resolving tool below lands there. The
+    // override lives in state so `enter_worktree` and `exit_worktree` only
+    // have to set and clear one value.
+    let active = ctx
+        .state
+        .and_then(|s| s.active_worktree.lock().ok().and_then(|g| g.clone()));
+    let root = active.as_deref().or(ctx.root);
     let Some(root) = root else {
         return ToolResult::err_code(ErrorCode::InternalError, "project root not set");
     };
@@ -2608,6 +5110,12 @@ pub fn execute(
             });
             ToolResult::ok_structured(text, structured)
         }
+        // The three background-command tools carry their own dispatch: they
+        // need the manager from the app state as well as this root, and the
+        // gate that names which half is missing belongs in one place.
+        Tool::RunCommandBackground { .. }
+        | Tool::CommandOutput { .. }
+        | Tool::KillCommand { .. } => run_bg_tool(tool, ctx),
         Tool::ListDirectory { path } => {
             let p = match resolve_path(root, path) {
                 Ok(p) => p,
@@ -2663,6 +5171,50 @@ pub fn execute(
             });
             ToolResult::ok_structured(out, structured)
         }
+        Tool::Grep {
+            pattern,
+            path,
+            include,
+            exclude,
+            mode,
+            max_results,
+        } => {
+            // The plan is built before the tree is touched, so a bad regex
+            // costs a compile rather than a walk.
+            let plan = match plan_grep(
+                pattern,
+                include.as_deref(),
+                exclude.as_deref(),
+                *mode,
+                *max_results,
+            ) {
+                Ok(p) => p,
+                Err(r) => return r,
+            };
+            let target = match SearchTarget::resolve(root, path.as_deref()) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            run_grep(&plan, &target, root)
+        }
+        Tool::Glob {
+            pattern,
+            path,
+            max_results,
+        } => {
+            let pattern = match PathGlob::new(pattern, "pattern") {
+                Ok(g) => g,
+                Err(r) => return r,
+            };
+            let target = match SearchTarget::resolve(root, path.as_deref()) {
+                Ok(t) => t,
+                Err(r) => return r,
+            };
+            let max = max_results
+                .map(|n| (n.max(1) as usize).min(GLOB_MAX_RESULTS))
+                .unwrap_or(GLOB_MAX_RESULTS);
+            run_glob(&pattern, &target, root, max)
+        }
         Tool::GitStatus => {
             let repo = match git::open_repo(root) {
                 Ok(r) => r,
@@ -2713,9 +5265,2773 @@ pub fn execute(
             });
             ToolResult::ok_structured(out, structured)
         }
+        Tool::GitDiff { path } => {
+            let repo = match open_workspace_repo(root) {
+                Ok(r) => r,
+                Err(r) => return r,
+            };
+            let diffs = match git::diff_workdir(&repo) {
+                Ok(d) => d,
+                Err(e) => return git_failed("git diff", e),
+            };
+            let selected: Vec<&git::FileDiff> = match path {
+                Some(want) => diffs.iter().filter(|d| &d.path == want).collect(),
+                None => diffs.iter().collect(),
+            };
+            if selected.is_empty() {
+                let said = match path {
+                    Some(want) => format!("no uncommitted changes to {want}\n"),
+                    None => "working tree clean\n".to_string(),
+                };
+                return ToolResult::ok_structured(
+                    said,
+                    serde_json::json!({ "count": 0, "truncated": false, "files": [] }),
+                );
+            }
+            // One budget for the whole result, not one per file: the caller
+            // gets as much patch as fits and an honest count of what did not.
+            let mut budget = GIT_PATCH_BUDGET;
+            let mut omitted = 0usize;
+            let mut out = format!("[{} changed files]\n", selected.len());
+            let mut files = Vec::with_capacity(selected.len());
+            for d in &selected {
+                out.push_str(&format!(
+                    "── {} [{} +{}/-{}]\n",
+                    d.path, d.status, d.added, d.deleted
+                ));
+                let (patch, skipped) = fit_patch(&d.patch, &mut budget);
+                if skipped {
+                    omitted += 1;
+                    out.push_str("[patch omitted: does not fit the result budget]\n");
+                } else {
+                    out.push_str(&patch);
+                    if !patch.ends_with('\n') {
+                        out.push('\n');
+                    }
+                }
+                files.push(serde_json::json!({
+                    "path": d.path,
+                    "status": d.status,
+                    "added": d.added,
+                    "deleted": d.deleted,
+                    "patch": patch,
+                    "patch_omitted": skipped,
+                }));
+            }
+            if omitted > 0 {
+                out.push_str(&format!("\n[{omitted} patch(es) omitted]\n"));
+            }
+            ToolResult::ok_structured(
+                out,
+                serde_json::json!({
+                    "count": files.len(),
+                    "truncated": omitted > 0,
+                    "files": files,
+                }),
+            )
+        }
+        Tool::GitLog { limit } => {
+            let repo = match open_workspace_repo(root) {
+                Ok(r) => r,
+                Err(r) => return r,
+            };
+            let limit = limit
+                .map(|n| (n.max(1) as usize).min(GIT_LOG_MAX))
+                .unwrap_or(20);
+            // An unborn HEAD is not a failure: a fresh repository has no
+            // commits, and saying so is the whole answer. `log` reports it as
+            // an error because git2 has no other way to say it.
+            if repo.head().is_err() {
+                return ToolResult::ok_structured(
+                    "no commits yet\n".to_string(),
+                    serde_json::json!({ "count": 0, "commits": [] }),
+                );
+            }
+            let commits = match git::log(&repo, limit) {
+                Ok(c) => c,
+                Err(e) => return git_failed("git log", e),
+            };
+            let mut out = String::new();
+            for c in &commits {
+                // `message` may be multi-line; the subject is what a log line
+                // shows, and the full body is available through git_show.
+                let subject = c.message.lines().next().unwrap_or("").trim();
+                out.push_str(&format!(
+                    "{} {} ({})\n",
+                    &c.oid[..7.min(c.oid.len())],
+                    subject,
+                    c.author
+                ));
+            }
+            let rows: Vec<serde_json::Value> = commits
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "oid": c.oid,
+                        "summary": c.message.lines().next().unwrap_or("").trim(),
+                        "author": c.author,
+                        "timestamp": c.timestamp,
+                    })
+                })
+                .collect();
+            ToolResult::ok_structured(
+                out,
+                serde_json::json!({ "count": rows.len(), "commits": rows }),
+            )
+        }
+        Tool::GitBranches => {
+            let repo = match open_workspace_repo(root) {
+                Ok(r) => r,
+                Err(r) => return r,
+            };
+            let branches = match git::branches(&repo) {
+                Ok(b) => b,
+                Err(e) => return git_failed("git branch", e),
+            };
+            let current = git::current_branch(&repo);
+            let mut out = String::new();
+            for b in &branches {
+                out.push_str(if b.is_current { "* " } else { "  " });
+                out.push_str(&b.name);
+                out.push('\n');
+            }
+            let rows: Vec<serde_json::Value> = branches
+                .iter()
+                .map(|b| serde_json::json!({ "name": b.name, "is_current": b.is_current }))
+                .collect();
+            ToolResult::ok_structured(
+                out,
+                serde_json::json!({
+                    "current": current,
+                    "count": rows.len(),
+                    "branches": rows,
+                }),
+            )
+        }
+        Tool::GitAdd { path } => {
+            let repo = match open_workspace_repo(root) {
+                Ok(r) => r,
+                Err(r) => return r,
+            };
+            // The path reaches the index, not the disk, so containment has to
+            // be checked here rather than by the walk that a search would do.
+            if let Some(p) = path {
+                if let Err(e) = resolve_path(root, p) {
+                    if e.contains("escapes project root") {
+                        return ToolResult::err_code(ErrorCode::PathEscapesRoot, e);
+                    }
+                    return ToolResult::err_code(ErrorCode::InvalidArguments, e);
+                }
+            }
+            let staged = match path {
+                Some(p) => git::stage(&repo, p).map(|()| p.clone()),
+                None => git::stage_all(&repo).map(|()| "*".to_string()),
+            };
+            match staged {
+                Ok(which) => {
+                    let scoped = path.clone();
+                    ToolResult::ok_structured(
+                        format!("staged {which}\n"),
+                        serde_json::json!({ "scoped_to": scoped }),
+                    )
+                }
+                Err(e) => git_failed("git add", e),
+            }
+        }
+        Tool::GitUnstage { path } => {
+            let repo = match open_workspace_repo(root) {
+                Ok(r) => r,
+                Err(r) => return r,
+            };
+            if let Err(e) = resolve_path(root, path) {
+                if e.contains("escapes project root") {
+                    return ToolResult::err_code(ErrorCode::PathEscapesRoot, e);
+                }
+                return ToolResult::err_code(ErrorCode::InvalidArguments, e);
+            }
+            // "Nothing to unstage" is a routine answer, not a failure to
+            // apologise for — but it is an answer that has to *say* so rather
+            // than report success for a call that changed nothing.
+            match git::has_staged_change(&repo, path) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return ToolResult::err_code(
+                        ErrorCode::InvalidArguments,
+                        format!("nothing to unstage: {path} has no staged change"),
+                    );
+                }
+                Err(e) => return git_failed("git status", e),
+            }
+            match git::unstage(&repo, path) {
+                Ok(()) => ToolResult::ok_structured(
+                    format!("unstaged {path}\n"),
+                    serde_json::json!({ "scoped_to": path }),
+                ),
+                Err(e) => git_failed("git unstage", e),
+            }
+        }
+        Tool::GitCommit { message } => {
+            let repo = match open_workspace_repo(root) {
+                Ok(r) => r,
+                Err(r) => return r,
+            };
+            if message.trim().is_empty() {
+                return ToolResult::err_code(
+                    ErrorCode::InvalidArguments,
+                    "commit message is empty",
+                );
+            }
+            // Committing with nothing staged writes an empty commit — legal in
+            // git, essentially never what was meant, and confusing to undo.
+            match git::has_staged_changes(&repo) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return ToolResult::err_code(
+                        ErrorCode::InvalidArguments,
+                        "nothing staged to commit — call git_add first",
+                    );
+                }
+                Err(e) => return git_failed("git status", e),
+            }
+            match git::commit(&repo, message) {
+                Ok(oid) => {
+                    let summary = message.lines().next().unwrap_or("").trim().to_string();
+                    ToolResult::ok_structured(
+                        format!("committed {} {summary}\n", oid),
+                        serde_json::json!({ "oid": oid.to_string(), "summary": summary }),
+                    )
+                }
+                Err(e) => git_failed("git commit", e),
+            }
+        }
+        Tool::GitCheckout { name } => {
+            let repo = match open_workspace_repo(root) {
+                Ok(r) => r,
+                Err(r) => return r,
+            };
+            // Refuse before anything moves. `git::checkout` refuses too, but
+            // it can only report *a* dirty path in its message; going through
+            // `dirty_paths` here lets the code be `WorktreeDirty` and the
+            // message name several, so the caller can see the shape of the
+            // problem rather than one line of it.
+            match git::dirty_paths(&repo) {
+                Ok(dirty) if !dirty.is_empty() => return worktree_dirty(name, &dirty),
+                Ok(_) => {}
+                Err(e) => return git_failed("git status", e),
+            }
+            match git::checkout(&repo, name) {
+                Ok(()) => ToolResult::ok_structured(
+                    format!("switched to {name}\n"),
+                    serde_json::json!({
+                        "branch": name,
+                        "created": false,
+                        "checked_out": true,
+                    }),
+                ),
+                Err(e) => git_failed("git checkout", e),
+            }
+        }
+        Tool::GitCreateBranch {
+            name,
+            base,
+            checkout,
+        } => {
+            let repo = match open_workspace_repo(root) {
+                Ok(r) => r,
+                Err(r) => return r,
+            };
+            let checkout = checkout.unwrap_or(false);
+            match git::create_branch(&repo, name, base.as_deref(), checkout) {
+                Ok(()) => ToolResult::ok_structured(
+                    format!(
+                        "created {name}{}\n",
+                        match base {
+                            Some(b) => format!(" from {b}"),
+                            None => " at HEAD".to_string(),
+                        }
+                    ),
+                    serde_json::json!({
+                        "branch": name,
+                        "created": true,
+                        "checked_out": checkout,
+                    }),
+                ),
+                Err(e) => git_failed("git branch", e),
+            }
+        }
+        Tool::GitShow { oid } => {
+            let repo = match open_workspace_repo(root) {
+                Ok(r) => r,
+                Err(r) => return r,
+            };
+            match git::show(&repo, oid) {
+                Ok(c) => {
+                    let mut budget = GIT_PATCH_BUDGET;
+                    let (patch, omitted) = fit_patch(&c.patch, &mut budget);
+                    let mut out = format!(
+                        "commit {}\nAuthor: {} <{}>\n\n{}\n",
+                        c.oid,
+                        c.author,
+                        c.email.as_deref().unwrap_or(""),
+                        c.message.trim_end(),
+                    );
+                    if omitted {
+                        out.push_str("\n[patch omitted: does not fit the result budget]\n");
+                    } else {
+                        out.push_str(&patch);
+                    }
+                    ToolResult::ok_structured(
+                        out,
+                        serde_json::json!({
+                            "oid": c.oid,
+                            "summary": c.summary,
+                            "author": c.author,
+                            "email": c.email,
+                            "timestamp": c.timestamp,
+                            "patch": patch,
+                            "patch_omitted": omitted,
+                        }),
+                    )
+                }
+                Err(e) => git_failed("git show", e),
+            }
+        }
+        Tool::GitCommitDiff { oid } => {
+            let repo = match open_workspace_repo(root) {
+                Ok(r) => r,
+                Err(r) => return r,
+            };
+            match git::commit_diff(&repo, oid) {
+                Ok(patch) => {
+                    let mut budget = GIT_PATCH_BUDGET;
+                    let (patch, omitted) = fit_patch(&patch, &mut budget);
+                    let out = if omitted {
+                        format!("[{oid}: patch omitted, does not fit the result budget]\n")
+                    } else {
+                        patch.clone()
+                    };
+                    ToolResult::ok_structured(
+                        out,
+                        serde_json::json!({
+                            "oid": oid,
+                            "patch": patch,
+                            "patch_omitted": omitted,
+                        }),
+                    )
+                }
+                Err(e) => git_failed("git show", e),
+            }
+        }
         // Handled above, before the project-root check.
-        Tool::DescribeTool { .. } | Tool::ListTools => unreachable!(),
+        Tool::DescribeTool { .. }
+        | Tool::ListTools
+        | Tool::TodoWrite { .. }
+        | Tool::TodoRead
+        | Tool::SetObjective { .. }
+        | Tool::RememberDecision { .. }
+        | Tool::RememberConstraint { .. }
+        | Tool::RememberAttempt { .. }
+        | Tool::GetFacts { .. }
+        | Tool::ListSessions { .. }
+        | Tool::RequestHandoff { .. }
+        | Tool::GetHandoff
+        | Tool::WebFetch { .. }
+        | Tool::WebSearch { .. }
+        | Tool::NotebookRead { .. }
+        | Tool::NotebookEdit { .. }
+        | Tool::DelegateTask { .. }
+        | Tool::LspDiagnostics { .. }
+        | Tool::LspDefinition { .. }
+        | Tool::LspReferences { .. }
+        | Tool::LspSymbols { .. }
+        | Tool::AskUser { .. }
+        | Tool::ProposePlan { .. }
+        | Tool::Monitor { .. }
+        | Tool::Notify { .. }
+        | Tool::EnterWorktree { .. }
+        | Tool::ExitWorktree { .. }
+        | Tool::ReadMedia { .. }
+        | Tool::PublishArtifact { .. }
+        | Tool::ReportFindings { .. } => unreachable!(),
     }
+}
+
+// --- memory ----------------------------------------------------------------
+//
+// Ten tools over the tables the fact extractor already writes. What this layer
+// adds is the *pull* direction: until now the only way knowledge entered the
+// project memory was `facts::extract` reading a Claude Code transcript, so a
+// web AI could read the developer's conclusions but never record its own.
+//
+// Two decisions shape everything below:
+//
+// * **A session of its own.** The fact tables are keyed by session, and the
+//   archive's sessions belong to Claude Code transcripts. Filing a connector's
+//   decisions under one of those would attribute them to the wrong agent, so
+//   the connector gets one row of its own, found or created.
+// * **"No answer" is not "no database".** A tool that cannot reach the
+//   database says so, rather than reporting an empty memory — the first is a
+//   bug in the caller, the second is information, and confusing them is how a
+//   model concludes the project has no constraints and proceeds to violate
+//   them.
+
+/// Ceiling for `list_sessions`. A caller asking for every session ever has
+/// asked for a result it cannot use.
+const SESSION_LIST_MAX: usize = 100;
+
+/// The database behind a tool call, or a coded error naming what is missing.
+fn db_guard<'a>(
+    ctx: &ToolCtx<'a>,
+) -> Result<std::sync::MutexGuard<'a, rusqlite::Connection>, ToolResult> {
+    let state = ctx.state.ok_or_else(|| {
+        ToolResult::err_code(
+            ErrorCode::InternalError,
+            "this tool reads the project memory, which lives in the desktop \
+             database, and the caller did not supply it",
+        )
+    })?;
+    state.conn.lock().map_err(|_| {
+        ToolResult::err_code(ErrorCode::InternalError, "the database lock is poisoned")
+    })
+}
+
+fn db_failed(what: &str, e: rusqlite::Error) -> ToolResult {
+    ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{what}: {e}"))
+}
+
+/// The session the connector records into. Created on first use, so a fresh
+/// install has somewhere to file the first decision.
+fn connector_session(conn: &rusqlite::Connection) -> Result<i64, ToolResult> {
+    db::connector_session_id(conn).map_err(|e| db_failed("could not open the connector session", e))
+}
+
+/// The session a memory tool should act on.
+///
+/// A caller may name one — `list_sessions` is how it learns the ids — but the
+/// default is the connector's own row.
+fn resolve_session(conn: &rusqlite::Connection, requested: Option<i64>) -> Result<i64, ToolResult> {
+    let Some(id) = requested else {
+        return connector_session(conn);
+    };
+    let known: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .map_err(|e| db_failed("could not look up the session", e))?;
+    if known == 0 {
+        return Err(ToolResult::err_code(
+            ErrorCode::FileNotFound,
+            format!("no session {id} — call list_sessions for the ids that exist"),
+        ));
+    }
+    Ok(id)
+}
+
+/// Validate a task list, refusing the whole list on one bad entry.
+///
+/// The alternative — clamping an unknown status to `pending` — would store a
+/// list the caller did not send and then hand it back as truth. A list is one
+/// value, so one bad item invalidates it (ch. 12: fail-fast for dependent
+/// data).
+fn normalise_todos(items: &[TodoItem]) -> Result<Vec<db::Todo>, ToolResult> {
+    const STATUSES: &[&str] = &["pending", "in_progress", "completed"];
+    let mut out = Vec::with_capacity(items.len());
+    for (i, t) in items.iter().enumerate() {
+        let content = t.content.trim();
+        if content.is_empty() {
+            return Err(ToolResult::err_code(
+                ErrorCode::InvalidArguments,
+                format!("todo {} has empty content", i + 1),
+            ));
+        }
+        let status = t.status.as_deref().unwrap_or("pending");
+        if !STATUSES.contains(&status) {
+            return Err(ToolResult::err_code(
+                ErrorCode::InvalidArguments,
+                format!(
+                    "todo {} has unknown status {status:?} — use one of: {}",
+                    i + 1,
+                    STATUSES.join(", ")
+                ),
+            ));
+        }
+        out.push(db::Todo {
+            content: content.to_string(),
+            status: status.to_string(),
+            active_form: t
+                .active_form
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        });
+    }
+    Ok(out)
+}
+
+/// The task list as text: a status mark per item, and the tally.
+fn render_todos(items: &[db::Todo]) -> String {
+    if items.is_empty() {
+        return "task list is empty\n".to_string();
+    }
+    let done = items.iter().filter(|t| t.status == "completed").count();
+    let mut out = format!("[{done}/{} done]\n", items.len());
+    for t in items {
+        let mark = match t.status.as_str() {
+            "completed" => "x",
+            "in_progress" => ">",
+            _ => " ",
+        };
+        out.push_str(&format!("[{mark}] {}\n", t.content));
+    }
+    out
+}
+
+fn todo_json(items: &[db::Todo]) -> Vec<serde_json::Value> {
+    items
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "content": t.content,
+                "status": t.status,
+                "active_form": t.active_form,
+            })
+        })
+        .collect()
+}
+
+/// One recorded fact, with the shared validation and answer shape.
+///
+/// The three `remember_*` tools differ only in the [`db::Fact`] they build.
+/// Everything that must stay identical across them — refusing empty text,
+/// resolving the session, shaping the answer — lives here once, so the three
+/// tools cannot drift apart.
+fn remember(ctx: &ToolCtx<'_>, fact: db::Fact<'_>) -> ToolResult {
+    let kind = fact.kind();
+    let text = fact.text().trim();
+    if text.is_empty() {
+        return ToolResult::err_code(
+            ErrorCode::InvalidArguments,
+            format!("{kind} text is empty — nothing to record"),
+        );
+    }
+    let conn = match db_guard(ctx) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let session = match resolve_session(&conn, None) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match db::record_fact(&conn, session, &fact) {
+        Ok(id) => ToolResult::ok_structured(
+            format!("recorded {kind}: {}\n", clip_chars(text, 160)),
+            serde_json::json!({ "id": id, "kind": kind, "session_id": session }),
+        ),
+        Err(e) => db_failed(&format!("could not record the {kind}"), e),
+    }
+}
+
+fn render_facts(f: &db::ProjectFacts) -> String {
+    let mut out = match &f.objective {
+        Some(o) => format!("objective: {o}\n"),
+        None => "objective: (none recorded)\n".to_string(),
+    };
+    out.push_str(&format!(
+        "progress: {}%  ·  {} decision(s)  ·  {} constraint(s)  ·  {} \
+         failed attempt(s)  ·  {} changed file(s)\n",
+        f.progress_percent,
+        f.decisions.len(),
+        f.constraints.len(),
+        f.failed_attempts.len(),
+        f.changed_files.len(),
+    ));
+    for (heading, rows) in [
+        ("decisions", &f.decisions),
+        ("constraints", &f.constraints),
+        ("failed attempts (do not repeat)", &f.failed_attempts),
+        ("changed files", &f.changed_files),
+    ] {
+        if rows.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("\n{heading}:\n"));
+        for r in rows.iter() {
+            out.push_str(&format!("  - {r}\n"));
+        }
+    }
+    out
+}
+
+/// The handoff card as text.
+///
+/// Text as well as structure, because a handoff is the one result a caller is
+/// likely to *paste* into a fresh conversation, where prose is what survives.
+pub(crate) fn render_handoff(h: &crate::Handoff) -> String {
+    let mut out = format!(
+        "objective: {}\nprogress: {}%  ·  {} file(s) changed  ·  {} error(s) open\n",
+        h.objective, h.progress_percent, h.files_changed, h.errors_remaining
+    );
+    if let Some(reason) = &h.end_reason {
+        out.push_str(&format!("ended: {reason}\n"));
+    }
+    if let Some(next) = &h.next_step {
+        out.push_str(&format!("next step: {next}\n"));
+    }
+    for (heading, rows) in [
+        ("decisions", &h.decisions),
+        ("constraints", &h.constraints),
+        ("failed attempts (do not repeat)", &h.failed_attempts),
+        ("files", &h.files),
+    ] {
+        if rows.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("\n{heading}:\n"));
+        for r in rows.iter() {
+            out.push_str(&format!("  - {r}\n"));
+        }
+    }
+    if let Some(ctx) = &h.context {
+        out.push_str(&format!("\ncontext:\n{ctx}\n"));
+    }
+    out.push_str(&format!("\n(generated {})\n", h.generated_at));
+    out
+}
+
+/// Run one of the memory tools.
+///
+/// These reach the database rather than the workspace, so none of them takes a
+/// project root — and `get_handoff` builds its card from the desktop's own
+/// view of the project rather than from the call's root argument, which is why
+/// it does not take one either.
+/// How long `ask_user` / `propose_plan` may wait for the developer before
+/// giving up. Matches the connector's approval window: a call that blocks
+/// longer than the transport allows is a call the caller has already stopped
+/// waiting for.
+const QUESTION_WAIT: Duration = Duration::from_secs(120);
+
+/// Tools whose result can exceed a page; caps shared by the renderers.
+const DIAGNOSTIC_CAP: usize = 100;
+const LOCATION_CAP: usize = 200;
+const SYMBOL_CAP: usize = 200;
+const MONITOR_CAP_MS: u32 = 120_000;
+
+/// The root for a Phase 7–10 tool: the active worktree when the session is
+/// inside one, otherwise the project root.
+fn phase_root(ctx: &ToolCtx<'_>) -> Result<PathBuf, ToolResult> {
+    let active = ctx
+        .state
+        .and_then(|s| s.active_worktree.lock().ok().and_then(|g| g.clone()));
+    active
+        .or_else(|| ctx.root.map(Path::to_path_buf))
+        .ok_or_else(|| ToolResult::err_code(ErrorCode::InternalError, "project root not set"))
+}
+
+/// Resolve a workspace-relative path, mapping the failure to the same codes
+/// the file tools use so a caller can branch on them.
+fn phase_path(root: &Path, path: &str) -> Result<PathBuf, ToolResult> {
+    resolve_path(root, path).map_err(|e| {
+        if e.contains("escapes project root") {
+            ToolResult::err_code(ErrorCode::PathEscapesRoot, e)
+        } else {
+            ToolResult::err_code(ErrorCode::FileNotFound, e)
+        }
+    })
+}
+
+/// Dispatch every Phase 7–10 tool. Each arm is responsible for its own root
+/// and state, because those needs differ per tool.
+fn run_phase_tool(tool: &Tool, ctx: &ToolCtx<'_>) -> ToolResult {
+    match tool {
+        Tool::WebFetch { url, max_bytes } => run_web_fetch(url, *max_bytes),
+        Tool::WebSearch {
+            query,
+            max_results,
+        } => run_web_search(query, *max_results),
+        Tool::NotebookRead { path } => run_notebook_read(ctx, path),
+        Tool::NotebookEdit {
+            path,
+            cell_id,
+            new_source,
+            cell_type,
+        } => run_notebook_edit(ctx, path, cell_id, new_source, cell_type.as_deref()),
+        Tool::DelegateTask { task, .. } => ToolResult::err_code(
+            ErrorCode::AgentNotAvailable,
+            format!(
+                "there is no agent runtime for delegate_task to hand '{task}' to in this build; \
+                 do the work with the tools you already have, or ask the developer to run it"
+            ),
+        ),
+        Tool::LspDiagnostics { path, severity } => {
+            run_lsp_diagnostics(ctx, path.as_deref(), severity.as_deref())
+        }
+        Tool::LspDefinition {
+            path,
+            line,
+            character,
+        } => run_lsp_definition(ctx, path, *line, *character),
+        Tool::LspReferences {
+            path,
+            line,
+            character,
+            include_declaration,
+        } => run_lsp_references(ctx, path, *line, *character, *include_declaration),
+        Tool::LspSymbols { path, query } => {
+            run_lsp_symbols(ctx, path.as_deref(), query.as_deref())
+        }
+        Tool::AskUser { question, options } => {
+            run_ask_user(ctx, question, options)
+        }
+        Tool::ProposePlan { plan, steps } => run_propose_plan(ctx, plan, steps),
+        Tool::Monitor {
+            path,
+            command_id,
+            pattern,
+            timeout_ms,
+        } => run_monitor(ctx, path.as_deref(), *command_id, pattern.as_deref(), *timeout_ms),
+        Tool::Notify {
+            title,
+            body,
+            level,
+        } => run_notify(ctx, title, body, level.as_deref()),
+        Tool::EnterWorktree { name } => run_enter_worktree(ctx, name.as_deref()),
+        Tool::ExitWorktree { action } => run_exit_worktree(ctx, action.as_deref()),
+        Tool::ReadMedia { path } => run_read_media(ctx, path),
+        Tool::PublishArtifact { path, title } => {
+            run_publish_artifact(ctx, path, title.as_deref())
+        }
+        Tool::ReportFindings { findings, summary } => {
+            run_report_findings(findings, summary.as_deref())
+        }
+        // Every variant is listed in the caller's pre-dispatch; reaching here
+        // would mean that list and this one drifted.
+        other => ToolResult::err_code(
+            ErrorCode::InternalError,
+            format!("unhandled phase tool: {other:?}"),
+        ),
+    }
+}
+
+// --- web ---------------------------------------------------------------------
+
+fn run_web_fetch(url: &str, max_bytes: Option<u64>) -> ToolResult {
+    let plan = match web::plan(url, max_bytes) {
+        Ok(p) => p,
+        Err(r) => return ToolResult::err_code(ErrorCode::NetworkBlocked, r.message()),
+    };
+    match web::fetch(&plan) {
+        Ok(page) => {
+            let text = if page.body.trim().is_empty() {
+                format!(
+                    "{} {} — no text content ({} bytes, {})",
+                    page.status, page.status_text, page.bytes, page.content_type
+                )
+            } else {
+                page.body.clone()
+            };
+            ToolResult::ok_structured(
+                text,
+                serde_json::json!({
+                    "url": page.url,
+                    "status": page.status,
+                    "content_type": page.content_type,
+                    "bytes": page.bytes,
+                    "truncated": page.truncated,
+                    "reduced_html": page.reduced_html,
+                    "redirects": page.redirects,
+                }),
+            )
+        }
+        Err(r) => ToolResult::err_code(ErrorCode::NetworkBlocked, r.message()),
+    }
+}
+
+fn run_web_search(query: &str, max_results: Option<u32>) -> ToolResult {
+    let want = max_results.unwrap_or(8).clamp(1, 20) as usize;
+    match web::search(query, max_results) {
+        Ok(results) => {
+            let truncated = results.len() >= want;
+            let text = if results.is_empty() {
+                format!("no results for {query:?}")
+            } else {
+                results
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        format!(
+                            "{}. {}\n   {}\n   {}",
+                            i + 1,
+                            r.title,
+                            r.url,
+                            r.snippet
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            ToolResult::ok_structured(
+                text,
+                serde_json::json!({
+                    "query": query,
+                    "results": results,
+                    "truncated": truncated,
+                }),
+            )
+        }
+        Err(r) => ToolResult::err_code(ErrorCode::NetworkBlocked, r.message()),
+    }
+}
+
+// --- notebooks ---------------------------------------------------------------
+
+fn notebook_error(path: &str, e: notebook::NotebookError) -> ToolResult {
+    match e {
+        notebook::NotebookError::Io(msg) => {
+            ToolResult::err_code(ErrorCode::FileNotFound, format!("{path}: {msg}"))
+        }
+        notebook::NotebookError::Invalid(msg) => {
+            ToolResult::err_code(ErrorCode::NotebookInvalid, format!("{path}: {msg}"))
+        }
+        notebook::NotebookError::NoSuchCell(id) => {
+            ToolResult::err_code(ErrorCode::NotebookInvalid, format!("{path}: no cell '{id}'"))
+        }
+    }
+}
+
+fn render_notebook(path: &str, nb: &notebook::Notebook) -> String {
+    let mut out = format!(
+        "{path} — {} cell(s){}\n",
+        nb.cells.len(),
+        nb.kernel
+            .as_deref()
+            .map(|k| format!(", kernel {k}"))
+            .unwrap_or_default()
+    );
+    for cell in &nb.cells {
+        out.push_str(&format!(
+            "\n--- cell {} [{}] ({} output(s)) ---\n{}\n",
+            cell.id, cell.cell_type, cell.outputs, cell.source
+        ));
+    }
+    out
+}
+
+fn run_notebook_read(ctx: &ToolCtx<'_>, path: &str) -> ToolResult {
+    let root = match phase_root(ctx) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let p = match phase_path(&root, path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    // An `Auto` read that reached every path would be a way around the
+    // sensitive-path gate `read_file` sits behind.
+    if is_sensitive_path(&p) {
+        return ToolResult::err_code(
+            ErrorCode::SensitivePath,
+            format!("{path}: sensitive path, not read"),
+        );
+    }
+    match notebook::read(&p) {
+        Ok(nb) => {
+            let cells: Vec<serde_json::Value> = nb
+                .cells
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "cell_id": c.id,
+                        "cell_type": c.cell_type,
+                        "source": c.source,
+                        "outputs": c.outputs,
+                    })
+                })
+                .collect();
+            ToolResult::ok_structured(
+                render_notebook(path, &nb),
+                serde_json::json!({ "path": path, "kernel": nb.kernel, "cells": cells }),
+            )
+        }
+        Err(e) => notebook_error(path, e),
+    }
+}
+
+fn run_notebook_edit(
+    ctx: &ToolCtx<'_>,
+    path: &str,
+    cell_id: &str,
+    new_source: &str,
+    cell_type: Option<&str>,
+) -> ToolResult {
+    let root = match phase_root(ctx) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let p = match phase_path(&root, path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if is_sensitive_path(&p) {
+        return ToolResult::err_code(
+            ErrorCode::SensitivePath,
+            format!("{path}: sensitive path, not edited"),
+        );
+    }
+    match notebook::edit(&p, cell_id, new_source, cell_type) {
+        Ok(outcome) => ToolResult::ok_structured(
+            format!(
+                "edited {} cell {} [{}] ({} bytes)",
+                path, outcome.cell_id, outcome.cell_type, outcome.bytes_written
+            ),
+            serde_json::json!({
+                "path": path,
+                "cell_id": outcome.cell_id,
+                "cell_type": outcome.cell_type,
+                "bytes_written": outcome.bytes_written,
+            }),
+        ),
+        Err(e) => notebook_error(path, e),
+    }
+}
+
+// --- language server ---------------------------------------------------------
+
+/// Run `f` against the cached server for `root`, starting one if needed.
+///
+/// A protocol failure evicts the client, so a server that has died is
+/// replaced on the next request instead of failing every call until the app
+/// restarts. An unavailable server is not cached, so a project that gains a
+/// server (a `Cargo.toml` added during the session) is noticed.
+fn with_lsp<R>(
+    ctx: &ToolCtx<'_>,
+    root: &Path,
+    f: impl FnOnce(&mut lsp::Client) -> Result<R, lsp::LspError>,
+) -> Result<R, ToolResult> {
+    let Some(state) = ctx.state else {
+        return Err(ToolResult::err_code(
+            ErrorCode::LspUnavailable,
+            "no language-server registry in this context",
+        ));
+    };
+    let mut clients = state.lsp_clients.lock().unwrap();
+    if !clients.contains_key(root) {
+        match lsp::Client::start(root) {
+            Ok(c) => {
+                clients.insert(root.to_path_buf(), c);
+            }
+            Err(e) => {
+                return Err(ToolResult::err_code(
+                    ErrorCode::LspUnavailable,
+                    e.to_string(),
+                ))
+            }
+        }
+    }
+    let outcome = {
+        let client = clients.get_mut(root).expect("just inserted");
+        f(client)
+    };
+    match outcome {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            if matches!(e, lsp::LspError::Protocol(_)) {
+                clients.remove(root);
+            }
+            let code = match e {
+                lsp::LspError::Unavailable(_) => ErrorCode::LspUnavailable,
+                lsp::LspError::Protocol(_) => ErrorCode::LspProtocolError,
+            };
+            Err(ToolResult::err_code(code, e.to_string()))
+        }
+    }
+}
+
+/// Severity as a rank, so "at least a warning" is a comparison.
+fn severity_rank(sev: &str) -> u8 {
+    match sev {
+        "error" => 0,
+        "warning" => 1,
+        "information" => 2,
+        _ => 3,
+    }
+}
+
+fn run_lsp_diagnostics(
+    ctx: &ToolCtx<'_>,
+    path: Option<&str>,
+    min_severity: Option<&str>,
+) -> ToolResult {
+    let root = match phase_root(ctx) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let resolved = match path {
+        Some(p) => match phase_path(&root, p) {
+            Ok(p) => Some(p),
+            Err(e) => return e,
+        },
+        None => None,
+    };
+    let min = severity_rank(min_severity.unwrap_or("warning"));
+    let (server, mut diagnostics) = match with_lsp(ctx, &root, |c| {
+        let server = c.server.clone();
+        c.diagnostics(resolved.as_deref()).map(|d| (server, d))
+    }) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    diagnostics.retain(|d| severity_rank(&d.severity) <= min);
+    diagnostics.sort_by(|a, b| {
+        severity_rank(&a.severity)
+            .cmp(&severity_rank(&b.severity))
+            .then_with(|| (a.path.as_str(), a.line, a.character).cmp(&(b.path.as_str(), b.line, b.character)))
+    });
+    // Dedupe: servers happily report the same diagnostic from two passes.
+    diagnostics.dedup_by(|a, b| {
+        a.path == b.path && a.line == b.line && a.character == b.character && a.message == b.message
+    });
+    let truncated = diagnostics.len() > DIAGNOSTIC_CAP;
+    diagnostics.truncate(DIAGNOSTIC_CAP);
+    let scanned = if resolved.is_some() { 1 } else { 0 };
+    let json: Vec<serde_json::Value> = diagnostics
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "path": d.path,
+                "line": d.line,
+                "character": d.character,
+                "severity": d.severity,
+                "message": d.message,
+                "source": d.source,
+            })
+        })
+        .collect();
+    let text = if diagnostics.is_empty() {
+        format!("no diagnostics from {server}")
+    } else {
+        let mut out = format!("{} diagnostic(s) from {server}\n", diagnostics.len());
+        for d in &diagnostics {
+            out.push_str(&format!(
+                "{}:{}:{} {} {}\n",
+                d.path, d.line, d.character, d.severity, d.message
+            ));
+        }
+        if truncated {
+            out.push_str("[more diagnostics withheld]\n");
+        }
+        out
+    };
+    ToolResult::ok_structured(
+        text,
+        serde_json::json!({
+            "server": server,
+            "scanned": scanned,
+            "diagnostics": json,
+            "truncated": truncated,
+            "unavailable": false,
+        }),
+    )
+}
+
+fn location_json(locs: &[lsp::Location]) -> Vec<serde_json::Value> {
+    locs.iter()
+        .map(|l| {
+            serde_json::json!({
+                "path": l.path,
+                "line": l.line,
+                "character": l.character,
+            })
+        })
+        .collect()
+}
+
+fn render_locations(verb: &str, locs: &[lsp::Location]) -> String {
+    if locs.is_empty() {
+        format!("no {verb} found")
+    } else {
+        locs.iter()
+            .map(|l| format!("{}:{}:{}", l.path, l.line, l.character))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn run_lsp_definition(ctx: &ToolCtx<'_>, path: &str, line: u32, character: u32) -> ToolResult {
+    let root = match phase_root(ctx) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let p = match phase_path(&root, path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let pos = lsp::Position { line, character };
+    let (server, mut locs) = match with_lsp(ctx, &root, |c| {
+        let server = c.server.clone();
+        c.definition(&p, pos).map(|l| (server, l))
+    }) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let truncated = locs.len() > LOCATION_CAP;
+    locs.truncate(LOCATION_CAP);
+    ToolResult::ok_structured(
+        render_locations("definitions", &locs),
+        serde_json::json!({
+            "server": server,
+            "locations": location_json(&locs),
+            "truncated": truncated,
+            "unavailable": false,
+        }),
+    )
+}
+
+fn run_lsp_references(
+    ctx: &ToolCtx<'_>,
+    path: &str,
+    line: u32,
+    character: u32,
+    include_declaration: Option<bool>,
+) -> ToolResult {
+    let root = match phase_root(ctx) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let p = match phase_path(&root, path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let pos = lsp::Position { line, character };
+    let include = include_declaration.unwrap_or(true);
+    let (server, mut locs) = match with_lsp(ctx, &root, |c| {
+        let server = c.server.clone();
+        c.references(&p, pos, include).map(|l| (server, l))
+    }) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let truncated = locs.len() > LOCATION_CAP;
+    locs.truncate(LOCATION_CAP);
+    ToolResult::ok_structured(
+        render_locations("references", &locs),
+        serde_json::json!({
+            "server": server,
+            "locations": location_json(&locs),
+            "truncated": truncated,
+            "unavailable": false,
+        }),
+    )
+}
+
+fn run_lsp_symbols(
+    ctx: &ToolCtx<'_>,
+    path: Option<&str>,
+    query: Option<&str>,
+) -> ToolResult {
+    let root = match phase_root(ctx) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let resolved = match path {
+        Some(p) => match phase_path(&root, p) {
+            Ok(p) => Some(p),
+            Err(e) => return e,
+        },
+        None => None,
+    };
+    let (server, mut symbols) = match with_lsp(ctx, &root, |c| {
+        let server = c.server.clone();
+        c.symbols(resolved.as_deref(), query).map(|s| (server, s))
+    }) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let truncated = symbols.len() > SYMBOL_CAP;
+    symbols.truncate(SYMBOL_CAP);
+    let json: Vec<serde_json::Value> = symbols
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "kind": s.kind,
+                "path": s.path,
+                "line": s.line,
+                "container": s.container,
+            })
+        })
+        .collect();
+    let text = if symbols.is_empty() {
+        "no symbols found".to_string()
+    } else {
+        symbols
+            .iter()
+            .map(|s| {
+                format!(
+                    "{} {}  {}:{}",
+                    s.kind, s.name, s.path, s.line
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    ToolResult::ok_structured(
+        text,
+        serde_json::json!({
+            "server": server,
+            "symbols": json,
+            "truncated": truncated,
+            "unavailable": false,
+        }),
+    )
+}
+
+// --- agent loop --------------------------------------------------------------
+
+/// Put a card on the desktop and block until it is answered.
+///
+/// `Ok(None)` is a timeout — the developer did not answer in time — which is
+/// not the same as "no desktop": one is a person who stepped away, the other
+/// is a harness that cannot ask, and only the second is a tool failure.
+fn ask_desktop(
+    ctx: &ToolCtx<'_>,
+    kind: &str,
+    title: &str,
+    body: &str,
+    options: &[String],
+) -> Result<Option<QuestionAnswer>, ToolResult> {
+    let Some(state) = ctx.state else {
+        return Err(ToolResult::err_code(
+            ErrorCode::AgentNotAvailable,
+            "no desktop is attached to answer; ask the developer in the chat instead",
+        ));
+    };
+    let id = state.question_seq.fetch_add(1, Ordering::SeqCst);
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    state.questions.lock().unwrap().insert(id, tx);
+    let card = QuestionCard {
+        id,
+        kind: kind.to_string(),
+        title: title.to_string(),
+        body: body.to_string(),
+        options: options.to_vec(),
+        source: SOURCE_MCP.to_string(),
+    };
+    let emitted = state
+        .app_handle
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|h| {
+            use tauri::Emitter;
+            h.emit("bridge://question-requested", &card).is_ok()
+        })
+        .unwrap_or(false);
+    if !emitted {
+        state.questions.lock().unwrap().remove(&id);
+        return Err(ToolResult::err_code(
+            ErrorCode::AgentNotAvailable,
+            "no desktop is attached to answer; ask the developer in the chat instead",
+        ));
+    }
+    match rx.recv_timeout(QUESTION_WAIT) {
+        Ok(answer) => Ok(Some(answer)),
+        Err(_) => {
+            state.questions.lock().unwrap().remove(&id);
+            Ok(None)
+        }
+    }
+}
+
+fn run_ask_user(ctx: &ToolCtx<'_>, question: &str, options: &[String]) -> ToolResult {
+    match ask_desktop(
+        ctx,
+        "question",
+        "The assistant has a question",
+        question,
+        options,
+    ) {
+        Ok(Some(a)) => ToolResult::ok_structured(
+            format!("answer: {}", a.answer),
+            serde_json::json!({
+                "question": question,
+                "option": a.option,
+                "answer": a.answer,
+                "timed_out": false,
+            }),
+        ),
+        Ok(None) => ToolResult::ok_structured(
+            format!("no answer within {}s", QUESTION_WAIT.as_secs()),
+            serde_json::json!({
+                "question": question,
+                "option": serde_json::Value::Null,
+                "answer": "",
+                "timed_out": true,
+            }),
+        ),
+        Err(e) => e,
+    }
+}
+
+fn run_propose_plan(ctx: &ToolCtx<'_>, plan: &str, steps: &[String]) -> ToolResult {
+    let body = if steps.is_empty() {
+        plan.to_string()
+    } else {
+        format!(
+            "{plan}\n\n{}",
+            steps
+                .iter()
+                .enumerate()
+                .map(|(i, s)| format!("{}. {s}", i + 1))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    let options = vec!["Allow".to_string(), "Deny".to_string()];
+    match ask_desktop(ctx, "plan", "Plan for approval", &body, &options) {
+        Ok(Some(a)) => {
+            let approved = a
+                .option
+                .as_deref()
+                .map(|o| o.eq_ignore_ascii_case("allow"))
+                .unwrap_or(false);
+            let comment = (!a.answer.trim().is_empty()).then(|| a.answer.clone());
+            ToolResult::ok_structured(
+                if approved {
+                    "plan approved".to_string()
+                } else {
+                    format!("plan denied{}", comment.as_deref().map(|c| format!(": {c}")).unwrap_or_default())
+                },
+                serde_json::json!({
+                    "approved": approved,
+                    "comment": comment,
+                    "steps": steps.len(),
+                    "timed_out": false,
+                }),
+            )
+        }
+        Ok(None) => ToolResult::ok_structured(
+            "plan approval timed out; do not proceed".to_string(),
+            serde_json::json!({
+                "approved": false,
+                "comment": serde_json::Value::Null,
+                "steps": steps.len(),
+                "timed_out": true,
+            }),
+        ),
+        Err(e) => e,
+    }
+}
+
+fn run_notify(ctx: &ToolCtx<'_>, title: &str, body: &str, level: Option<&str>) -> ToolResult {
+    let level = level.unwrap_or("info");
+    let raised = ctx
+        .state
+        .and_then(|s| s.app_handle.lock().unwrap().clone())
+        .map(|h| {
+            use tauri::Emitter;
+            h.emit(
+                "bridge://notify",
+                serde_json::json!({ "title": title, "body": body, "level": level }),
+            )
+            .is_ok()
+        })
+        .unwrap_or(false);
+    ToolResult::ok_structured(
+        format!("[{level}] {title}: {body}"),
+        serde_json::json!({ "title": title, "level": level, "raised": raised }),
+    )
+}
+
+fn run_monitor(
+    ctx: &ToolCtx<'_>,
+    path: Option<&str>,
+    command_id: Option<u64>,
+    pattern: Option<&str>,
+    timeout_ms: Option<u32>,
+) -> ToolResult {
+    let timeout = Duration::from_millis(
+        timeout_ms.unwrap_or(60_000).clamp(1_000, MONITOR_CAP_MS) as u64,
+    );
+    let re = match pattern {
+        Some(p) => match regex::Regex::new(p) {
+            Ok(re) => Some(re),
+            Err(e) => {
+                return ToolResult::err_code(
+                    ErrorCode::RegexInvalid,
+                    format!("bad pattern {p:?}: {e}"),
+                )
+            }
+        },
+        None => None,
+    };
+    match (path, command_id) {
+        (Some(path), None) => monitor_path(ctx, path, re.as_ref(), timeout),
+        (None, Some(id)) => monitor_command(ctx, id, re.as_ref(), timeout),
+        _ => ToolResult::err_code(
+            ErrorCode::InvalidArguments,
+            "monitor needs exactly one of `path` or `command_id`",
+        ),
+    }
+}
+
+fn monitor_path(
+    ctx: &ToolCtx<'_>,
+    path: &str,
+    re: Option<&regex::Regex>,
+    timeout: Duration,
+) -> ToolResult {
+    let root = match phase_root(ctx) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let p = match phase_path(&root, path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let started = Instant::now();
+    let before = fingerprint(&p);
+    loop {
+        thread::sleep(Duration::from_millis(250));
+        let after = fingerprint(&p);
+        if after != before {
+            let detail = match re {
+                None => Some(format!("{path} changed")),
+                Some(re) => match std::fs::read_to_string(&p) {
+                    Ok(text) => re.find(&text).map(|m| {
+                        format!("matched {:?}", m.as_str())
+                    }),
+                    Err(_) => None,
+                },
+            };
+            if detail.is_some() {
+                return ToolResult::ok_structured(
+                    detail.clone().unwrap(),
+                    serde_json::json!({
+                        "matched": true,
+                        "reason": "path",
+                        "detail": detail,
+                        "elapsed_ms": started.elapsed().as_millis() as u64,
+                    }),
+                );
+            }
+        }
+        if started.elapsed() >= timeout {
+            return ToolResult::ok_structured(
+                format!("no match within {}ms", timeout.as_millis()),
+                serde_json::json!({
+                    "matched": false,
+                    "reason": "timeout",
+                    "detail": serde_json::Value::Null,
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                }),
+            );
+        }
+    }
+}
+
+/// A cheap change signal: existence, size, and modification time.
+fn fingerprint(p: &Path) -> Option<(u64, Option<std::time::SystemTime>)> {
+    std::fs::metadata(p)
+        .ok()
+        .map(|m| (m.len(), m.modified().ok()))
+}
+
+fn monitor_command(
+    ctx: &ToolCtx<'_>,
+    id: u64,
+    re: Option<&regex::Regex>,
+    timeout: Duration,
+) -> ToolResult {
+    let Some(state) = ctx.state else {
+        return ToolResult::err_code(
+            ErrorCode::InternalError,
+            "no background-command manager in this context",
+        );
+    };
+    let manager = &state.bgproc;
+    let started = Instant::now();
+    let mut cursor = 0u64;
+    loop {
+        match manager.snapshot(id, cursor) {
+            Ok(s) => {
+                cursor = s.next_cursor;
+                let matched = match re {
+                    None => !s.output.is_empty(),
+                    Some(re) => re.is_match(&s.output),
+                };
+                if matched {
+                    return ToolResult::ok_structured(
+                        format!("command #{id} output matched"),
+                        serde_json::json!({
+                            "matched": true,
+                            "reason": "command",
+                            "detail": s.output.chars().take(2000).collect::<String>(),
+                            "elapsed_ms": started.elapsed().as_millis() as u64,
+                        }),
+                    );
+                }
+                if s.complete {
+                    return ToolResult::ok_structured(
+                        format!("command #{id} finished without a match"),
+                        serde_json::json!({
+                            "matched": false,
+                            "reason": "command_finished",
+                            "detail": serde_json::Value::Null,
+                            "elapsed_ms": started.elapsed().as_millis() as u64,
+                        }),
+                    );
+                }
+            }
+            Err(lookup) => {
+                return ToolResult::err_code(
+                    missing_command_code(lookup),
+                    missing_command_message(lookup, id),
+                )
+            }
+        }
+        if started.elapsed() >= timeout {
+            return ToolResult::ok_structured(
+                format!("no match within {}ms", timeout.as_millis()),
+                serde_json::json!({
+                    "matched": false,
+                    "reason": "timeout",
+                    "detail": serde_json::Value::Null,
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                }),
+            );
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+// --- isolation & delivery ----------------------------------------------------
+
+fn run_enter_worktree(ctx: &ToolCtx<'_>, name: Option<&str>) -> ToolResult {
+    let root = match phase_root(ctx) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let Some(state) = ctx.state else {
+        return ToolResult::err_code(
+            ErrorCode::InternalError,
+            "no app state to record the worktree in",
+        );
+    };
+    if state.active_worktree.lock().unwrap().is_some() {
+        return ToolResult::err_code(
+            ErrorCode::InvalidArguments,
+            "already inside a worktree; call exit_worktree first",
+        );
+    }
+    let name = name.map(str::to_string).unwrap_or_else(|| {
+        format!(
+            "wt-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        )
+    });
+    let repo = match git::open_repo(&root) {
+        Ok(r) => r,
+        Err(e) => return ToolResult::err_code(ErrorCode::NotAGitRepo, format!("{root:?}: {e}")),
+    };
+    match git::add_worktree(&repo, &root, &name) {
+        Ok(info) => {
+            *state.active_worktree.lock().unwrap() = Some(PathBuf::from(&info.path));
+            ToolResult::ok_structured(
+                format!(
+                    "entered worktree {} on branch {} — subsequent tools work there",
+                    info.path, info.branch
+                ),
+                serde_json::json!({
+                    "worktree": info.path,
+                    "branch": info.branch,
+                    "active": true,
+                    "removed": false,
+                }),
+            )
+        }
+        Err(e) => ToolResult::err_code(
+            ErrorCode::ExecutionFailed,
+            format!("could not create worktree {name:?}: {e}"),
+        ),
+    }
+}
+
+fn run_exit_worktree(ctx: &ToolCtx<'_>, action: Option<&str>) -> ToolResult {
+    let Some(state) = ctx.state else {
+        return ToolResult::err_code(ErrorCode::InternalError, "no app state");
+    };
+    let active = state.active_worktree.lock().unwrap().clone();
+    let Some(wt_path) = active else {
+        return ToolResult::err_code(
+            ErrorCode::InvalidArguments,
+            "not inside a worktree",
+        );
+    };
+    let discard = action.map(|a| a.eq_ignore_ascii_case("discard")) == Some(true);
+    let project_root = ctx.root.map(Path::to_path_buf).unwrap_or_else(|| wt_path.clone());
+    let repo = match git::open_repo(&project_root) {
+        Ok(r) => r,
+        Err(e) => return ToolResult::err_code(ErrorCode::NotAGitRepo, e.to_string()),
+    };
+    let name = wt_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if discard {
+        if let Err(e) = git::remove_worktree(&repo, &name, true) {
+            return ToolResult::err_code(
+                ErrorCode::ExecutionFailed,
+                format!("could not remove worktree {name:?}: {e}"),
+            );
+        }
+    }
+    *state.active_worktree.lock().unwrap() = None;
+    ToolResult::ok_structured(
+        if discard {
+            format!("left and removed worktree {name}")
+        } else {
+            format!("left worktree {name} (kept on disk)")
+        },
+        serde_json::json!({
+            "worktree": wt_path.to_string_lossy(),
+            "branch": name,
+            "active": false,
+            "removed": discard,
+        }),
+    )
+}
+
+fn run_read_media(ctx: &ToolCtx<'_>, path: &str) -> ToolResult {
+    let root = match phase_root(ctx) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let p = match phase_path(&root, path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if is_sensitive_path(&p) {
+        return ToolResult::err_code(
+            ErrorCode::SensitivePath,
+            format!("{path}: sensitive path, not returned as media"),
+        );
+    }
+    let md = match std::fs::metadata(&p) {
+        Ok(md) if md.is_dir() => {
+            return ToolResult::err_code(
+                ErrorCode::InvalidArguments,
+                format!("{path} is a directory"),
+            )
+        }
+        Ok(md) => md,
+        Err(e) => return ToolResult::err_code(ErrorCode::FileNotFound, format!("{path}: {e}")),
+    };
+    if md.len() > media::MAX_MEDIA_BYTES {
+        return ToolResult::err_code(
+            ErrorCode::FileTooLarge,
+            format!(
+                "{path}: {} bytes exceeds the {} byte media cap",
+                md.len(),
+                media::MAX_MEDIA_BYTES
+            ),
+        );
+    }
+    let Some(mime) = media::mime_for(&p) else {
+        return ToolResult::err_code(
+            ErrorCode::InvalidArguments,
+            format!("{path}: not a media type this tool returns; use read_file"),
+        );
+    };
+    let bytes = match std::fs::read(&p) {
+        Ok(b) => b,
+        Err(e) => return ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{path}: {e}")),
+    };
+    let kind = match media::kind_for(mime) {
+        media::MediaKind::Image => "image",
+        media::MediaKind::Pdf => "pdf",
+        media::MediaKind::Text => "text",
+    };
+    let encoded = media::base64_encode(&bytes);
+    ToolResult::ok_media(
+        format!("{path} — {mime}, {} bytes", bytes.len()),
+        serde_json::json!({
+            "path": path,
+            "media_type": mime,
+            "bytes": bytes.len(),
+            "kind": kind,
+        }),
+        MediaPayload {
+            media_type: mime.to_string(),
+            base64: encoded,
+            kind: kind.to_string(),
+        },
+    )
+}
+
+fn run_publish_artifact(ctx: &ToolCtx<'_>, path: &str, title: Option<&str>) -> ToolResult {
+    let root = match phase_root(ctx) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let p = match phase_path(&root, path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let bytes = match std::fs::read(&p) {
+        Ok(b) => b,
+        Err(e) => return ToolResult::err_code(ErrorCode::FileNotFound, format!("{path}: {e}")),
+    };
+    let file_name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "artifact".to_string());
+    let dir = root.join(".lexsus/artifacts");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return ToolResult::err_code(ErrorCode::ExecutionFailed, format!("artifacts dir: {e}"));
+    }
+    let dest = dir.join(&file_name);
+    if let Err(e) = std::fs::write(&dest, &bytes) {
+        return ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{file_name}: {e}"));
+    }
+    let media_type = media::mime_for(&p).unwrap_or("application/octet-stream");
+    let title = title.unwrap_or(&file_name);
+    ToolResult::ok_structured(
+        format!("published {title} -> {}", dest.display()),
+        serde_json::json!({
+            "path": path,
+            "artifact": dest.to_string_lossy(),
+            "title": title,
+            "bytes": bytes.len(),
+            "media_type": media_type,
+        }),
+    )
+}
+
+fn run_report_findings(findings: &[Finding], summary: Option<&str>) -> ToolResult {
+    let errors = findings.iter().filter(|f| f.severity == "error").count();
+    let warnings = findings.iter().filter(|f| f.severity == "warning").count();
+    let mut text = String::new();
+    if let Some(s) = summary {
+        text.push_str(s);
+        text.push('\n');
+    }
+    text.push_str(&format!(
+        "{} finding(s): {errors} error, {warnings} warning\n",
+        findings.len()
+    ));
+    for f in findings {
+        text.push_str(&format!(
+            "[{}] {}:{} {}{}\n",
+            f.severity,
+            f.path,
+            f.line,
+            f.claim,
+            f.evidence
+                .as_deref()
+                .map(|e| format!("  ({e})"))
+                .unwrap_or_default()
+        ));
+    }
+    let json: Vec<serde_json::Value> = findings
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "path": f.path,
+                "line": f.line,
+                "severity": f.severity,
+                "claim": f.claim,
+                "evidence": f.evidence,
+            })
+        })
+        .collect();
+    ToolResult::ok_structured(
+        text,
+        serde_json::json!({
+            "summary": summary,
+            "count": findings.len(),
+            "errors": errors,
+            "warnings": warnings,
+            "findings": json,
+        }),
+    )
+}
+
+fn run_memory_tool(tool: &Tool, ctx: &ToolCtx<'_>) -> ToolResult {
+    match tool {
+        Tool::TodoWrite { todos } => {
+            // Validate before writing: a list is one value, so nothing is
+            // stored unless all of it is.
+            let items = match normalise_todos(todos) {
+                Ok(i) => i,
+                Err(r) => return r,
+            };
+            let conn = match db_guard(ctx) {
+                Ok(c) => c,
+                Err(r) => return r,
+            };
+            let session = match connector_session(&conn) {
+                Ok(s) => s,
+                Err(r) => return r,
+            };
+            if let Err(e) = db::replace_todos(&conn, session, &items) {
+                return db_failed("could not save the task list", e);
+            }
+            // Answer from what was *stored*, not from what was handed in.
+            // The two agree by construction today, which is exactly why the
+            // difference would never be noticed: echoing the input would
+            // report success for a write that quietly kept the old rows too.
+            // Reading back costs one query and makes the answer evidence.
+            match db::read_todos(&conn, session) {
+                Ok(stored) => ToolResult::ok_structured(
+                    render_todos(&stored),
+                    serde_json::json!({ "count": stored.len(), "todos": todo_json(&stored) }),
+                ),
+                Err(e) => db_failed("could not read the task list back", e),
+            }
+        }
+        Tool::TodoRead => {
+            let conn = match db_guard(ctx) {
+                Ok(c) => c,
+                Err(r) => return r,
+            };
+            let session = match connector_session(&conn) {
+                Ok(s) => s,
+                Err(r) => return r,
+            };
+            match db::read_todos(&conn, session) {
+                Ok(items) => ToolResult::ok_structured(
+                    render_todos(&items),
+                    serde_json::json!({ "count": items.len(), "todos": todo_json(&items) }),
+                ),
+                Err(e) => db_failed("could not read the task list", e),
+            }
+        }
+        Tool::SetObjective { text } => {
+            let text = text.trim();
+            if text.is_empty() {
+                return ToolResult::err_code(
+                    ErrorCode::InvalidArguments,
+                    "objective text is empty",
+                );
+            }
+            let conn = match db_guard(ctx) {
+                Ok(c) => c,
+                Err(r) => return r,
+            };
+            let session = match connector_session(&conn) {
+                Ok(s) => s,
+                Err(r) => return r,
+            };
+            match db::set_objective(&conn, session, text) {
+                Ok(previous) => {
+                    let mut out = format!("objective set: {text}\n");
+                    if let Some(prev) = &previous {
+                        out.push_str(&format!("(replaced: {prev})\n"));
+                    }
+                    ToolResult::ok_structured(
+                        out,
+                        serde_json::json!({ "objective": text, "previous": previous }),
+                    )
+                }
+                Err(e) => db_failed("could not set the objective", e),
+            }
+        }
+        Tool::RememberDecision { summary, reason } => remember(
+            ctx,
+            db::Fact::Decision {
+                summary: summary.trim(),
+                // An empty reason is no reason: storing "" would make the
+                // handoff claim a rationale it does not have.
+                reason: reason.as_deref().map(str::trim).filter(|r| !r.is_empty()),
+            },
+        ),
+        Tool::RememberConstraint { text } => {
+            remember(ctx, db::Fact::Constraint { text: text.trim() })
+        }
+        Tool::RememberAttempt {
+            description,
+            succeeded,
+        } => remember(
+            ctx,
+            db::Fact::Attempt {
+                description: description.trim(),
+                succeeded: succeeded.unwrap_or(false),
+            },
+        ),
+        Tool::GetFacts { session_id } => {
+            let conn = match db_guard(ctx) {
+                Ok(c) => c,
+                Err(r) => return r,
+            };
+            let session = match resolve_session(&conn, *session_id) {
+                Ok(s) => s,
+                Err(r) => return r,
+            };
+            match db::get_facts(&conn, session) {
+                Ok(f) => {
+                    let body = render_facts(&f);
+                    ToolResult::ok_structured(
+                        body,
+                        serde_json::json!({
+                            "session_id": session,
+                            "objective": f.objective,
+                            "progress_percent": f.progress_percent,
+                            "decisions": f.decisions,
+                            "failed_attempts": f.failed_attempts,
+                            "constraints": f.constraints,
+                            "changed_files": f.changed_files,
+                        }),
+                    )
+                }
+                Err(e) => db_failed("could not read the project memory", e),
+            }
+        }
+        Tool::ListSessions { limit } => {
+            let conn = match db_guard(ctx) {
+                Ok(c) => c,
+                Err(r) => return r,
+            };
+            let limit = limit
+                .map(|n| (n.max(1) as usize).min(SESSION_LIST_MAX))
+                .unwrap_or(20);
+            match db::list_sessions(&conn, limit) {
+                Ok(rows) => {
+                    let mut out = String::new();
+                    for s in &rows {
+                        out.push_str(&format!(
+                            "#{} {} — {} ({} event(s), {})\n",
+                            s.id,
+                            s.agent,
+                            s.objective.as_deref().unwrap_or("(no objective)"),
+                            s.events,
+                            s.started_at,
+                        ));
+                    }
+                    if out.is_empty() {
+                        out.push_str("no archived sessions\n");
+                    }
+                    let sessions: Vec<serde_json::Value> = rows
+                        .iter()
+                        .map(|s| {
+                            serde_json::json!({
+                                "id": s.id,
+                                "agent": s.agent,
+                                "objective": s.objective,
+                                "started_at": s.started_at,
+                                "events": s.events,
+                            })
+                        })
+                        .collect();
+                    ToolResult::ok_structured(
+                        out,
+                        serde_json::json!({ "count": sessions.len(), "sessions": sessions }),
+                    )
+                }
+                Err(e) => db_failed("could not list sessions", e),
+            }
+        }
+        Tool::RequestHandoff { reason, next_step } => {
+            let reason = reason.trim();
+            if reason.is_empty() {
+                return ToolResult::err_code(
+                    ErrorCode::InvalidArguments,
+                    "handoff reason is empty — say why the developer is needed",
+                );
+            }
+            let conn = match db_guard(ctx) {
+                Ok(c) => c,
+                Err(r) => return r,
+            };
+            let session = match connector_session(&conn) {
+                Ok(s) => s,
+                Err(r) => return r,
+            };
+            // Read the objective before recording, so the request carries the
+            // context it was made in rather than a later one.
+            let objective = db::get_facts(&conn, session).ok().and_then(|f| f.objective);
+            match db::record_handoff_request(&conn, session, reason, next_step.as_deref()) {
+                Ok(id) => ToolResult::ok_structured(
+                    format!(
+                        "handoff requested: {reason}\n\
+                         The desktop will show this to the developer.\n"
+                    ),
+                    serde_json::json!({ "id": id, "objective": objective }),
+                ),
+                Err(e) => db_failed("could not record the handoff request", e),
+            }
+        }
+        Tool::GetHandoff => {
+            let Some(state) = ctx.state else {
+                return ToolResult::err_code(
+                    ErrorCode::InternalError,
+                    "the handoff is built from the desktop's live state, which \
+                     this caller did not supply",
+                );
+            };
+            match crate::build_handoff_impl(state) {
+                Ok(h) => {
+                    let body = render_handoff(&h);
+                    let structured = serde_json::to_value(&h).unwrap_or(serde_json::Value::Null);
+                    ToolResult::ok_structured(body, structured)
+                }
+                Err(e) => ToolResult::err_code(
+                    ErrorCode::ExecutionFailed,
+                    format!("could not build the handoff: {e}"),
+                ),
+            }
+        }
+        // The caller only routes memory tools here.
+        _ => ToolResult::err_code(
+            ErrorCode::InternalError,
+            format!("{} is not a memory tool", tool_name(tool)),
+        ),
+    }
+}
+
+// --- background commands -----------------------------------------------------
+//
+// The three tools over `bgproc.rs`. Each one is a thin render of a manager
+// call: the state machine, the window and the cleanup live in that module, and
+// what happens here is argument checking and turning a `Result` into the two
+// halves of a `ToolResult`.
+
+/// Run one of the three background-command tools.
+///
+/// These need a workspace to run *in* and a manager to be registered *with*,
+/// and the two come from different halves of the context. Neither substitutes
+/// for the other, so each is checked and named separately.
+fn run_bg_tool(tool: &Tool, ctx: &ToolCtx<'_>) -> ToolResult {
+    let Some(root) = ctx.root else {
+        return ToolResult::err_code(ErrorCode::InternalError, "project root not set");
+    };
+    let Some(state) = ctx.state else {
+        return ToolResult::err_code(
+            ErrorCode::InternalError,
+            "no background-command manager in this context",
+        );
+    };
+    let manager = &state.bgproc;
+
+    match tool {
+        Tool::RunCommandBackground { command } => {
+            match manager.start(Shell::detect(), command, root) {
+                Ok(started) => ToolResult::ok_structured(
+                    // Naming the readers is the point of the sentence: a
+                    // handle the caller does not know how to use is the same
+                    // as no handle at all.
+                    format!(
+                        "command #{} started in the background{}\n\
+                         [read it with command_output, stop it with kill_command]\n",
+                        started.id,
+                        match started.pid {
+                            Some(pid) => format!(" (pid {pid})"),
+                            None => String::new(),
+                        }
+                    ),
+                    serde_json::json!({
+                        "id": started.id,
+                        "pid": started.pid,
+                        "command": started.command,
+                    }),
+                ),
+                Err(bgproc::StartError::Busy { running, cap }) => ToolResult::err_code(
+                    ErrorCode::TooManyProcesses,
+                    format!(
+                        "{running} background commands are already running (limit {cap}); \
+                         stop one with kill_command first"
+                    ),
+                ),
+                Err(bgproc::StartError::Spawn(e)) => ToolResult::err_code(
+                    ErrorCode::ExecutionFailed,
+                    format!("could not start the command: {e}"),
+                ),
+            }
+        }
+        Tool::CommandOutput { id, cursor } => {
+            // Absent means "from the start of what is kept", which is what a
+            // first read wants. Defaulting to the *end* would make the first
+            // read of a command that has already printed something look like
+            // a command that printed nothing.
+            match manager.snapshot(*id, cursor.unwrap_or(0)) {
+                Ok(s) => ToolResult::ok_structured(
+                    bgproc::render_snapshot(&s),
+                    serde_json::json!({
+                        "id": s.id,
+                        "status": s.status.state(),
+                        "exit_code": s.status.exit_code(),
+                        "cursor": s.cursor,
+                        "next_cursor": s.next_cursor,
+                        "lost": s.lost,
+                        "more": s.more,
+                        "complete": s.complete,
+                        "elapsed_ms": s.elapsed_ms,
+                    }),
+                ),
+                Err(lookup) => ToolResult::err_code(
+                    missing_command_code(lookup),
+                    missing_command_message(lookup, *id),
+                ),
+            }
+        }
+        Tool::KillCommand { id } => match manager.kill(*id) {
+            Ok(k) => ToolResult::ok_structured(
+                bgproc::render_kill(&k),
+                serde_json::json!({
+                    "id": k.id,
+                    "status": k.status.state(),
+                    "exit_code": k.status.exit_code(),
+                    "already_finished": k.already_finished,
+                }),
+            ),
+            Err(lookup) => ToolResult::err_code(
+                missing_command_code(lookup),
+                missing_command_message(lookup, *id),
+            ),
+        },
+        // The caller only routes background-command tools here.
+        _ => ToolResult::err_code(
+            ErrorCode::InternalError,
+            format!("{} is not a background-command tool", tool_name(tool)),
+        ),
+    }
+}
+
+/// Two different facts, two different codes: an id that was never issued is a
+/// caller mistake, and an id whose output has been released is not.
+fn missing_command_code(lookup: bgproc::Lookup) -> ErrorCode {
+    match lookup {
+        bgproc::Lookup::Unknown => ErrorCode::ProcessNotFound,
+        bgproc::Lookup::Evicted => ErrorCode::OutputGone,
+    }
+}
+
+fn missing_command_message(lookup: bgproc::Lookup, id: u64) -> String {
+    match lookup {
+        bgproc::Lookup::Unknown => format!(
+            "no background command #{id}. run_command_background returns the handle to use here."
+        ),
+        bgproc::Lookup::Evicted => format!(
+            "command #{id} finished long enough ago that its output has been released; \
+             only the most recent finished commands are kept readable"
+        ),
+    }
+}
+
+// --- git -------------------------------------------------------------------
+//
+// Ten tools over `git.rs`, which already did the work: eight are wiring, and
+// only `create_branch` and `show` needed new code there. What this layer adds
+// is the part `git.rs` cannot know about — the error *vocabulary* a caller
+// reasons with.
+//
+// `git.rs` returns `git2::Error`, whose `message()` is prose. That is fine for
+// the desktop panel, which shows it to a person, and wrong for a tool call,
+// which returns it to a program: "no such branch" and "you have unsaved work"
+// are both just strings, so a caller can only tell them apart by matching
+// English. Every tool below maps the failure to an `ErrorCode` instead, and
+// uses the specific one wherever the situation is distinguishable.
+
+/// Open the workspace repository, or `NOT_A_GIT_REPO`.
+fn open_workspace_repo(root: &Path) -> Result<git2::Repository, ToolResult> {
+    git::open_repo(root).map_err(|e| {
+        ToolResult::err_code(
+            ErrorCode::NotAGitRepo,
+            format!("{} is not a git repository: {e}", root.display()),
+        )
+    })
+}
+
+/// A `git2::Error` from an operation that has no more specific code.
+fn git_failed(what: &str, e: git2::Error) -> ToolResult {
+    ToolResult::err_code(ErrorCode::ExecutionFailed, format!("{what}: {e}"))
+}
+
+/// Total patch text a single git tool result will carry.
+///
+/// Diffs are the one thing these tools return whose size the caller does not
+/// choose, so it is bounded here rather than left to the connector's cap —
+/// which truncates the *string* and would leave `structured.patch` claiming a
+/// size the payload does not contain. Files past the budget are still listed,
+/// with their counts, and marked as not included: the answer stays complete
+/// about *what* changed even when it is partial about *how*.
+const GIT_PATCH_BUDGET: usize = 96 * 1024;
+
+/// Ceiling for `git_log`'s `limit`. A caller asking for 10 000 commits is
+/// asking for a result it cannot use; the cap is the same "stop, don't
+/// truncate" rule the search tools follow.
+const GIT_LOG_MAX: usize = 200;
+
+/// Report a `git_checkout` that the working tree blocks.
+///
+/// The roadmap invariant is that checkout refuses rather than forcing, so this
+/// is a routine outcome, not an error to apologise for — hence its own code,
+/// and a message that names the files so the caller can act on it.
+fn worktree_dirty(name: &str, dirty: &[String]) -> ToolResult {
+    let mut msg = format!(
+        "cannot switch to '{name}': {} uncommitted change(s) — commit or stash \
+         before switching",
+        dirty.len()
+    );
+    for path in dirty.iter().take(3) {
+        msg.push_str("\n  ");
+        msg.push_str(path);
+    }
+    if dirty.len() > 3 {
+        msg.push_str(&format!("\n  ...and {} more", dirty.len() - 3));
+    }
+    ToolResult::err_code(ErrorCode::WorktreeDirty, msg)
+}
+
+/// Split a patch across the byte budget, reporting what was left out.
+///
+/// Returns the patch text that fits and the number of files whose patch did
+/// not — the `take`s happen before the `collect` (ch. 5 §5.3), so a large diff
+/// stops being *formatted*, not just being printed.
+fn fit_patch(patch: &str, budget: &mut usize) -> (String, bool) {
+    if patch.len() <= *budget {
+        *budget -= patch.len();
+        return (patch.to_string(), false);
+    }
+    ("".to_string(), true)
+}
+
+// --- search ---------------------------------------------------------------
+//
+// `grep` and `glob` are the first tools whose cost is proportional to the
+// *workspace* rather than to their arguments, which is what makes them where
+// the book's two rules about work start to bite:
+//
+//   * Ch 13 §13.1 — split argument handling from traversal. `plan_grep`
+//     compiles and validates the request with no filesystem access at all, so
+//     the part that a model can get wrong is testable on its own; `run_grep`
+//     is the thin effectful shell that walks and reads.
+//   * Ch 5 §5.3 — a cap must *stop* the work, not truncate its result. The
+//     walk is callback-driven and takes a `ControlFlow::Break`, so a search
+//     that has found its last match stops reading files instead of reading
+//     every one of them and discarding the tail. Without this a `grep` for a
+//     common token in a large tree is unbounded work behind a bounded answer.
+
+/// Directories never descended into. Not a cosmetic tidy-up: a single
+/// `node_modules` can hold millions of files, and the cap above would still
+/// pay for every one of them.
+const WALK_SKIP_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "vendor",
+    "coverage",
+];
+
+/// Depth past which the walk stops descending. A workspace nested this deeply
+/// is pathological; the cap is here so a cycle the filesystem does not show as
+/// a symlink (a bind mount, a runaway tree) cannot exhaust the stack.
+const WALK_MAX_DEPTH: usize = 48;
+
+/// How many failures a result names individually before summarising the rest.
+/// The *count* is always exact — only the listing is bounded, so a directory
+/// of unreadable files cannot turn one call into an unbounded answer.
+const MAX_REPORTED_FAILURES: usize = 10;
+
+/// Search reads a whole file but returns only matching lines, so its cap is
+/// about memory rather than about how much the caller is shown — generously
+/// above `READ_CAP`, which bounds what a *reader* returns.
+const SEARCH_FILE_CAP: u64 = 8 * 1024 * 1024;
+
+/// A matched line is quoted back up to here. One minified file can hold a
+/// whole megabyte on a single line; quoting it verbatim would spend the whole
+/// result budget on one match.
+const GREP_LINE_CHARS: usize = 400;
+
+/// Reported matches before `grep` stops. High enough that a real search rarely
+/// reaches it, low enough that a search for a common token cannot return a
+/// payload the connector then has to truncate.
+const GREP_MAX_RESULTS: usize = 200;
+
+/// Reported paths before `glob` stops.
+const GLOB_MAX_RESULTS: usize = 500;
+
+/// Paths a walk could not use, in the order they were met.
+///
+/// This is Ch 12 §12.4.1's `Validation` shape — a `head` that is always
+/// present once there is a failure, plus an accumulating `tail` — kept as a
+/// list because the successes are reported alongside rather than as the other
+/// side of a sum type. The property the book cares about is what matters
+/// here: a walk in which one file is unreadable must still return the matches
+/// in all the others, *and* must say that it could not read that one, rather
+/// than quietly reporting a smaller answer.
+struct Failures {
+    rows: Vec<serde_json::Value>,
+    total: usize,
+}
+
+impl Failures {
+    fn new() -> Self {
+        Self {
+            rows: Vec::new(),
+            total: 0,
+        }
+    }
+
+    fn push(&mut self, path: &str, reason: impl Into<String>) {
+        let reason: String = reason.into();
+        self.total += 1;
+        if self.rows.len() < MAX_REPORTED_FAILURES {
+            self.rows
+                .push(serde_json::json!({ "path": path, "reason": reason }));
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.total > 0
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!(self.rows)
+    }
+
+    /// The human-readable half, or `None` when there is nothing to say — so a
+    /// clean search never carries an empty "0 failures" footer.
+    fn prose(&self) -> Option<String> {
+        if !self.any() {
+            return None;
+        }
+        let mut out = format!("\n[{} path(s) could not be searched:\n", self.total);
+        for row in &self.rows {
+            out.push_str(&format!(
+                "  {} — {}\n",
+                row["path"].as_str().unwrap_or("?"),
+                row["reason"].as_str().unwrap_or("")
+            ));
+        }
+        if self.total > self.rows.len() {
+            out.push_str(&format!("  ...and {} more\n", self.total - self.rows.len()));
+        }
+        out.push_str("]\n");
+        Some(out)
+    }
+}
+
+/// A glob plus how to apply it.
+///
+/// A pattern with no `/` in it is matched against the *file name*, so `*.rs`
+/// means "every Rust file" rather than "a Rust file at the workspace root".
+/// The second reading is what a path glob literally says and is essentially
+/// never what a caller means.
+struct PathGlob {
+    pattern: glob::Pattern,
+    bare: bool,
+}
+
+impl PathGlob {
+    fn new(pattern: &str, what: &str) -> Result<Self, ToolResult> {
+        Ok(Self {
+            bare: !pattern.contains('/'),
+            pattern: glob::Pattern::new(pattern).map_err(|e| {
+                ToolResult::err_code(
+                    ErrorCode::GlobInvalid,
+                    format!("invalid {what} glob {pattern:?}: {e}"),
+                )
+            })?,
+        })
+    }
+
+    fn matches(&self, rel: &str) -> bool {
+        if self.pattern.matches_path(Path::new(rel)) {
+            return true;
+        }
+        if !self.bare {
+            return false;
+        }
+        Path::new(rel)
+            .file_name()
+            .is_some_and(|n| self.pattern.matches(&n.to_string_lossy()))
+    }
+}
+
+/// Walk every file under `start`, depth-first and in sorted order, calling `f`
+/// with the absolute path and its path relative to `base`.
+///
+/// `f` returns [`ControlFlow::Break`] to stop the walk immediately — that is
+/// the whole point of the shape (see the section note above).
+///
+/// Three classes of path are never visited:
+///
+///   * noise directories ([`WALK_SKIP_DIRS`]), which are cost without meaning;
+///   * **every** symlink. A symlink inside the workspace can resolve to a file
+///     outside it, and `resolve_path`'s containment check cannot help here
+///     because the walk builds these paths itself — so the cheapest sound
+///     answer is not to follow them at all;
+///   * sensitive paths, by the same rule the read tools honour. A walk that
+///     could reach `.env` would make `grep` a way *around* the sensitive-path
+///     gate that every other reader goes through.
+///
+/// Returns the number of files visited.
+fn walk_files(
+    start: &Path,
+    base: &Path,
+    f: &mut impl FnMut(&Path, &str) -> ControlFlow<()>,
+) -> usize {
+    fn rec(
+        dir: &Path,
+        base: &Path,
+        depth: usize,
+        f: &mut impl FnMut(&Path, &str) -> ControlFlow<()>,
+        visited: &mut usize,
+    ) -> ControlFlow<()> {
+        if depth > WALK_MAX_DEPTH {
+            return ControlFlow::Continue(());
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return ControlFlow::Continue(());
+        };
+        // Sorted so two runs over an unchanged tree report the same order, and
+        // so a truncated result is at least deterministic.
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        for path in paths {
+            // `symlink_metadata` is what *enforces* the no-follow rule below:
+            // it reports the link itself, so a symlink is neither `is_dir()`
+            // nor `is_file()` and cannot be descended into or read. Swapping
+            // this for `metadata` (which follows) is a one-word change that
+            // opens the hole — `the_walk_does_not_follow_a_symlink_out_of_the_
+            // workspace` fails on exactly that mutation.
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            // Redundant given the above, and kept deliberately: it states the
+            // rule rather than leaving it to follow from two type checks, and
+            // it is what would still hold if the call above were ever
+            // changed to `metadata`.
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(base) else {
+                continue;
+            };
+            let rel = rel.to_string_lossy().into_owned();
+            if is_sensitive_path(Path::new(&rel)) {
+                continue;
+            }
+            if meta.is_dir() {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if WALK_SKIP_DIRS.contains(&name.as_str()) {
+                    continue;
+                }
+                if rec(&path, base, depth + 1, f, visited).is_break() {
+                    return ControlFlow::Break(());
+                }
+            } else if meta.is_file() {
+                *visited += 1;
+                if f(&path, &rel).is_break() {
+                    return ControlFlow::Break(());
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    let mut visited = 0usize;
+    let _ = rec(start, base, 0, f, &mut visited);
+    visited
+}
+
+/// What a search runs over: one file, or a tree.
+///
+/// `grep` and `glob` share this so both accept a file where a directory would
+/// go — `grep path: Cargo.toml` is a reasonable thing to ask for.
+enum SearchTarget {
+    File(PathBuf),
+    Tree(PathBuf),
+}
+
+impl SearchTarget {
+    /// Resolve the optional `path` argument against the workspace root.
+    fn resolve(root: &Path, path: Option<&str>) -> Result<Self, ToolResult> {
+        let resolved = match path {
+            None => root.to_path_buf(),
+            Some(p) => resolve_tool_path(root, p)?,
+        };
+        if resolved.is_file() {
+            Ok(SearchTarget::File(resolved))
+        } else if resolved.is_dir() {
+            Ok(SearchTarget::Tree(resolved))
+        } else {
+            Err(ToolResult::err_code(
+                ErrorCode::NotADirectory,
+                format!("no such file or directory: {}", path.unwrap_or(".")),
+            ))
+        }
+    }
+
+    /// Visit every file to search. Returns the number visited.
+    fn visit(&self, base: &Path, f: &mut impl FnMut(&Path, &str) -> ControlFlow<()>) -> usize {
+        match self {
+            // A single file needs no sensitive-path check: it arrived through
+            // the `path` argument, which `tool_paths` reports and the approval
+            // gate already screened. The walk-time filter exists for the files
+            // the caller never named.
+            SearchTarget::File(p) => {
+                let Ok(rel) = p.strip_prefix(base) else {
+                    return 0;
+                };
+                let rel = rel.to_string_lossy().into_owned();
+                let _ = f(p, &rel);
+                1
+            }
+            SearchTarget::Tree(dir) => walk_files(dir, base, f),
+        }
+    }
+}
+
+/// Read a file for searching.
+///
+/// `Err(reason)` says why it could not be searched; the caller decides whether
+/// that is worth reporting. A walk that stopped at the first binary file would
+/// be useless, and one that reported every binary file would bury the real
+/// permission errors — so the reason is returned rather than judged here.
+fn read_for_search(p: &Path) -> Result<String, String> {
+    let md = std::fs::metadata(p).map_err(|e| e.to_string())?;
+    if md.len() > SEARCH_FILE_CAP {
+        return Err(format!("too large to search ({} bytes)", md.len()));
+    }
+    let bytes = std::fs::read(p).map_err(|e| e.to_string())?;
+    if bytes.contains(&0) {
+        return Err("binary".to_string());
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// What `grep` should report. A property of the request, not of the tree —
+/// choosing the mode is how a caller avoids paying for output it will discard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrepMode {
+    /// Matching lines, with path and line number.
+    Content,
+    /// Just the files that contain a match.
+    FilesWithMatches,
+    /// A match count per file.
+    Count,
+}
+
+/// A validated, compiled `grep` request. Building one touches no files.
+struct GrepPlan {
+    regex: regex::Regex,
+    include: Option<PathGlob>,
+    exclude: Option<PathGlob>,
+    mode: GrepMode,
+    max_results: usize,
+}
+
+/// The pure half of `grep`: every way a caller can be wrong about the request
+/// is caught here, before any directory is opened.
+fn plan_grep(
+    pattern: &str,
+    include: Option<&str>,
+    exclude: Option<&str>,
+    mode: Option<GrepMode>,
+    max_results: Option<u32>,
+) -> Result<GrepPlan, ToolResult> {
+    let regex = regex::Regex::new(pattern).map_err(|e| {
+        ToolResult::err_code(
+            ErrorCode::RegexInvalid,
+            format!("invalid regex {pattern:?}: {e}"),
+        )
+    })?;
+    Ok(GrepPlan {
+        regex,
+        include: include.map(|p| PathGlob::new(p, "include")).transpose()?,
+        exclude: exclude.map(|p| PathGlob::new(p, "exclude")).transpose()?,
+        mode: mode.unwrap_or(GrepMode::Content),
+        // Clamped rather than refused: a caller asking for more than the
+        // ceiling gets the ceiling and a `truncated` flag, which is more
+        // useful than an error telling it to guess a smaller number.
+        max_results: max_results
+            .map(|n| (n.max(1) as usize).min(GREP_MAX_RESULTS))
+            .unwrap_or(GREP_MAX_RESULTS),
+    })
+}
+
+/// The effectful half of `grep`.
+fn run_grep(plan: &GrepPlan, target: &SearchTarget, base: &Path) -> ToolResult {
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    let mut files: Vec<serde_json::Value> = Vec::new();
+    let mut failures = Failures::new();
+    let mut truncated = false;
+    let mut unsearchable = 0usize;
+
+    let visited = target.visit(base, &mut |path, rel| {
+        if let Some(inc) = &plan.include {
+            if !inc.matches(rel) {
+                return ControlFlow::Continue(());
+            }
+        }
+        if let Some(exc) = &plan.exclude {
+            if exc.matches(rel) {
+                return ControlFlow::Continue(());
+            }
+        }
+        let text = match read_for_search(path) {
+            Ok(t) => t,
+            Err(reason) => {
+                // Binary and oversized files are the ordinary shape of a walk.
+                // Counting them keeps a search over a tree of binaries honest
+                // without listing each one as though it were a problem.
+                if reason.starts_with("too large") || reason == "binary" {
+                    unsearchable += 1;
+                } else {
+                    failures.push(rel, reason);
+                }
+                return ControlFlow::Continue(());
+            }
+        };
+        match plan.mode {
+            GrepMode::Content => {
+                for (i, line) in text.lines().enumerate() {
+                    if !plan.regex.is_match(line) {
+                        continue;
+                    }
+                    if rows.len() >= plan.max_results {
+                        truncated = true;
+                        return ControlFlow::Break(());
+                    }
+                    rows.push(serde_json::json!({
+                        "path": rel,
+                        "line": i + 1,
+                        "text": clip_chars(line.trim_end(), GREP_LINE_CHARS),
+                    }));
+                }
+            }
+            GrepMode::FilesWithMatches | GrepMode::Count => {
+                let count = text.lines().filter(|l| plan.regex.is_match(l)).count();
+                if count == 0 {
+                    return ControlFlow::Continue(());
+                }
+                if files.len() >= plan.max_results {
+                    truncated = true;
+                    return ControlFlow::Break(());
+                }
+                files.push(serde_json::json!({ "path": rel, "count": count }));
+            }
+        }
+        ControlFlow::Continue(())
+    });
+
+    // The prose half mirrors the mode, so a caller that ignores the structured
+    // payload still gets the shape it asked for rather than everything.
+    let mut out = String::new();
+    for row in &rows {
+        out.push_str(&format!(
+            "{}:{}: {}\n",
+            row["path"].as_str().unwrap_or(""),
+            row["line"],
+            row["text"].as_str().unwrap_or("")
+        ));
+    }
+    for row in &files {
+        match plan.mode {
+            GrepMode::Count => out.push_str(&format!(
+                "{}: {}\n",
+                row["path"].as_str().unwrap_or(""),
+                row["count"]
+            )),
+            _ => out.push_str(&format!("{}\n", row["path"].as_str().unwrap_or(""))),
+        }
+    }
+
+    let hits = rows.len() + files.len();
+    if hits == 0 {
+        out.push_str(&format!("no matches in {visited} file(s) scanned\n"));
+    } else if truncated {
+        out.push_str(&format!(
+            "\n[stopped at the {}-result cap; refine the pattern or raise \
+             max_results]\n",
+            plan.max_results
+        ));
+    }
+    if unsearchable > 0 {
+        out.push_str(&format!(
+            "[{unsearchable} binary or oversized file(s) not searched]\n"
+        ));
+    }
+    if let Some(note) = failures.prose() {
+        out.push_str(&note);
+    }
+
+    ToolResult::ok_structured(
+        out,
+        serde_json::json!({
+            "mode": plan.mode,
+            "matches": rows,
+            "files": files,
+            "scanned": visited,
+            "truncated": truncated,
+            "failures": failures.json(),
+        }),
+    )
+}
+
+/// The whole of `glob`: a target, a pattern, and a cap.
+fn run_glob(pattern: &PathGlob, target: &SearchTarget, base: &Path, max: usize) -> ToolResult {
+    let mut paths: Vec<String> = Vec::new();
+    let mut truncated = false;
+
+    let visited = target.visit(base, &mut |_path, rel| {
+        if !pattern.matches(rel) {
+            return ControlFlow::Continue(());
+        }
+        if paths.len() >= max {
+            truncated = true;
+            return ControlFlow::Break(());
+        }
+        paths.push(rel.to_string());
+        ControlFlow::Continue(())
+    });
+
+    let mut out = if paths.is_empty() {
+        format!("no path matches, {visited} file(s) scanned\n")
+    } else {
+        let mut s = paths.join("\n");
+        s.push('\n');
+        s
+    };
+    if truncated {
+        out.push_str(&format!("\n[stopped at the {max}-result cap]\n"));
+    }
+
+    ToolResult::ok_structured(
+        out,
+        serde_json::json!({
+            "paths": paths,
+            "scanned": visited,
+            "truncated": truncated,
+        }),
+    )
+}
+
+/// Clip to `max` characters on a char boundary, marking that it happened.
+fn clip_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let clipped: String = s.chars().take(max).collect();
+    format!("{clipped}…")
 }
 
 /// Create a channel a remote caller can wait on for approval resolution.
@@ -2985,6 +8301,68 @@ mod tests {
             .unwrap();
         assert!(!r.ok);
         assert!(r.error.unwrap().contains("denied"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A gated command is approved on the desktop's own thread, long after the
+    /// asking thread has returned. If the owner were not carried with the
+    /// request, the PTY would register with no owner and `cancel_request`
+    /// could never reach it — so a caller that gave up could not stop the
+    /// command it caused to run.
+    #[test]
+    fn an_approved_command_stays_owned_by_the_request_that_asked() {
+        let dir = temp_project("ownership");
+        let bridge = Bridge::new();
+
+        // Asked for by a request… (the question is asked from the caller's
+        // thread, which is all `execution_owner` reads).
+        let (result, id) = {
+            let _asking = crate::process::own_current_thread(Some("req_owner".into()));
+            bridge.submit(
+                Tool::RunCommand {
+                    command: "sleep 30".into(),
+                },
+                SOURCE_MCP,
+                Some(&dir),
+            )
+        };
+        assert!(result.pending.is_some());
+        let id = id.unwrap();
+        assert_eq!(
+            bridge.pending.lock().unwrap()[0].owner.as_deref(),
+            Some("req_owner"),
+            "the queue must remember who asked"
+        );
+
+        std::thread::scope(|scope| {
+            // …and approved from one that owns nothing, as Tauri's command
+            // thread does.
+            let approving = scope.spawn(|| {
+                assert!(crate::process::execution_owner().is_none());
+                let _ = bridge.resolve(id, true, Some(&dir), None);
+            });
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut owned = Vec::new();
+            while std::time::Instant::now() < deadline {
+                owned = crate::process::registry().by_owner("req_owner");
+                if !owned.is_empty() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(
+                owned.len(),
+                1,
+                "the approved command must register under the request that asked"
+            );
+            assert_eq!(
+                crate::process::registry().kill_owner("req_owner", Duration::from_millis(200)),
+                1
+            );
+            approving.join().unwrap();
+        });
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3619,11 +8997,75 @@ mod tests {
             Tool::ReadManyFiles {
                 paths: vec!["a".into()],
             },
+            Tool::Grep {
+                pattern: "x".into(),
+                path: None,
+                include: None,
+                exclude: None,
+                mode: None,
+                max_results: None,
+            },
+            Tool::Glob {
+                pattern: "*.rs".into(),
+                path: None,
+                max_results: None,
+            },
             Tool::RunCommand {
                 command: "true".into(),
             },
+            Tool::RunCommandBackground {
+                command: "true".into(),
+            },
+            Tool::CommandOutput {
+                id: 1,
+                cursor: None,
+            },
+            Tool::KillCommand { id: 1 },
             Tool::ListDirectory { path: ".".into() },
             Tool::GitStatus,
+            Tool::GitDiff { path: None },
+            Tool::GitLog { limit: None },
+            Tool::GitAdd { path: None },
+            Tool::GitUnstage { path: "a".into() },
+            Tool::GitCommit {
+                message: "m".into(),
+            },
+            Tool::GitBranches,
+            Tool::GitCheckout { name: "b".into() },
+            Tool::GitCreateBranch {
+                name: "b".into(),
+                base: None,
+                checkout: None,
+            },
+            Tool::GitShow { oid: "HEAD".into() },
+            Tool::GitCommitDiff { oid: "HEAD".into() },
+            Tool::TodoWrite {
+                todos: vec![TodoItem {
+                    content: "do it".into(),
+                    status: None,
+                    active_form: None,
+                }],
+            },
+            Tool::TodoRead,
+            Tool::SetObjective {
+                text: "ship it".into(),
+            },
+            Tool::RememberDecision {
+                summary: "s".into(),
+                reason: None,
+            },
+            Tool::RememberConstraint { text: "c".into() },
+            Tool::RememberAttempt {
+                description: "a".into(),
+                succeeded: None,
+            },
+            Tool::GetFacts { session_id: None },
+            Tool::ListSessions { limit: None },
+            Tool::RequestHandoff {
+                reason: "r".into(),
+                next_step: None,
+            },
+            Tool::GetHandoff,
             Tool::DescribeTool {
                 name: "read_file".into(),
             },
@@ -3642,9 +9084,34 @@ mod tests {
                 | Tool::CopyFile { .. }
                 | Tool::CreateDirectory { .. }
                 | Tool::ReadManyFiles { .. }
+                | Tool::Grep { .. }
+                | Tool::Glob { .. }
                 | Tool::RunCommand { .. }
+                | Tool::RunCommandBackground { .. }
+                | Tool::CommandOutput { .. }
+                | Tool::KillCommand { .. }
                 | Tool::ListDirectory { .. }
                 | Tool::GitStatus
+                | Tool::GitDiff { .. }
+                | Tool::GitLog { .. }
+                | Tool::GitAdd { .. }
+                | Tool::GitUnstage { .. }
+                | Tool::GitCommit { .. }
+                | Tool::GitBranches
+                | Tool::GitCheckout { .. }
+                | Tool::GitCreateBranch { .. }
+                | Tool::GitShow { .. }
+                | Tool::GitCommitDiff { .. }
+                | Tool::TodoWrite { .. }
+                | Tool::TodoRead
+                | Tool::SetObjective { .. }
+                | Tool::RememberDecision { .. }
+                | Tool::RememberConstraint { .. }
+                | Tool::RememberAttempt { .. }
+                | Tool::GetFacts { .. }
+                | Tool::ListSessions { .. }
+                | Tool::RequestHandoff { .. }
+                | Tool::GetHandoff
                 | Tool::DescribeTool { .. }
                 | Tool::ListTools => {}
             }
@@ -3714,7 +9181,11 @@ mod tests {
 
         let r = execute(
             &Tool::DescribeTool {
-                name: "grep".into(), // not implemented yet
+                // A tool on the roadmap but not yet built. `web_search` is the
+                // one this project has deliberately deferred, so it is the
+                // name least likely to be implemented out from under this
+                // assertion.
+                name: "web_search".into(),
             },
             None,
             None,
@@ -3785,13 +9256,54 @@ mod tests {
         assert!(!text.contains("(shell command)"));
     }
 
+    /// A command that runs until something stops it, in whatever shell this
+    /// platform has.
+    ///
+    /// The background-command fixtures need a command that is still running
+    /// when the next tool in SPECS order reads it — a command that had already
+    /// finished would let `command_output` and `kill_command` pass while never
+    /// exercising the states they exist for.
+    fn background_sleeper() -> String {
+        match Shell::detect() {
+            Shell::PowerShell => "Start-Sleep -Seconds 30".to_string(),
+            Shell::Cmd => "timeout /t 30 /nobreak".to_string(),
+            _ => "sleep 30".to_string(),
+        }
+    }
+
     /// Args tuned so each tool actually succeeds against the workspace the two
     /// tests below build. `sample_args` only has to *parse*; these have to run,
     /// because the point is to inspect a real payload rather than skip every
     /// tool that happened to fail.
     ///
     /// Depends on SPECS order: the file tools build on each other (write, then
-    /// edit, then move), and both tests iterate `SPECS` in declaration order.
+    /// edit, then move), the background-command trio builds on the handle the
+    /// first of it returns, and both tests iterate `SPECS` in declaration
+    /// order.
+    /// Tools whose success depends on something a hermetic test cannot
+    /// supply: the network (the web pair), an installed language server (the
+    /// LSP four), or the desktop (the agent-loop pair and delegation — the
+    /// test context carries no `AppHandle`, deliberately).
+    ///
+    /// They are still parsed and schema-checked by the surface-wide tests;
+    /// only the executions that *require success* skip them. Every name here
+    /// is asserted to be a real tool, so a rename cannot silently widen the
+    /// skip.
+    fn needs_outside_world(name: &str) -> bool {
+        matches!(
+            name,
+            "web_fetch"
+                | "web_search"
+                | "lsp_diagnostics"
+                | "lsp_definition"
+                | "lsp_references"
+                | "lsp_symbols"
+                | "ask_user"
+                | "propose_plan"
+                | "delegate_task"
+        )
+    }
+
     fn succeeding_args(name: &str) -> serde_json::Value {
         match name {
             "read_file" => serde_json::json!({"path": "long.txt"}),
@@ -3812,6 +9324,94 @@ mod tests {
             "create_directory" => serde_json::json!({"path": "d"}),
             "read_many_files" => serde_json::json!({"paths": ["moved.txt"]}),
             "run_command" => serde_json::json!({"command": "echo hi"}),
+            // A command that runs until something stops it, so the trio below
+            // is exercised for real rather than against a command that had
+            // already finished: `command_output` reports a *running* process
+            // and `kill_command` actually has to kill one. It also leaves no
+            // work behind — the kill is the cleanup.
+            "run_command_background" => serde_json::json!({"command": background_sleeper()}),
+            // Handle 1, because this workspace's manager is fresh and the
+            // command above is the only thing that has started anything. The
+            // surface-wide tests walk SPECS in declaration order, which is
+            // what makes the id knowable here — the same reliance the git
+            // fixtures place on that order.
+            "command_output" => serde_json::json!({"id": 1}),
+            "kill_command" => serde_json::json!({"id": 1}),
+            // Deliberately searches the *tree*, so the walk, the cap and the
+            // structured payload are all exercised by the surface-wide tests.
+            "grep" => serde_json::json!({"pattern": "alpha", "path": "."}),
+            "glob" => serde_json::json!({"pattern": "*.txt"}),
+            // The git fixtures lean on the workspace's one commit and its
+            // `second` branch, and they run in SPECS order — so by the time
+            // these fire the earlier editing tools have left the tree dirty,
+            // which is what makes `git_diff` produce a patch rather than the
+            // empty clean-tree answer. `git_add` stages everything so the
+            // `git_unstage` that follows has a staged path to remove, and the
+            // commit after that has something to record.
+            "git_diff" => serde_json::json!({}),
+            "git_log" => serde_json::json!({"limit": 5}),
+            "git_add" => serde_json::json!({}),
+            "git_unstage" => serde_json::json!({"path": "moved.txt"}),
+            "git_commit" => serde_json::json!({"message": "test commit\n\nbody"}),
+            "git_branches" => serde_json::json!({}),
+            "git_checkout" => serde_json::json!({"name": "second"}),
+            "git_create_branch" => serde_json::json!({"name": "third"}),
+            "git_show" => serde_json::json!({"oid": "HEAD"}),
+            "git_commit_diff" => serde_json::json!({"oid": "HEAD"}),
+            // The memory fixture is one call per tool, in SPECS order, against
+            // the same database: the write tools leave facts behind for the
+            // reading tools that follow, so `get_facts` and `get_handoff`
+            // report a session that actually has something in it.
+            "todo_write" => serde_json::json!({
+                "todos": [
+                    {"content": "read the plan", "status": "completed"},
+                    {"content": "write the tools", "status": "in_progress",
+                     "active_form": "writing the tools"},
+                ]
+            }),
+            "todo_read" => serde_json::json!({}),
+            "set_objective" => serde_json::json!({"text": "land the memory tools"}),
+            "remember_decision" => serde_json::json!({
+                "summary": "keep the connector's own session row",
+                "reason": "transcript sessions belong to another agent"
+            }),
+            "remember_constraint" => serde_json::json!({"text": "no new dependencies"}),
+            "remember_attempt" => serde_json::json!({
+                "description": "file facts under the newest session",
+                "succeeded": false
+            }),
+            "get_facts" => serde_json::json!({}),
+            "list_sessions" => serde_json::json!({"limit": 5}),
+            "request_handoff" => serde_json::json!({"reason": "a decision is needed"}),
+            "get_handoff" => serde_json::json!({}),
+            // Phase 7–10. The ones that need the outside world are skipped by
+            // `needs_outside_world`; these fixtures still parse so the
+            // schema and path tests can reach them.
+            "web_fetch" => serde_json::json!({"url": "ftp://example.invalid/"}),
+            "web_search" => serde_json::json!({"query": ""}),
+            "notebook_read" => serde_json::json!({"path": "nb.ipynb"}),
+            "notebook_edit" => serde_json::json!({
+                "path": "nb.ipynb", "cell_id": "code-1", "new_source": "print(2)\n"
+            }),
+            "delegate_task" => serde_json::json!({"task": "summarise"}),
+            "lsp_diagnostics" => serde_json::json!({}),
+            "lsp_definition" => serde_json::json!({"path": "a.txt", "line": 1, "character": 1}),
+            "lsp_references" => serde_json::json!({
+                "path": "a.txt", "line": 1, "character": 1, "include_declaration": true
+            }),
+            "lsp_symbols" => serde_json::json!({"path": "a.txt"}),
+            "ask_user" => serde_json::json!({"question": "which?", "options": ["a", "b"]}),
+            "propose_plan" => serde_json::json!({"plan": "do it", "steps": ["one"]}),
+            "monitor" => serde_json::json!({"path": ".", "timeout_ms": 1000}),
+            "notify" => serde_json::json!({"title": "t", "body": "b", "level": "info"}),
+            "enter_worktree" => serde_json::json!({}),
+            "exit_worktree" => serde_json::json!({"action": "discard"}),
+            "read_media" => serde_json::json!({"path": "pic.png"}),
+            "publish_artifact" => serde_json::json!({"path": "long.txt", "title": "log"}),
+            "report_findings" => serde_json::json!({
+                "summary": "one issue",
+                "findings": [{"path": "a.txt", "line": 1, "severity": "warning", "claim": "x"}]
+            }),
             other => sample_args(other),
         }
     }
@@ -3824,8 +9424,60 @@ mod tests {
         std::fs::write(dir.join("b.txt"), "one\ntwo\n").unwrap();
         let long: String = (1..=1000).map(|i| format!("line {i}\n")).collect();
         std::fs::write(dir.join("long.txt"), &long).unwrap();
-        let _ = git2::Repository::init(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/nested.txt"), "nested\n").unwrap();
+        // A notebook and a tiny image, so the Phase 7/10 content tools have
+        // something real to read and edit rather than only an error path.
+        std::fs::write(
+            dir.join("nb.ipynb"),
+            serde_json::json!({
+                "cells": [
+                    {"cell_type": "markdown", "source": ["# Fixture\n"], "metadata": {}},
+                    {"cell_type": "code", "id": "code-1", "source": ["print(1)\n"], "outputs": [], "metadata": {}}
+                ],
+                "metadata": {"kernelspec": {"name": "python3"}},
+                "nbformat": 4,
+                "nbformat_minor": 5
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("pic.png"),
+            [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+        )
+        .unwrap();
+        let repo = git2::Repository::init(&dir).unwrap();
+        // A configured identity and one commit, so the git tools have real
+        // history to read. Without the config `git::commit` fails on
+        // `signature()`, which would leave every commit-shaped tool exercised
+        // only on its error path.
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Lexsus Test").unwrap();
+            cfg.set_str("user.email", "test@example.invalid").unwrap();
+        }
+        git::stage_all(&repo).unwrap();
+        let first = git::commit(&repo, "fixtures").unwrap();
+        // A named second branch, so `git_checkout` has a destination that does
+        // not depend on what libgit2 calls the initial branch.
+        repo.branch("second", &repo.find_commit(first).unwrap(), false)
+            .unwrap();
         dir
+    }
+
+    /// The structured workspace plus a live app state over a temporary
+    /// database.
+    ///
+    /// The surface-wide properties iterate every tool in `SPECS`, and the
+    /// memory tools have nowhere to read or write without a database — so the
+    /// fixture supplies one. Without it they would be checked only on their
+    /// "no database" error path, which is exactly the vacuity
+    /// `every_tool_succeeds_on_its_succeeding_fixture` exists to catch.
+    fn stateful_workspace(tag: &str) -> (PathBuf, crate::AppState) {
+        let dir = structured_workspace(tag);
+        let state = crate::test_state(&dir);
+        (dir, state)
     }
 
     /// Drive every tool on the read-only *and* the write surface and check no
@@ -3839,13 +9491,14 @@ mod tests {
     /// checked here.
     #[test]
     fn no_tool_output_reads_as_call_syntax() {
-        let dir = structured_workspace("call-syntax");
+        let (dir, state) = stateful_workspace("call-syntax");
+        let ctx = ToolCtx::with_state(Some(&dir), &state);
 
         for spec in SPECS {
             // Built through the parser, the same way the connector builds one.
             let tool = parse_tool_call(spec.name, &succeeding_args(spec.name))
                 .unwrap_or_else(|e| panic!("{}: {e}", spec.name));
-            let result = execute(&tool, Some(&dir), None);
+            let result = execute_in(&tool, &ctx, None);
             for text in [result.output.as_deref(), result.error.as_deref()]
                 .into_iter()
                 .flatten()
@@ -3865,6 +9518,256 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Every tool succeeds on its `succeeding_args` fixture.
+    ///
+    /// The surface-wide properties below all *tolerate* failure, which is
+    /// right — an error result needs checking too — but it means a fixture
+    /// that quietly stopped reaching the tool would leave them green while
+    /// testing the error path. This is the test that says the fixtures still
+    /// exercise what they are named for; it caught `git_unstage` pointing at a
+    /// path nothing had staged, and `git_checkout` needing a commit the
+    /// workspace did not have.
+    #[test]
+    fn every_tool_succeeds_on_its_succeeding_fixture() {
+        let (dir, state) = stateful_workspace("succeeds");
+        let ctx = ToolCtx::with_state(Some(&dir), &state);
+
+        let mut failed = Vec::new();
+        for spec in SPECS {
+            if needs_outside_world(spec.name) {
+                continue;
+            }
+            let tool = parse_tool_call(spec.name, &succeeding_args(spec.name))
+                .unwrap_or_else(|e| panic!("{}: {e}", spec.name));
+            let result = execute_in(&tool, &ctx, None);
+            if !result.ok {
+                failed.push(format!("{}: {:?}", spec.name, result.error));
+            }
+        }
+        assert!(
+            failed.is_empty(),
+            "these tools no longer succeed on their fixture, so every other \
+             property is checking their error path instead of their logic:\n{}",
+            failed.join("\n")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `git_unstage` on a path with nothing staged says so instead of
+    /// reporting success.
+    ///
+    /// `Index::remove_path` accepts a path that is not there, so the naive
+    /// implementation returns `Ok` for a mistyped name — and, worse, for a
+    /// committed file it stages that file's *deletion*. Refusing is both the
+    /// honest answer and the useful one.
+    #[test]
+    fn git_unstage_says_when_there_is_nothing_to_unstage() {
+        let dir = structured_workspace("unstage-clean");
+
+        // `a.txt` is committed and untouched: in the index, but with no
+        // staged change, which is the case the weak "is it in the index?"
+        // check would have waved through.
+        let tool = parse_tool_call("git_unstage", &serde_json::json!({"path": "a.txt"})).unwrap();
+        let result = execute(&tool, Some(&dir), None);
+        assert!(!result.ok, "an unchanged file is not something to unstage");
+        assert_eq!(result.error_code, Some(ErrorCode::InvalidArguments));
+
+        // And the refusal left the file alone rather than queueing its
+        // removal, which is what `remove_path` would have done.
+        let repo = git2::Repository::open(&dir).unwrap();
+        assert!(!git::has_staged_change(&repo, "a.txt").unwrap());
+        assert!(std::fs::read_to_string(dir.join("a.txt"))
+            .unwrap()
+            .contains("alpha"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unstaging a real change puts the index back to HEAD and leaves the
+    /// working tree exactly as it was.
+    #[test]
+    fn git_unstage_restores_the_committed_version() {
+        let dir = structured_workspace("unstage-round-trip");
+        std::fs::write(dir.join("a.txt"), "edited\n").unwrap();
+
+        let add = parse_tool_call("git_add", &serde_json::json!({"path": "a.txt"})).unwrap();
+        assert!(execute(&add, Some(&dir), None).ok);
+
+        let staged = git2::Repository::open(&dir).unwrap();
+        assert!(
+            git::has_staged_change(&staged, "a.txt").unwrap(),
+            "stage first"
+        );
+
+        let un = parse_tool_call("git_unstage", &serde_json::json!({"path": "a.txt"})).unwrap();
+        assert!(execute(&un, Some(&dir), None).ok);
+
+        // A fresh handle on purpose: libgit2 caches the index inside the
+        // `Repository`, so a handle opened before the unstage can answer from
+        // the pre-unstage index. Each tool call opens its own, which is why
+        // this only ever bites the test.
+        let after = git2::Repository::open(&dir).unwrap();
+        assert!(
+            !git::has_staged_change(&after, "a.txt").unwrap(),
+            "unstage should return the index entry to HEAD's version"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "edited\n",
+            "unstage is index-only; the working tree must not be touched"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `git_add` takes a directory.
+    ///
+    /// `Index::add_path` answers "could not find 'sub' to stat" for a
+    /// directory, which would make the ordinary request — stage this folder —
+    /// fail for a reason the caller cannot act on. The pathspec form recurses.
+    #[test]
+    fn git_add_stages_a_directory() {
+        let dir = structured_workspace("add-dir");
+        // A file the fixture commit does not already contain. Staging is a
+        // no-op for a path whose index entry and HEAD entry already agree, so
+        // a settled file would let this pass without staging anything.
+        std::fs::write(dir.join("sub/fresh.txt"), "fresh\n").unwrap();
+
+        let tool = parse_tool_call("git_add", &serde_json::json!({"path": "sub"})).unwrap();
+        let result = execute(&tool, Some(&dir), None);
+        assert!(result.ok, "{:?}", result.error);
+
+        let repo = git2::Repository::open(&dir).unwrap();
+        assert!(
+            git::has_staged_change(&repo, "sub/fresh.txt").unwrap(),
+            "staging a directory must stage what is inside it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `git_checkout` refuses a dirty tree, and refuses it with a *code*.
+    ///
+    /// The refusal is the roadmap's invariant — a force checkout discards
+    /// work — but the part a caller can act on is that the failure is
+    /// `WORKTREE_DIRTY` rather than prose, so a client can offer "commit or
+    /// stash" without matching English.
+    #[test]
+    fn git_checkout_refuses_a_dirty_tree_with_a_code() {
+        let dir = structured_workspace("checkout-dirty");
+        std::fs::write(dir.join("a.txt"), "uncommitted\n").unwrap();
+
+        let tool = parse_tool_call("git_checkout", &serde_json::json!({"name": "second"})).unwrap();
+        let result = execute(&tool, Some(&dir), None);
+
+        assert!(!result.ok, "checkout must refuse a dirty tree");
+        assert_eq!(result.error_code, Some(ErrorCode::WorktreeDirty));
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("a.txt"),
+            "the refusal should name the blocking file: {:?}",
+            result.error
+        );
+
+        // Refusing has to mean *nothing moved*. The code is only worth having
+        // if the branch did not switch anyway.
+        let repo = git2::Repository::open(&dir).unwrap();
+        assert_ne!(
+            git::current_branch(&repo).as_deref(),
+            Some("second"),
+            "the refusal reported failure but switched branch anyway"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `git_commit` with nothing staged is refused rather than writing an
+    /// empty commit.
+    #[test]
+    fn git_commit_refuses_an_empty_index() {
+        let dir = structured_workspace("commit-empty");
+
+        let tool =
+            parse_tool_call("git_commit", &serde_json::json!({"message": "nothing"})).unwrap();
+        let result = execute(&tool, Some(&dir), None);
+
+        assert!(!result.ok);
+        assert_eq!(result.error_code, Some(ErrorCode::InvalidArguments));
+
+        // The refusal is only worth the error if no commit was created.
+        let repo = git2::Repository::open(&dir).unwrap();
+        assert_eq!(
+            git::log(&repo, 10).unwrap().len(),
+            1,
+            "an empty commit landed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `git_show` and `git_commit_diff` take a revision, not only a hex id.
+    ///
+    /// `git::show` used `Oid::from_str`, so the schema's "commit id or
+    /// revision, e.g. 'HEAD~1'" was a promise the code did not keep — the
+    /// documented example failed.
+    #[test]
+    fn git_show_accepts_a_revision_name() {
+        let dir = structured_workspace("revparse");
+
+        for rev in ["HEAD", "second"] {
+            let tool = parse_tool_call("git_show", &serde_json::json!({"oid": rev})).unwrap();
+            let result = execute(&tool, Some(&dir), None);
+            assert!(result.ok, "git_show {rev:?} failed: {:?}", result.error);
+        }
+        // A name that resolves to nothing is an error, not a panic.
+        let tool =
+            parse_tool_call("git_show", &serde_json::json!({"oid": "no-such-thing"})).unwrap();
+        assert!(!execute(&tool, Some(&dir), None).ok);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The patch budget is shared across the whole result, and a patch that
+    /// does not fit does not spend it.
+    ///
+    /// So a change too large to include is dropped while a small change after
+    /// it still arrives. The alternative — spending the budget on the big file
+    /// anyway — would let one huge diff silently swallow every smaller one
+    /// behind it, which is the failure mode the cap exists to prevent.
+    #[test]
+    fn a_patch_too_large_to_include_does_not_drop_the_small_ones_after_it() {
+        let dir = structured_workspace("diff-budget");
+        let huge: String = (1..=60_000).map(|i| format!("changed {i}\n")).collect();
+        std::fs::write(dir.join("a.txt"), &huge).unwrap();
+        // A *small* change to a file that sorts after the huge one.
+        std::fs::write(dir.join("long.txt"), "line 1\nchanged\n").unwrap();
+
+        let tool = parse_tool_call("git_diff", &serde_json::json!({})).unwrap();
+        let result = execute(&tool, Some(&dir), None);
+        assert!(result.ok, "{:?}", result.error);
+
+        let s = result
+            .structured
+            .expect("git_diff always structures its result");
+        assert_eq!(
+            s["truncated"], true,
+            "a 600 kB patch should not fit the budget"
+        );
+        assert_eq!(s["count"], 2);
+        assert_eq!(s["files"][0]["path"], "a.txt");
+        assert_eq!(s["files"][0]["patch_omitted"], true);
+        assert_eq!(s["files"][1]["path"], "long.txt");
+        assert_eq!(
+            s["files"][1]["patch_omitted"], false,
+            "a patch that did not fit must not spend the budget for later files"
+        );
+        // The omitted file is still *reported*: complete about what changed,
+        // partial about how.
+        assert!(result.output.unwrap_or_default().contains("a.txt"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Every tool that returns a structured payload emits exactly the keys its
     /// `output_schema` advertises, and every key the schema marks `required`.
     ///
@@ -3873,13 +9776,14 @@ mod tests {
     /// than a harmless extra — this is what keeps the two halves honest.
     #[test]
     fn structured_output_matches_its_declared_schema() {
-        let dir = structured_workspace("structured");
+        let (dir, state) = stateful_workspace("structured");
+        let ctx = ToolCtx::with_state(Some(&dir), &state);
 
         let mut structured_tools = Vec::new();
         for spec in SPECS {
             let tool = parse_tool_call(spec.name, &succeeding_args(spec.name))
                 .unwrap_or_else(|e| panic!("{}: {e}", spec.name));
-            let result = execute(&tool, Some(&dir), None);
+            let result = execute_in(&tool, &ctx, None);
             let schema = output_schema(spec.name)
                 .unwrap_or_else(|| panic!("no output schema for {}", spec.name));
             let props = schema["properties"].as_object().expect("properties");
@@ -4067,10 +9971,76 @@ mod tests {
             "copy_file" => serde_json::json!({"from": "a", "to": "b"}),
             "create_directory" => serde_json::json!({"path": "d"}),
             "read_many_files" => serde_json::json!({"paths": ["a.txt", "b.txt"]}),
+            "grep" => serde_json::json!({"pattern": "alpha", "path": "."}),
+            "glob" => serde_json::json!({"pattern": "*.txt"}),
             "run_command" => serde_json::json!({"command": "echo hi"}),
+            "run_command_background" => serde_json::json!({"command": "sleep 30"}),
+            "command_output" => serde_json::json!({"id": 1, "cursor": 0}),
+            "kill_command" => serde_json::json!({"id": 1}),
             "git_status" => serde_json::json!({}),
+            "git_diff" => serde_json::json!({"path": "a.txt"}),
+            "git_log" => serde_json::json!({"limit": 5}),
+            "git_add" => serde_json::json!({"path": "a.txt"}),
+            "git_unstage" => serde_json::json!({"path": "a.txt"}),
+            "git_commit" => serde_json::json!({"message": "a subject\n\nand a body"}),
+            "git_branches" => serde_json::json!({}),
+            "git_checkout" => serde_json::json!({"name": "second"}),
+            "git_create_branch" => {
+                serde_json::json!({"name": "third", "base": "HEAD", "checkout": false})
+            }
+            "git_show" => serde_json::json!({"oid": "HEAD"}),
+            "git_commit_diff" => serde_json::json!({"oid": "HEAD"}),
+            "todo_write" => serde_json::json!({
+                "todos": [{"content": "do it", "status": "in_progress", "active_form": "doing it"}]
+            }),
+            "todo_read" => serde_json::json!({}),
+            "set_objective" => serde_json::json!({"text": "ship the memory tools"}),
+            "remember_decision" => {
+                serde_json::json!({"summary": "keep one connector session", "reason": "attribution"})
+            }
+            "remember_constraint" => serde_json::json!({"text": "no new dependencies"}),
+            "remember_attempt" => {
+                serde_json::json!({"description": "tried the newest session", "succeeded": false})
+            }
+            "get_facts" => serde_json::json!({"session_id": 1}),
+            "list_sessions" => serde_json::json!({"limit": 5}),
+            "request_handoff" => {
+                serde_json::json!({"reason": "a decision is needed", "next_step": "pick a store"})
+            }
+            "get_handoff" => serde_json::json!({}),
             "describe_tool" => serde_json::json!({"name": "read_file"}),
             "list_tools" => serde_json::json!({}),
+            // Phase 7–10. `web_fetch` deliberately names a non-fetchable
+            // scheme: `plan` refuses it before any socket opens, so the
+            // surface-wide tests exercise the tool without a network. The
+            // language-server and agent-loop tools fail fast here (no server
+            // installed, no desktop attached), which is why
+            // `needs_outside_world` skips them where success is required.
+            "web_fetch" => serde_json::json!({"url": "ftp://example.invalid/"}),
+            "web_search" => serde_json::json!({"query": ""}),
+            "notebook_read" => serde_json::json!({"path": "nb.ipynb"}),
+            "notebook_edit" => serde_json::json!({
+                "path": "nb.ipynb", "cell_id": "cell-0", "new_source": "edited\n"
+            }),
+            "delegate_task" => serde_json::json!({"task": "t"}),
+            "lsp_diagnostics" => serde_json::json!({}),
+            "lsp_definition" => serde_json::json!({"path": "a.txt", "line": 1, "character": 1}),
+            "lsp_references" => serde_json::json!({
+                "path": "a.txt", "line": 1, "character": 1, "include_declaration": true
+            }),
+            "lsp_symbols" => serde_json::json!({"path": "a.txt"}),
+            "ask_user" => serde_json::json!({"question": "which?", "options": ["a", "b"]}),
+            "propose_plan" => serde_json::json!({"plan": "do it", "steps": ["one"]}),
+            "monitor" => serde_json::json!({"path": ".", "timeout_ms": 1000}),
+            "notify" => serde_json::json!({"title": "t", "body": "b"}),
+            "enter_worktree" => serde_json::json!({}),
+            "exit_worktree" => serde_json::json!({"action": "discard"}),
+            "read_media" => serde_json::json!({"path": "pic.png"}),
+            "publish_artifact" => serde_json::json!({"path": "long.txt"}),
+            "report_findings" => serde_json::json!({
+                "summary": "one issue",
+                "findings": [{"path": "a.txt", "line": 1, "severity": "warning", "claim": "x"}]
+            }),
             other => panic!("sample_args missing tool: {other}"),
         }
     }
@@ -4203,5 +10173,1008 @@ mod tests {
         );
         // Unknown tool name is an error, not a panic.
         assert!(parse_tool_call("no_such_tool", &serde_json::json!({})).is_err());
+    }
+    // --- the property suite ----------------------------------------------
+    //
+    // *Functional Programming in Scala* ch. 8 makes two points that shape
+    // everything below. First, a property "reveals hidden assumptions" that
+    // examples paper over. Second, when a domain is small and closed,
+    // quantifying over it exhaustively is a proof rather than the absence of
+    // evidence. The tool × group × approval matrix here is small and closed,
+    // so every property below is stated over all of `SPECS` — never over a
+    // hand-written sample. The payoff is that a tool added tomorrow is
+    // covered the moment it is declared, and the forcing function is that
+    // `Tool`'s `match`es are wildcard-free: a new variant does not compile
+    // until `tool_paths`, `spec` and `output_schema` all know about it.
+
+    /// Path-valued keys a tool's input schema may declare.
+    const PATH_ARG_KEYS: &[&str] = &["path", "from", "to", "paths"];
+
+    /// Tools that screen their path arguments per item at *execution* time
+    /// instead of up front through [`tool_paths`].
+    ///
+    /// Exactly one, and it is the documented batch case: `read_many_files`
+    /// marks a sensitive entry `status: "skipped"` rather than refusing the
+    /// whole batch, so its `tool_paths` is deliberately empty (see its arm).
+    /// Any other name appearing here would be a hole in the approval gate,
+    /// which is why `every_per_item_exception_is_a_real_tool` pins the list.
+    const PER_ITEM_PATH_SCREENED: &[&str] = &["read_many_files"];
+
+    /// Paths a model may emit: mostly escapes, plus three legal shapes so the
+    /// property cannot pass by refusing everything.
+    const PATH_CORPUS: &[&str] = &[
+        "..",
+        "../outside",
+        "../",
+        "../../etc/passwd",
+        "a/../../outside",
+        "a/b/../../../outside.txt",
+        "notes/../../../.bashrc",
+        "sub/../../outside",
+        "./../outside",
+        "a/./../../outside",
+        ".../outside",
+        "\\\\..\\\\..\\\\windows",
+        "/etc/passwd",
+        "//etc/passwd",
+        // Legal, and must stay legal — cancelling back inside the root.
+        "sub/..",
+        "a/../b.txt",
+        "new_dir/nested/f.txt",
+    ];
+
+    /// Every code has one spelling, in both halves of the boundary.
+    ///
+    /// `ErrorCode` reaches a connector two ways: serde writes it by name into
+    /// `structuredContent`/the error payload, and `Display` writes it into
+    /// prose. A client that reads one and compares against the other sees two
+    /// different codes if they drift. `name()` is the single source; this
+    /// checks the other two against it.
+    #[test]
+    fn every_error_code_is_named_consistently() {
+        let mut seen: Vec<&str> = Vec::new();
+        for code in ErrorCode::ALL {
+            let wire = code.name();
+            assert!(
+                !seen.contains(&wire),
+                "ErrorCode::ALL lists {wire} more than once"
+            );
+            seen.push(wire);
+
+            // The serde rename and Display must agree, or the same failure
+            // reads as two different codes depending on which half a client
+            // looked at.
+            let serialized = serde_json::to_value(code)
+                .expect("a unit enum always serializes")
+                .as_str()
+                .expect("a unit enum serializes to a string")
+                .to_string();
+            assert_eq!(
+                wire, serialized,
+                "{wire} is serialized as {serialized} — the two halves disagree"
+            );
+            assert_eq!(wire, code.to_string());
+
+            // SCREAMING_SNAKE, so a code is safe to compare as an opaque
+            // token in a protocol that also carries prose.
+            assert!(
+                wire.chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
+                "{wire} is not SCREAMING_SNAKE"
+            );
+            assert!(
+                wire.starts_with(|c: char| c.is_ascii_uppercase()),
+                "{wire} does not begin with a letter"
+            );
+            assert!(!wire.ends_with('_'), "{wire} ends with a separator");
+        }
+
+        // A guard on the guard: iterating an empty or truncated list would
+        // make every assertion above vacuous. The count is deliberate — it
+        // makes *any* change to the vocabulary a conscious edit rather than a
+        // silent one, and that includes additions, which are exactly the
+        // changes most likely to be made in passing.
+        assert_eq!(
+            seen.len(),
+            32,
+            "the error vocabulary changed size — update this tripwire and \
+             confirm the new codes are the ones you meant to add: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn every_per_item_exception_is_a_real_tool() {
+        // Otherwise the list above could name a tool that no longer exists
+        // and quietly exempt nothing, while looking like it exempts something.
+        for name in PER_ITEM_PATH_SCREENED {
+            assert!(
+                spec_by_name(name).is_some(),
+                "PER_ITEM_PATH_SCREENED names {name}, which is not a tool"
+            );
+        }
+    }
+
+    /// **No accepted path resolves outside the workspace.**
+    ///
+    /// Stated over every tool and a corpus of escapes, rather than over the
+    /// two examples the older tests carried. The check is deliberately
+    /// one-directional: `resolve_path` returning `Err` is always acceptable
+    /// (refusing a legal path is a usability bug), while returning a path
+    /// outside the canonical root is a sandbox escape.
+    #[test]
+    fn no_accepted_path_resolves_outside_the_root() {
+        let dir = structured_workspace("escape-proof");
+        let canonical = dir.canonicalize().unwrap();
+
+        let mut accepted = 0usize;
+        let mut tools_with_paths = 0usize;
+        for spec in SPECS {
+            let tool = parse_tool_call(spec.name, &succeeding_args(spec.name))
+                .unwrap_or_else(|e| panic!("{}: {e}", spec.name));
+
+            // The tool's own declared paths first, so a tool that ships a
+            // surprising path is checked even if the corpus never names it.
+            let declared: Vec<String> = tool_paths(&tool).into_iter().map(str::to_string).collect();
+            if !declared.is_empty() {
+                tools_with_paths += 1;
+            }
+
+            for raw in declared
+                .iter()
+                .map(String::as_str)
+                .chain(PATH_CORPUS.iter().copied())
+            {
+                if let Ok(p) = resolve_path(&dir, raw) {
+                    assert!(
+                        p.starts_with(&canonical),
+                        "{}: resolve_path accepted {raw:?} and produced {} — \
+                         outside {}",
+                        spec.name,
+                        p.display(),
+                        canonical.display()
+                    );
+                    accepted += 1;
+                }
+            }
+        }
+
+        // Guards on the guard: the corpus must actually produce successes
+        // (otherwise this proves only that everything errors), and the
+        // iteration must actually be finding path-bearing tools.
+        assert!(
+            accepted >= 3,
+            "only {accepted} corpus paths were accepted — the corpus is \
+             misaligned with the root and this test is near-vacuous"
+        );
+        assert!(
+            tools_with_paths >= 8,
+            "only {tools_with_paths} tools reported a path — `tool_paths` has \
+             drifted and this test is no longer covering the surface"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **What the approval gate screens covers what the call carries.**
+    ///
+    /// Both `needs_approval` and `grant_matches` screen a tool by asking
+    /// `tool_paths`. A path argument the extractor does not return is
+    /// therefore neither approved nor refused on its own merits — the
+    /// `copy_file .env notes.txt` laundering shape, where a secret moves to a
+    /// name no read gate stops at. So: every path-valued slot the *schema*
+    /// advertises must come back out of `tool_paths`.
+    ///
+    /// The sentinels are distinct per slot so a failure names the slot rather
+    /// than just the tool.
+    #[test]
+    fn tool_paths_covers_every_path_the_schema_advertises() {
+        for spec in SPECS {
+            if PER_ITEM_PATH_SCREENED.contains(&spec.name) {
+                continue;
+            }
+            let schema = tool_input_schema(spec.name).expect("every spec has a schema");
+            let props = schema["properties"].as_object().expect("properties");
+
+            let mut args = sample_args(spec.name);
+            let mut expected: Vec<String> = Vec::new();
+            for key in props.keys() {
+                if !PATH_ARG_KEYS.contains(&key.as_str()) {
+                    continue;
+                }
+                let sentinel = format!("sentinel-{}-{key}", spec.name);
+                // `paths` is an array slot; every other path slot is a string.
+                args[key] = match args.get(key) {
+                    Some(serde_json::Value::Array(_)) => serde_json::json!([sentinel.clone()]),
+                    _ => serde_json::Value::String(sentinel.clone()),
+                };
+                expected.push(sentinel);
+            }
+            if expected.is_empty() {
+                continue;
+            }
+
+            let tool =
+                parse_tool_call(spec.name, &args).unwrap_or_else(|e| panic!("{}: {e}", spec.name));
+            let found: Vec<&str> = tool_paths(&tool);
+            for want in &expected {
+                assert!(
+                    found.iter().any(|p| p == want),
+                    "{}: its schema advertises a path slot that `tool_paths` \
+                     does not return ({want:?} not in {found:?}) — the \
+                     approval gate would not screen it",
+                    spec.name
+                );
+            }
+        }
+    }
+    // --- memory ----------------------------------------------------------
+
+    /// Run one memory tool against a live database.
+    fn memory_call(
+        dir: &Path,
+        state: &crate::AppState,
+        name: &str,
+        args: serde_json::Value,
+    ) -> ToolResult {
+        let tool = parse_tool_call(name, &args).unwrap_or_else(|e| panic!("{name}: {e}"));
+        execute_in(&tool, &ToolCtx::with_state(Some(dir), state), None)
+    }
+
+    /// A tool that cannot reach the database says so instead of reporting an
+    /// empty memory.
+    ///
+    /// "There are no constraints" and "there is nowhere to read constraints
+    /// from" are different answers, and only the first is information. A model
+    /// told the second as though it were the first concludes the project has
+    /// no constraints and proceeds to break them.
+    #[test]
+    fn a_memory_tool_without_a_database_says_which_half_is_missing() {
+        let dir = structured_workspace("memory-nodb");
+
+        for name in [
+            "todo_write",
+            "todo_read",
+            "set_objective",
+            "remember_decision",
+            "get_facts",
+            "request_handoff",
+            "get_handoff",
+        ] {
+            let tool = parse_tool_call(name, &succeeding_args(name)).unwrap();
+            // A root and nothing else: the desktop's own context, without the
+            // database behind it.
+            let result = execute(&tool, Some(&dir), None);
+            assert!(!result.ok, "{name} claimed success with no database");
+            let err = result.error.unwrap_or_default();
+            assert!(
+                err.contains("database") || err.contains("live state"),
+                "{name} blamed something other than the missing context: {err}"
+            );
+            assert_eq!(result.error_code, Some(ErrorCode::InternalError));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A task list with one bad status is refused whole, and nothing is
+    /// stored.
+    ///
+    /// The alternative — clamping `"sorta"` to `pending` — stores a list the
+    /// caller did not send and hands it straight back as truth. A list is one
+    /// value (ch. 12), so one bad item invalidates it.
+    #[test]
+    fn an_unknown_todo_status_refuses_the_whole_list() {
+        let (dir, state) = stateful_workspace("todo-status");
+
+        let first = memory_call(
+            &dir,
+            &state,
+            "todo_write",
+            serde_json::json!({"todos": [{"content": "keep me", "status": "pending"}]}),
+        );
+        assert!(first.ok, "{:?}", first.error);
+
+        let bad = memory_call(
+            &dir,
+            &state,
+            "todo_write",
+            serde_json::json!({"todos": [
+                {"content": "fine", "status": "pending"},
+                {"content": "not fine", "status": "sorta"},
+            ]}),
+        );
+        assert!(!bad.ok, "an unknown status is not a status");
+        assert_eq!(bad.error_code, Some(ErrorCode::InvalidArguments));
+        assert!(
+            bad.error.unwrap_or_default().contains("sorta"),
+            "the refusal should name the status it did not recognise"
+        );
+
+        // The refused write stored nothing, and did not half-replace the list
+        // that was already there.
+        let read = memory_call(&dir, &state, "todo_read", serde_json::json!({}));
+        let s = read.structured.unwrap();
+        assert_eq!(s["count"].as_u64(), Some(1));
+        assert_eq!(s["todos"][0]["content"], "keep me");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `todo_write` writes the list it was given, not a merge with the old
+    /// one.
+    ///
+    /// An item disappearing is how a caller says "this is done and I no longer
+    /// want to see it"; a merge would keep resurrecting it.
+    #[test]
+    fn todo_write_replaces_rather_than_merges() {
+        let (dir, state) = stateful_workspace("todo-replace");
+
+        // Bare strings, which the parser lifts to pending items — the same
+        // leniency a model-written argument object gets everywhere else.
+        let r = memory_call(
+            &dir,
+            &state,
+            "todo_write",
+            serde_json::json!({"todos": ["a", "b", "c"]}),
+        );
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(r.structured.unwrap()["count"].as_u64(), Some(3));
+
+        let r = memory_call(
+            &dir,
+            &state,
+            "todo_write",
+            serde_json::json!({"todos": ["a", "b"]}),
+        );
+        assert!(r.ok, "{:?}", r.error);
+        let s = r.structured.unwrap();
+        assert_eq!(s["count"].as_u64(), Some(2), "the list was merged, not set");
+        assert_eq!(s["todos"][0]["status"], "pending");
+
+        // And the text is the list, so the trace shows what was stored.
+        let text = r.output.clone().unwrap_or_default();
+        assert!(text.contains("b"), "{text}");
+        assert!(!text.contains("c"), "a dropped item is still in the answer");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A recorded fact lands in the connector's own session, and creates no
+    /// other.
+    ///
+    /// The archive's sessions belong to Claude Code transcripts; filing a web
+    /// AI's decision under one of those would credit it to the wrong agent,
+    /// and the desktop UI reads exactly these tables.
+    #[test]
+    fn a_recorded_fact_lands_in_the_connectors_own_session() {
+        let (dir, state) = stateful_workspace("memory-session");
+
+        // A session that already exists — an archived Claude Code transcript.
+        // Without it, "file under the connector's own row" and "file under
+        // whatever session is newest" are the same instruction, and the test
+        // would pass either way.
+        let other = {
+            let conn = state.conn.lock().unwrap();
+            db::upsert_session(
+                &conn,
+                &db::NewSession {
+                    agent: "claude-code",
+                    source: "/tmp/an-archived-transcript.jsonl",
+                    cwd: None,
+                    source_mtime: 0,
+                    objective: Some("someone else's task"),
+                },
+            )
+            .unwrap()
+        };
+
+        let r = memory_call(
+            &dir,
+            &state,
+            "remember_decision",
+            serde_json::json!({"summary": "use sqlite", "reason": "it is already here"}),
+        );
+        assert!(r.ok, "{:?}", r.error);
+        let id = r.structured.unwrap()["session_id"].as_i64().unwrap();
+
+        let conn = state.conn.lock().unwrap();
+        assert_eq!(db::connector_session_id(&conn).unwrap(), id);
+        let facts = db::get_facts(&conn, id).unwrap();
+        assert_eq!(facts.decisions, vec!["use sqlite".to_string()]);
+        let sessions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sessions, 2, "recording a fact invented a session");
+        // ...and it went to the connector's row, not to the newest session —
+        // which, in a fresh install with an archive beside it, is someone
+        // else's.
+        let theirs = db::get_facts(&conn, other).unwrap();
+        assert!(
+            theirs.decisions.is_empty(),
+            "a connector's decision was filed against another agent's session"
+        );
+        drop(conn);
+
+        // An empty reason is no reason: the row must not claim a rationale it
+        // was not given.
+        let r = memory_call(
+            &dir,
+            &state,
+            "remember_decision",
+            serde_json::json!({"summary": "ship it", "reason": "   "}),
+        );
+        assert!(r.ok, "{:?}", r.error);
+        let conn = state.conn.lock().unwrap();
+        let reason: Option<String> = conn
+            .query_row(
+                "SELECT reason FROM decisions WHERE summary = 'ship it'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, None, "whitespace became a rationale");
+        drop(conn);
+
+        // An empty fact is refused rather than stored as a blank line.
+        let r = memory_call(
+            &dir,
+            &state,
+            "remember_constraint",
+            serde_json::json!({"text": "  "}),
+        );
+        assert!(!r.ok);
+        assert_eq!(r.error_code, Some(ErrorCode::InvalidArguments));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `get_handoff` returns the card the desktop builds, and says it in
+    /// words as well as fields.
+    ///
+    /// This is the pull-based handoff the extension removal cost, so the tool
+    /// and the desktop command must not drift into two different answers to
+    /// "what was happening?".
+    #[test]
+    fn get_handoff_returns_the_same_card_the_desktop_builds() {
+        let (dir, state) = stateful_workspace("handoff-card");
+
+        // A card with something in it. An empty handoff is a fine answer but a
+        // poor fixture: "build the same card" is trivial when the card is
+        // empty, so the objective comes from the desktop's own state and the
+        // decisions from the project memory — the two halves
+        // `build_handoff_impl` joins.
+        *state.objective.lock().unwrap() = Some("finish the memory tools".to_string());
+        let seeded = memory_call(
+            &dir,
+            &state,
+            "remember_decision",
+            serde_json::json!({"summary": "answer from what was stored"}),
+        );
+        assert!(seeded.ok, "{:?}", seeded.error);
+
+        let r = memory_call(&dir, &state, "get_handoff", serde_json::json!({}));
+        assert!(r.ok, "{:?}", r.error);
+
+        let text = r.output.clone().unwrap_or_default();
+        let mut got = r.structured.unwrap();
+        let mut want = serde_json::to_value(crate::build_handoff_impl(&state).unwrap()).unwrap();
+        // `generated_at` is a clock reading, so two builds differ by design.
+        // Everything else is state, and must match exactly.
+        for v in [&mut got, &mut want] {
+            v.as_object_mut().unwrap().remove("generated_at");
+        }
+        assert_eq!(
+            got, want,
+            "the tool and the desktop build two different handoffs"
+        );
+
+        // The text carries the card rather than pointing at it: a handoff is
+        // the thing a caller pastes into a fresh conversation.
+        let objective = want["objective"].as_str().unwrap();
+        assert_eq!(objective, "finish the memory tools");
+        assert!(text.contains(objective), "{text}");
+        assert!(text.contains("progress:"), "{text}");
+        assert!(
+            text.contains("answer from what was stored"),
+            "the card's decisions did not reach the text:\n{text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fact a caller records is the fact `get_facts` and the handoff
+    /// report.
+    ///
+    /// One round trip through all three read paths, because a write-only
+    /// memory is indistinguishable from no memory until something reads it.
+    #[test]
+    fn recorded_facts_come_back_out_of_the_project_memory() {
+        let (dir, state) = stateful_workspace("memory-roundtrip");
+
+        for (name, args) in [
+            (
+                "set_objective",
+                serde_json::json!({"text": "land the memory tools"}),
+            ),
+            (
+                "remember_decision",
+                serde_json::json!({"summary": "keep one connector session"}),
+            ),
+            (
+                "remember_constraint",
+                serde_json::json!({"text": "no new dependencies"}),
+            ),
+            (
+                "remember_attempt",
+                serde_json::json!({"description": "file under the newest session",
+                                   "succeeded": false}),
+            ),
+        ] {
+            let r = memory_call(&dir, &state, name, args);
+            assert!(r.ok, "{name}: {:?}", r.error);
+        }
+
+        let r = memory_call(&dir, &state, "get_facts", serde_json::json!({}));
+        assert!(r.ok, "{:?}", r.error);
+        let s = r.structured.unwrap();
+        assert_eq!(s["objective"], "land the memory tools");
+        assert_eq!(s["decisions"][0], "keep one connector session");
+        assert_eq!(s["constraints"][0], "no new dependencies");
+        assert_eq!(s["failed_attempts"][0], "file under the newest session");
+
+        // Nothing traced a step, so progress is the honest floor rather than
+        // a fabricated number.
+        assert_eq!(s["progress_percent"].as_u64(), Some(0));
+
+        // A successful attempt is not a failed one, so it must not appear in
+        // the list headed "do not repeat".
+        let r = memory_call(
+            &dir,
+            &state,
+            "remember_attempt",
+            serde_json::json!({"description": "the obvious fix worked", "succeeded": true}),
+        );
+        assert!(r.ok, "{:?}", r.error);
+        let r = memory_call(&dir, &state, "get_facts", serde_json::json!({}));
+        let s = r.structured.unwrap();
+        let failed: Vec<&str> = s["failed_attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(failed, vec!["file under the newest session"]);
+
+        // `list_sessions` sees the connector's row, which is how a caller
+        // learns the id `get_facts` will accept.
+        let r = memory_call(&dir, &state, "list_sessions", serde_json::json!({}));
+        assert!(r.ok, "{:?}", r.error);
+        let s = r.structured.unwrap();
+        assert_eq!(s["count"].as_u64(), Some(1), "{s}");
+        let id = s["sessions"][0]["id"].as_i64().unwrap();
+
+        let r = memory_call(
+            &dir,
+            &state,
+            "get_facts",
+            serde_json::json!({"session_id": id}),
+        );
+        assert!(r.ok, "the id list_sessions returned is not accepted");
+
+        // And a name for a session that does not exist is a refusal, not an
+        // empty memory.
+        let r = memory_call(
+            &dir,
+            &state,
+            "get_facts",
+            serde_json::json!({"session_id": id + 99}),
+        );
+        assert!(!r.ok);
+        assert_eq!(r.error_code, Some(ErrorCode::FileNotFound));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- search ----------------------------------------------------------
+
+    fn search_project(tag: &str) -> PathBuf {
+        let dir = temp_project(tag);
+        std::fs::write(dir.join("a.rs"), "fn main() { needle(); }\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "no match here\n").unwrap();
+        std::fs::write(dir.join("c.rs"), "// needle again\n").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/d.rs"), "needle deep\n").unwrap();
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        std::fs::write(dir.join("node_modules/e.rs"), "needle in noise\n").unwrap();
+        dir
+    }
+
+    fn grep_in(dir: &Path, args: serde_json::Value) -> ToolResult {
+        let tool = parse_tool_call("grep", &args).unwrap_or_else(|e| panic!("{e}"));
+        execute(&tool, Some(dir), None)
+    }
+
+    #[test]
+    fn grep_reports_path_line_and_text() {
+        let dir = search_project("grep-content");
+        let r = grep_in(&dir, serde_json::json!({"pattern": "needle", "path": "."}));
+        assert!(r.ok, "{:?}", r.error);
+        let s = r.structured.clone().unwrap();
+        assert_eq!(s["mode"], "content");
+        let matches = s["matches"].as_array().unwrap();
+        assert!(matches.len() >= 3, "{matches:?}");
+        // Every row is a real file:line, and line numbers are 1-based.
+        for m in matches {
+            assert_eq!(m["line"], 1, "each fixture has the match on line 1: {m:?}");
+            assert!(m["text"].as_str().unwrap().contains("needle"));
+        }
+        // The prose half carries the same facts in `path:line: text` form.
+        let out = r.output.unwrap();
+        assert!(out.contains("a.rs:1:"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grep_modes_change_the_shape_not_the_finding() {
+        let dir = search_project("grep-modes");
+        let files = grep_in(
+            &dir,
+            serde_json::json!({"pattern": "needle", "path": ".", "mode": "files_with_matches"}),
+        );
+        let s = files.structured.clone().unwrap();
+        assert_eq!(s["mode"], "files_with_matches");
+        assert!(s["matches"].as_array().unwrap().is_empty());
+        let named: Vec<&str> = s["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap())
+            .collect();
+        assert!(
+            named.contains(&"a.rs") && named.contains(&"c.rs"),
+            "{named:?}"
+        );
+        assert!(
+            named.contains(&"sub/d.rs"),
+            "the walk must recurse: {named:?}"
+        );
+
+        let counts = grep_in(
+            &dir,
+            serde_json::json!({"pattern": "needle", "path": ".", "mode": "count"}),
+        );
+        let s = counts.structured.unwrap();
+        assert_eq!(s["mode"], "count");
+        for f in s["files"].as_array().unwrap() {
+            assert_eq!(f["count"], 1, "{f:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A cap stops the work; it does not truncate its result** (ch. 5 §5.3).
+    ///
+    /// The difference is measurable: with the cap at 2, the walk must stop
+    /// after reading about two files. Reading all of them and discarding the
+    /// tail would produce the same *answer* and be unbounded work, so
+    /// asserting on the answer alone would not catch the regression.
+    #[test]
+    fn grep_cap_stops_the_walk_rather_than_truncating_it() {
+        let dir = temp_project("grep-cap");
+        for i in 0..40 {
+            std::fs::write(dir.join(format!("f{i:02}.txt")), "needle\n").unwrap();
+        }
+        let r = grep_in(
+            &dir,
+            serde_json::json!({"pattern": "needle", "path": ".", "max_results": 2}),
+        );
+        let s = r.structured.unwrap();
+        assert_eq!(s["matches"].as_array().unwrap().len(), 2);
+        assert_eq!(s["truncated"], true);
+        let scanned = s["scanned"].as_u64().unwrap();
+        assert!(
+            scanned <= 4,
+            "the cap did not stop the walk — {scanned} of 40 files were read \
+             to produce 2 matches"
+        );
+        assert!(r.output.unwrap().contains("cap"), "the cut is reported");
+
+        // And the same search without a cap reports no truncation.
+        let all = grep_in(&dir, serde_json::json!({"pattern": "needle", "path": "."}));
+        let s = all.structured.unwrap();
+        assert_eq!(s["truncated"], false);
+        assert_eq!(s["matches"].as_array().unwrap().len(), 40);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A search cannot reach a path the read tools are barred from.**
+    ///
+    /// This is the property that makes `grep` safe to hand a model: it walks
+    /// the tree itself, so its path argument is not a path list and the
+    /// approval gate cannot enumerate what it will touch. The walk has to
+    /// enforce the sensitivity rule on its own.
+    #[test]
+    fn grep_never_reaches_a_sensitive_path() {
+        let dir = temp_project("grep-sensitive");
+        std::fs::write(dir.join("notes.txt"), "the secret word is aardvark\n").unwrap();
+        std::fs::write(dir.join(".env"), "TOKEN=aardvark\n").unwrap();
+        std::fs::write(dir.join("id_rsa"), "aardvark\n").unwrap();
+        std::fs::create_dir_all(dir.join("secrets")).unwrap();
+        std::fs::write(dir.join("secrets/keys.json"), "aardvark\n").unwrap();
+
+        let r = grep_in(
+            &dir,
+            serde_json::json!({"pattern": "aardvark", "path": "."}),
+        );
+        let out = r.output.clone().unwrap();
+        let s = r.structured.unwrap();
+        let found = serde_json::to_string(&s["matches"]).unwrap();
+        assert!(
+            found.contains("notes.txt"),
+            "the ordinary file is found: {out}"
+        );
+        for barred in [".env", "id_rsa", "keys.json"] {
+            assert!(
+                !found.contains(barred),
+                "{barred} was searched — the walk does not honour the \
+                 sensitive-path rule:\n{out}"
+            );
+            assert!(!out.contains(barred), "{out}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_walk_does_not_follow_a_symlink_out_of_the_workspace() {
+        let outside = temp_project("grep-outside");
+        std::fs::write(outside.join("loot.txt"), "aardvark\n").unwrap();
+        let dir = temp_project("grep-symlink");
+        std::fs::write(dir.join("inside.txt"), "nothing here\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("loot.txt"), dir.join("link.txt")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("linkdir")).unwrap();
+
+        let r = grep_in(
+            &dir,
+            serde_json::json!({"pattern": "aardvark", "path": "."}),
+        );
+        let out = r.output.clone().unwrap();
+        assert!(
+            !out.contains("aardvark"),
+            "a symlink let the search read a file outside the workspace:\n{out}"
+        );
+
+        let g = execute(
+            &parse_tool_call(
+                "glob",
+                &serde_json::json!({"pattern": "*.txt", "path": "."}),
+            )
+            .unwrap(),
+            Some(&dir),
+            None,
+        );
+        let out = g.output.unwrap();
+        assert!(out.contains("inside.txt"), "{out}");
+        assert!(!out.contains("loot.txt"), "glob followed a symlink: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn grep_skips_noise_directories() {
+        let dir = search_project("grep-noise");
+        let r = grep_in(&dir, serde_json::json!({"pattern": "needle", "path": "."}));
+        let out = r.output.unwrap();
+        assert!(
+            !out.contains("node_modules"),
+            "the walk descended into node_modules:\n{out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grep_include_and_exclude_filter_by_path() {
+        let dir = search_project("grep-filters");
+        let only_rs = grep_in(
+            &dir,
+            serde_json::json!({"pattern": "needle", "path": ".", "include": "*.rs"}),
+        );
+        let s = only_rs.structured.unwrap();
+        let paths: Vec<&str> = s["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["path"].as_str().unwrap())
+            .collect();
+        assert!(!paths.is_empty(), "the filter excluded everything");
+        assert!(paths.iter().all(|p| p.ends_with(".rs")), "{paths:?}");
+
+        let without_deep = grep_in(
+            &dir,
+            serde_json::json!({"pattern": "needle", "path": ".", "exclude": "sub/*"}),
+        );
+        let s = without_deep.structured.unwrap();
+        let paths: Vec<&str> = s["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["path"].as_str().unwrap())
+            .collect();
+        assert!(!paths.contains(&"sub/d.rs"), "{paths:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bad_search_arguments_are_coded_errors() {
+        let dir = search_project("grep-bad");
+        // An unbalanced group is a regex error, not a walk that finds nothing.
+        let r = grep_in(&dir, serde_json::json!({"pattern": "a(", "path": "."}));
+        assert!(!r.ok);
+        assert_eq!(r.error_code, Some(ErrorCode::RegexInvalid));
+
+        // A malformed filter arrives as its own code, so a caller can tell
+        // "your pattern is broken" from "your filter is broken".
+        let r = grep_in(
+            &dir,
+            serde_json::json!({"pattern": "a", "path": ".", "include": "["}),
+        );
+        assert_eq!(r.error_code, Some(ErrorCode::GlobInvalid));
+
+        let r = grep_in(
+            &dir,
+            serde_json::json!({"pattern": "a", "path": "nope.txt"}),
+        );
+        assert_eq!(r.error_code, Some(ErrorCode::NotADirectory));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn glob_matches_bare_patterns_at_any_depth() {
+        let dir = search_project("glob-bare");
+        let r = execute(
+            &parse_tool_call("glob", &serde_json::json!({"pattern": "*.rs", "path": "."})).unwrap(),
+            Some(&dir),
+            None,
+        );
+        let s = r.structured.unwrap();
+        let paths: Vec<&str> = s["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap())
+            .collect();
+        // `*.rs` with no `/` means "any .rs file", not "a .rs file in the
+        // root" — the second reading matches nothing here and would be
+        // useless, since `sub/d.rs` is the interesting one.
+        assert!(paths.contains(&"a.rs"), "{paths:?}");
+        assert!(paths.contains(&"sub/d.rs"), "{paths:?}");
+        assert!(paths.iter().all(|p| p.ends_with(".rs")), "{paths:?}");
+        assert!(
+            !paths.iter().any(|p| p.contains("node_modules")),
+            "{paths:?}"
+        );
+
+        // An explicit `**/` means the same thing and is also accepted.
+        let r = execute(
+            &parse_tool_call(
+                "glob",
+                &serde_json::json!({"pattern": "**/*.rs", "path": "."}),
+            )
+            .unwrap(),
+            Some(&dir),
+            None,
+        );
+        let s = r.structured.unwrap();
+        assert!(s["paths"].as_array().unwrap().len() >= 2, "{s:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- background commands -------------------------------------------------
+    //
+    // The three tools are one story — start, read, stop — and are tested as
+    // one: any of them alone is satisfied by a stub, and the thing that can
+    // actually be wrong is the handoff between them (an id that cannot be
+    // read, a read that starts in the wrong place, a stop that leaves bytes
+    // unread).
+
+    fn bg_output(ctx: &ToolCtx<'_>, id: u64, cursor: Option<u64>) -> (String, serde_json::Value) {
+        let r = execute_in(&Tool::CommandOutput { id, cursor }, ctx, None);
+        assert!(r.ok, "{:?}", r.error);
+        (r.output.unwrap(), r.structured.unwrap())
+    }
+
+    #[test]
+    fn a_background_command_is_started_read_and_stopped() {
+        let (dir, state) = stateful_workspace("background");
+        let ctx = ToolCtx::with_state(Some(&dir), &state);
+
+        // Prints a marker, then stays alive until it is stopped — the shape of
+        // the thing `run_command` cannot do.
+        let started = execute_in(
+            &Tool::RunCommandBackground {
+                command: "echo bg-marker; sleep 30".into(),
+            },
+            &ctx,
+            None,
+        );
+        assert!(started.ok, "{:?}", started.error);
+        let started = started.structured.unwrap();
+        let id = started["id"]
+            .as_u64()
+            .expect("a handle to read the command by");
+        assert!(
+            started["pid"].as_u64().is_some(),
+            "a started command must report the process it started: {started:?}"
+        );
+
+        // A first read carries no cursor, and must show what the command has
+        // *already* written rather than only what comes after — otherwise the
+        // first look at a command that has already printed reads as a command
+        // that printed nothing.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut read = bg_output(&ctx, id, None);
+        while !read.0.contains("bg-marker") && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            read = bg_output(&ctx, id, None);
+        }
+        assert!(
+            read.0.contains("bg-marker"),
+            "the first read must reach back to the start: {:?}",
+            read.0
+        );
+        assert_eq!(read.1["status"], "running");
+
+        // Resuming from the cursor returns only what is new, which here is
+        // nothing — and says so rather than repeating the marker.
+        let next = read.1["next_cursor"].as_u64().unwrap();
+        let resumed = bg_output(&ctx, id, Some(next));
+        assert!(
+            !resumed.0.contains("bg-marker"),
+            "the marker was already read: {:?}",
+            resumed.0
+        );
+        assert_eq!(resumed.1["next_cursor"].as_u64(), Some(next));
+        assert_eq!(resumed.1["more"], false);
+
+        let killed = execute_in(&Tool::KillCommand { id }, &ctx, None);
+        assert!(killed.ok, "{:?}", killed.error);
+        let killed = killed.structured.unwrap();
+        assert_eq!(
+            killed["status"], "killed",
+            "a stopped command says it was stopped, not that it exited: {killed:?}"
+        );
+        assert_eq!(killed["already_finished"], false);
+
+        // The output outlives the stop, so what the command printed on its way
+        // down is still readable afterwards.
+        let after = bg_output(&ctx, id, None);
+        assert!(after.0.contains("bg-marker"), "{:?}", after.0);
+        assert_eq!(after.1["complete"], true);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reading an id that was never handed out is `PROCESS_NOT_FOUND`, and one
+    /// whose output has been released is `OUTPUT_GONE` — the caller can act on
+    /// the difference (stop guessing vs. start the command again), so
+    /// collapsing them into one "not found" would throw away the answer.
+    #[test]
+    fn a_missing_command_says_which_kind_of_missing() {
+        let (dir, state) = stateful_workspace("background-missing");
+        let ctx = ToolCtx::with_state(Some(&dir), &state);
+
+        let r = execute_in(
+            &Tool::CommandOutput {
+                id: 9999,
+                cursor: None,
+            },
+            &ctx,
+            None,
+        );
+        assert!(!r.ok);
+        assert_eq!(r.error_code, Some(ErrorCode::ProcessNotFound));
+        let r = execute_in(&Tool::KillCommand { id: 9999 }, &ctx, None);
+        assert_eq!(r.error_code, Some(ErrorCode::ProcessNotFound));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
