@@ -127,6 +127,18 @@ body {
   }
 }
 
+@keyframes lex-breathe {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.6;
+    transform: scale(1.08);
+  }
+}
+
 /* Entrance utilities — `both` keeps the start state before the delay. */
 .anim-fade-in {
   animation: lex-fade-in 180ms var(--ease-out) both;
@@ -143,6 +155,44 @@ body {
 .anim-pulse {
   animation: lex-pulse 2s ease-in-out infinite;
 }
+
+/* First-run stage: a black room with a slow teal breath behind the word. */
+.onboard-screen {
+  background:
+    radial-gradient(
+      120% 90% at 50% 0%,
+      color-mix(in oklab, var(--primary) 14%, transparent),
+      transparent 55%
+    ),
+    #000;
+}
+
+.onboard-glow {
+  position: absolute;
+  width: min(60vw, 34rem);
+  aspect-ratio: 1;
+  border-radius: 9999px;
+  background: radial-gradient(
+    circle,
+    color-mix(in oklab, var(--primary) 40%, transparent),
+    transparent 68%
+  );
+  filter: blur(60px);
+  animation: lex-breathe 7s ease-in-out infinite;
+}
+
+.onboard-hello {
+  position: relative;
+  font-family: Georgia, "Times New Roman", "Songti SC", serif;
+  font-style: italic;
+  font-weight: 400;
+  font-size: clamp(4.5rem, 17vw, 11rem);
+  line-height: 1;
+  letter-spacing: -0.045em;
+  color: #ffffff;
+  text-shadow: 0 0 44px color-mix(in oklab, var(--primary) 55%, transparent);
+}
+
 
 @media (prefers-reduced-transparency: reduce) {
   .glass,

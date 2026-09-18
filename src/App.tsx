@@ -17,12 +17,14 @@ import GitView from "./views/GitView";
 import HandoffView from "./views/HandoffView";
 import MemoryView from "./views/MemoryView";
 import ProjectDialog from "./components/ProjectDialog";
+import Onboarding from "./components/Onboarding";
 import QuestionBanner from "./components/QuestionBanner";
 import TraceView from "./views/TraceView";
 import Statusbar from "./components/Statusbar";
 import TerminalPane from "./components/TerminalPane";
 import Titlebar from "./components/Titlebar";
 import WorkbenchRail, { type View } from "./components/WorkbenchRail";
+import { isOnboarded } from "./lib/onboarding";
 import { useApprovals } from "./hooks/useApprovals";
 import { useFailover } from "./hooks/useFailover";
 import { useQuestions } from "./hooks/useQuestions";
@@ -77,6 +79,7 @@ export default function App() {
   const [recents, setRecents] = useState<string[]>([]);
   const [view, setView] = useState<View>(loadView);
   const [projectOpen, setProjectOpen] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState(() => !isOnboarded());
   const { approvals, grantState, decide } = useApprovals();
   const { questions, answer } = useQuestions();
   const { status, localEvent, webEvent, dismiss } = useFailover();
@@ -91,6 +94,20 @@ export default function App() {
     setRecents(loadRecents());
   }, []);
 
+  // Dev-only: Ctrl+Shift+O replays the onboarding stage. The DEV guard is
+  // compiled out of production builds, so real users never hit this.
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "o") {
+        e.preventDefault();
+        setShowOnboarding(true);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   useEffect(() => {
     void (async () => {
       try {
@@ -103,7 +120,9 @@ export default function App() {
           saveRecent(saved);
           setRecents(loadRecents());
           await startWatch();
-        } else {
+        } else if (isOnboarded()) {
+          // First-run users meet the onboarding stage first; the project
+          // dialog opens when they finish it.
           setProjectOpen(true);
         }
         setMcp(connector);
@@ -152,6 +171,12 @@ export default function App() {
   function onPickProject(path: string) {
     setRootInput(path);
     void applyProject(path);
+  }
+
+  function finishOnboarding() {
+    setShowOnboarding(false);
+    // Hand off to the project picker if nothing is bound yet.
+    if (!projectRoot) setProjectOpen(true);
   }
 
   return (
@@ -236,6 +261,8 @@ export default function App() {
         onPick={onPickProject}
         onBrowse={() => void onBrowse()}
       />
+
+      {showOnboarding && <Onboarding onDone={finishOnboarding} />}
       </div>
     </div>
   );

@@ -2,8 +2,7 @@
 
 import { FolderOpenIcon, GlobeIcon, ShieldCheckIcon } from "lucide-react";
 import { Button } from "./ui/button";
-
-const ONBOARD_KEY = "lexsus.onboarded";
+import { isOnboarded, markOnboarded } from "../lib/onboarding";
 
 const STEPS = [
   {
@@ -28,17 +27,10 @@ export default function GettingStarted({
 }: {
   onOpenProject: () => void;
 }) {
-  const dismissed =
-    typeof window !== "undefined" && localStorage.getItem(ONBOARD_KEY) === "true";
-
-  if (dismissed) return null;
+  if (isOnboarded()) return null;
 
   function dismiss() {
-    try {
-      localStorage.setItem(ONBOARD_KEY, "true");
-    } catch {
-      // storage unavailable
-    }
+    markOnboarded();
   }
 
   return (
