@@ -332,7 +332,7 @@ body {
   --chart-4: var(--success);
   --chart-5: var(--danger);
 
-  --radius: 0.5rem;
+  --radius: 0;
 
   --sidebar: var(--surface);
   --sidebar-foreground: var(--foreground);
@@ -393,7 +393,7 @@ body {
   --chart-4: var(--success);
   --chart-5: var(--danger);
 
-  --radius: 0.5rem;
+  --radius: 0;
 
   --sidebar: var(--surface);
   --sidebar-foreground: var(--foreground);

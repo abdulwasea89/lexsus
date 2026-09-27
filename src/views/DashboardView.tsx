@@ -433,6 +433,7 @@ export default function DashboardView() {
       icon={ActivityIcon}
       title="Dashboard"
       description="connector lifecycle · public tunnel · activity at a glance"
+      className="rounded-none border-0"
       actions={
         <Button
           size="sm"
