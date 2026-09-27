@@ -1,5 +1,12 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { CopyMinusIcon, CopyPlusIcon, XIcon } from "lucide-react";
+import {
+  CopyMinusIcon,
+  CopyPlusIcon,
+  MoonIcon,
+  SunIcon,
+  XIcon,
+} from "lucide-react";
+import { toggleTheme, useTheme } from "../hooks/useTheme";
 import { Button } from "./ui/button";
 
 const appWindow = getCurrentWindow();
@@ -10,6 +17,8 @@ const appWindow = getCurrentWindow();
  * `data-tauri-drag-region` (works on X11 and Wayland).
  */
 export default function Titlebar() {
+  const theme = useTheme();
+
   return (
     <header
       data-tauri-drag-region
@@ -23,6 +32,20 @@ export default function Titlebar() {
       </p>
 
       <div className="ml-auto flex h-full items-stretch">
+        <Button
+          variant="ghost"
+          size="sm"
+          aria-label={theme === "dark" ? "Use light theme" : "Use dark theme"}
+          title={theme === "dark" ? "Use light theme" : "Use dark theme"}
+          className="h-full rounded-none px-3.5 hover:bg-muted"
+          onClick={toggleTheme}
+        >
+          {theme === "dark" ? (
+            <SunIcon className="size-3.5" />
+          ) : (
+            <MoonIcon className="size-3.5" />
+          )}
+        </Button>
         <Button
           variant="ghost"
           size="sm"
