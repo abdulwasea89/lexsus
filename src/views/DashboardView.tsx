@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import {
   ActivityIcon,
   CheckIcon,
+  ChevronDownIcon,
   CircleAlertIcon,
   CopyIcon,
   FileIcon,
@@ -90,6 +91,56 @@ function fmtTs(ts: string | null | undefined): string {
   if (!ts) return "—";
   // SQLite datetime('now') is "YYYY-MM-DD HH:MM:SS"; show the time part.
   return ts.includes(" ") ? ts.split(" ")[1] : ts;
+}
+
+interface SectionProps {
+  title: ReactNode;
+  description?: string;
+  badge?: ReactNode;
+  defaultOpen?: boolean;
+  children: ReactNode;
+}
+
+/**
+ * Progressive disclosure: the dense secondary cards collapse behind a clear
+ * header, keeping the primary controls (connector, tunnel) visible without
+ * burying the reference data.
+ */
+function Section({
+  title,
+  description,
+  badge,
+  defaultOpen = false,
+  children,
+}: SectionProps) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <Card>
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        className="group flex w-full items-start gap-2 rounded-t-xl px-(--card-spacing) text-left"
+      >
+        <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+          <span className="flex items-center gap-2 font-heading text-base leading-snug font-medium">
+            {title}
+            {badge}
+          </span>
+          {description && (
+            <span className="text-sm text-muted-foreground">{description}</span>
+          )}
+        </span>
+        <ChevronDownIcon
+          className={cn(
+            "size-4 shrink-0 text-muted-foreground transition-transform duration-200",
+            open && "rotate-180",
+          )}
+        />
+      </button>
+      {open && <CardContent>{children}</CardContent>}
+    </Card>
+  );
 }
 
 /** The control surface: connector lifecycle, tunnel, tool surface, activity. */
@@ -327,6 +378,17 @@ export default function DashboardView() {
     ? Math.round((surface.read_only / surface.total) * 100)
     : 0;
 
+  // Form friction: Apply is only useful when the field actually differs from
+  // the live value — a disabled Apply is a clearer "already saved" than a
+  // toast after a no-op.
+  const portDirty = portInput !== String(mcp?.port ?? "");
+  const hostsDirty =
+    hostsInput
+      .split(/[\n,]/)
+      .map((h) => h.trim())
+      .filter(Boolean)
+      .join("\n") !== (mcp?.configured_hosts ?? []).join("\n");
+
   return (
     <ViewShell
       icon={ActivityIcon}
@@ -334,6 +396,36 @@ export default function DashboardView() {
       description="connector lifecycle · public tunnel · activity at a glance"
     >
       <div className="flex flex-col gap-3">
+        {/* Trust signals — privacy/security posture up front, never buried. */}
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border/60 bg-surface-2/50 px-3 py-2 text-[11px] text-muted-foreground">
+          <span className="inline-flex items-center gap-1.5">
+            <span className="size-1.5 rounded-full bg-success" />
+            Loopback only
+          </span>
+          <span className="text-muted-foreground/40">·</span>
+          <span className="inline-flex items-center gap-1.5">
+            <ShieldAlertIcon className="size-3" />
+            Bearer token required
+          </span>
+          <span className="text-muted-foreground/40">·</span>
+          <span className="inline-flex items-center gap-1.5">
+            {mcp?.allow_write ? (
+              <>
+                <span className="size-1.5 rounded-full bg-warning" />
+                Read/write enabled
+              </>
+            ) : (
+              <>
+                <span className="size-1.5 rounded-full bg-success" />
+                Read-only first
+              </>
+            )}
+          </span>
+          <span className="ml-auto hidden font-mono text-muted-foreground sm:inline">
+            {mcp?.workspace ? mcp.workspace.split(/[\\/]/).pop() : "no project bound"}
+          </span>
+        </div>
+
         {/* KPI strip */}
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-6">
           <Stat
@@ -442,7 +534,7 @@ export default function DashboardView() {
                 <Button
                   size="sm"
                   variant="outline"
-                  disabled={busy === "port"}
+                  disabled={busy === "port" || !portDirty}
                   onClick={() => void applyPort()}
                 >
                   Apply
@@ -604,7 +696,7 @@ export default function DashboardView() {
                   <Button
                     size="sm"
                     variant="outline"
-                    disabled={busy === "hosts"}
+                    disabled={busy === "hosts" || !hostsDirty}
                     onClick={() => void applyHosts()}
                   >
                     Apply hosts
@@ -616,15 +708,11 @@ export default function DashboardView() {
         </div>
 
         {/* Tool surface */}
-        <Card>
-          <CardHeader>
-            <CardTitle>Tool surface</CardTitle>
-            <CardDescription>
-              Derived from the engine's SPECS — the catalogue cannot drift from
-              what the connector actually exposes.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="grid gap-4 md:grid-cols-2">
+        <Section
+          title="Tool surface"
+          description="Derived from the engine's SPECS — the catalogue cannot drift from what the connector actually exposes."
+        >
+          <div className="grid gap-4 md:grid-cols-2">
             <div className="flex flex-col gap-1.5 md:col-span-2">
               <div className="flex items-center justify-between text-xs">
                 <span className="text-muted-foreground">
@@ -702,21 +790,19 @@ export default function DashboardView() {
                 )}
               </div>
             </div>
-          </CardContent>
-        </Card>
+          </div>
+        </Section>
 
         {/* Files + commands */}
         <div className="grid gap-3 xl:grid-cols-2">
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
+          <Section
+            title={
+              <>
                 <FileIcon className="size-4 text-muted-foreground" /> Files
-              </CardTitle>
-              <CardDescription>
-                {stats?.files ?? 0} distinct files · reads vs writes
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
+              </>
+            }
+            description={`${stats?.files ?? 0} distinct files · reads vs writes`}
+          >
               {files.length === 0 ? (
                 <p className="text-xs text-muted-foreground">No files yet.</p>
               ) : (
@@ -753,19 +839,16 @@ export default function DashboardView() {
                   </Table>
                 </ScrollArea>
               )}
-            </CardContent>
-          </Card>
+          </Section>
 
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
+          <Section
+            title={
+              <>
                 <SquareTerminalIcon className="size-4 text-muted-foreground" /> Commands
-              </CardTitle>
-              <CardDescription>
-                {stats?.commands ?? 0} distinct commands · last outcome
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
+              </>
+            }
+            description={`${stats?.commands ?? 0} distinct commands · last outcome`}
+          >
               {commands.length === 0 ? (
                 <p className="text-xs text-muted-foreground">
                   No commands run yet.
@@ -812,8 +895,7 @@ export default function DashboardView() {
                   </Table>
                 </ScrollArea>
               )}
-            </CardContent>
-          </Card>
+          </Section>
         </div>
 
         {/* Recent activity */}
