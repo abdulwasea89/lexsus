@@ -14,6 +14,7 @@
 //! - Tool results are capped so a connector (provider ceiling ≈150k chars)
 //!   never receives an unbounded blob.
 
+use crate::auth::{self, Auth, AuthError};
 use crate::bridge;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams,
@@ -28,6 +29,12 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager};
+
+use axum::body::Body;
+use axum::extract::{Request, State};
+use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::middleware::Next;
+use axum::response::Response;
 
 /// Loopback bind address for the connector's MCP endpoint. Bound to loopback
 /// only, which is the security posture; reaching it from anywhere else is an
@@ -496,12 +503,199 @@ pub fn effective_allowed_hosts() -> Vec<String> {
     server_config().allowed_hosts
 }
 
+/// Ceiling on a buffered request body. Comfortably above the largest a tool
+/// call carries — a `write_file` or `apply_patch` payload — and far below
+/// anything that would let one request exhaust memory.
+const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
+/// Ceiling on a response this layer will buffer in order to sign it. A tool
+/// result is capped at 140 000 chars, so only an out-of-band media block can
+/// approach this; see [`sign_response`] for what happens past it.
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Reject anything that cannot prove it is the desktop's connector.
+///
+/// One layer over the whole router — both the `/mcp` nest and the `/` alias a
+/// provider connector POSTs `initialize` to — so the check cannot be dodged by
+/// picking a path. It covers every tool in `SPECS` by construction rather than
+/// by enumeration: `READ_ONLY` and `WRITE` partition `SPECS`, and both go
+/// through here.
+async fn require_auth(State(auth): State<Arc<Auth>>, request: Request, next: Next) -> Response {
+    let (parts, body) = request.into_parts();
+
+    // The body is buffered because a signature covers it and the handler needs
+    // it again afterwards. MCP request bodies are single JSON-RPC objects, not
+    // streams, so there is nothing incremental to lose.
+    let body = match axum::body::to_bytes(body, MAX_REQUEST_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            eprintln!("[mcp] rejected: request body over {MAX_REQUEST_BYTES} bytes");
+            return plain(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body too large".to_string(),
+            );
+        }
+    };
+
+    if let Err(error) = auth.verify(&parts.headers, &body) {
+        // The specific reason is always logged. It goes to the caller only once
+        // their bearer token has already checked out — at that point they are
+        // entitled to know why their signature failed, and a caller who has not
+        // gets nothing to probe with.
+        let authenticated = !matches!(error, AuthError::MissingCredentials | AuthError::BadToken);
+        eprintln!("[mcp] rejected: {} ({})", error.code(), error.message());
+        return unauthorized(&error, authenticated);
+    }
+
+    let method = parts.method.clone();
+    let response = next.run(Request::from_parts(parts, Body::from(body))).await;
+    sign_response(&auth, response, &method).await
+}
+
+/// Attach the secure layer to whatever router serves the endpoint. Named so
+/// the tests drive the same wrapping the server does, rather than a paraphrase
+/// of it.
+fn with_auth(router: axum::Router, auth: Arc<Auth>) -> axum::Router {
+    router.layer(axum::middleware::from_fn_with_state(auth, require_auth))
+}
+
+/// Sign the response body, so a caller that checks can tell it was not altered
+/// in flight.
+///
+/// **rmcp 3.2 answers every POST with `text/event-stream`, not JSON.**
+/// `json_response = true` only governs rmcp's *stateless* path; this server
+/// installs a `LocalSessionManager`, and the stateful path always replies with
+/// an SSE frame. Buffering is still safe there, because a POST is a
+/// request/response exchange whose entire content is one terminal frame plus
+/// keep-alive comments — the frame is emitted at the moment a plain JSON body
+/// would have been, so signing costs the caller the interleaved keep-alives and
+/// nothing else. Measured on a live server: `initialize` 14 ms, `tools/list`
+/// 18 ms / 30 KB, `tools/call` 59 ms, each a single frame.
+///
+/// The **GET** stream is the one thing left unsigned, and it is not an
+/// oversight: rmcp serves GET in `legacy_session_mode` (its default) to open a
+/// stream that stays open for the life of the session, so buffering it would
+/// hang this future until the client left. Nothing is lost that a signature
+/// could protect — that stream carries server-initiated messages, not replies
+/// to a call — and a client that wants a signed answer gets one from the POST
+/// it makes.
+async fn sign_response(auth: &Arc<Auth>, response: Response, method: &Method) -> Response {
+    if !is_signable(&response, method) {
+        return response;
+    }
+    let declared = response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    // A declared length over the cap is the only case we can rule out without
+    // reading. An SSE body has no declared length at all and is read below.
+    if matches!(declared, Some(len) if len > MAX_RESPONSE_BYTES) {
+        eprintln!("[mcp] response over {MAX_RESPONSE_BYTES} bytes left unsigned");
+        return response;
+    }
+
+    let (mut parts, body) = response.into_parts();
+    let bytes = match axum::body::to_bytes(body, MAX_RESPONSE_BYTES).await {
+        Ok(bytes) => bytes,
+        // The body has been consumed by the failed read, so the original cannot
+        // be handed back. Saying so beats returning an empty `200`, which the
+        // caller would read as an empty tool result.
+        Err(_) => {
+            eprintln!(
+                "[mcp] response over {MAX_RESPONSE_BYTES} bytes, refused rather than truncated"
+            );
+            return plain(
+                StatusCode::BAD_GATEWAY,
+                format!("response exceeded {MAX_RESPONSE_BYTES} bytes"),
+            );
+        }
+    };
+    let signature = auth.sign_response(&bytes);
+    if let Ok(value) = HeaderValue::from_str(&signature) {
+        parts.headers.insert(auth::SIGNATURE_HEADER, value);
+    }
+    // The buffered length is authoritative now; a stale `Content-Length` from
+    // the streaming original would truncate the reply.
+    if let Ok(value) = HeaderValue::from_str(&bytes.len().to_string()) {
+        parts.headers.insert(header::CONTENT_LENGTH, value);
+    }
+    Response::from_parts(parts, Body::from(bytes))
+}
+
+fn is_event_stream(response: &Response) -> bool {
+    response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| {
+            ct.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("text/event-stream")
+        })
+}
+
+/// Whether this response should be buffered so it can be signed.
+///
+/// Split out from [`sign_response`] because it is the whole safety argument,
+/// and the case that matters — a GET stream — cannot be exercised end to end
+/// without a body that never ends.
+fn is_signable(response: &Response, method: &Method) -> bool {
+    // A GET opens the session-long server→client stream. Buffering it would
+    // hold this future open until the client left, so it streams unsigned.
+    method == Method::POST || !is_event_stream(response)
+}
+
+/// A `401` for a refused request.
+///
+/// `WWW-Authenticate` names the scheme but deliberately does **not** point at
+/// `resource_metadata`, preserving the existing decision that `/.well-known/*`
+/// 404s: a hosted connector reads that as "no auth advertised" instead of
+/// launching an OAuth flow this endpoint cannot complete.
+fn unauthorized(error: &AuthError, authenticated: bool) -> Response {
+    let payload = if authenticated {
+        serde_json::json!({
+            "error": "unauthorized",
+            "reason": error.code(),
+            "message": error.message(),
+        })
+    } else {
+        serde_json::json!({
+            "error": "unauthorized",
+            "message": "a valid Authorization: Bearer token is required",
+        })
+    };
+    let mut response = plain(StatusCode::UNAUTHORIZED, payload.to_string());
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Bearer realm=\"lexsus\""),
+    );
+    response
+}
+
+/// A JSON response built without axum's `json` feature, which this build does
+/// not enable.
+fn plain(status: StatusCode, body: String) -> Response {
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
 /// Bind and serve the MCP endpoint forever. Runs on its own tokio runtime on
 /// a detached thread (the same pattern as the rest of the core's background
 /// work) so it never interferes with the Tauri event loop, and its
 /// blocking-pool wait for approvals cannot stall anything else. `listening`
 /// is flipped once the loopback socket is actually bound.
-pub fn spawn_server(app: AppHandle, allow_write: Arc<AtomicBool>, listening: Arc<AtomicBool>) {
+pub fn spawn_server(
+    app: AppHandle,
+    allow_write: Arc<AtomicBool>,
+    listening: Arc<AtomicBool>,
+    auth: Arc<Auth>,
+) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -509,7 +703,7 @@ pub fn spawn_server(app: AppHandle, allow_write: Arc<AtomicBool>, listening: Arc
             .build()
             .expect("mcp tokio runtime");
         rt.block_on(async move {
-            if let Err(e) = serve(app, allow_write, listening).await {
+            if let Err(e) = serve(app, allow_write, listening, auth).await {
                 eprintln!("[mcp] server exited: {e}");
             }
         });
@@ -520,6 +714,7 @@ async fn serve(
     app: AppHandle,
     allow_write: Arc<AtomicBool>,
     listening: Arc<AtomicBool>,
+    auth: Arc<Auth>,
 ) -> std::io::Result<()> {
     let config = server_config();
     // A fresh handler per connection/session, each sharing the live flag and
@@ -535,7 +730,10 @@ async fn serve(
 
     let listener = tokio::net::TcpListener::bind(ADDR).await?;
     listening.store(true, Ordering::SeqCst);
-    eprintln!("[mcp] listening on http://{ADDR}{MCP_PATH}");
+    eprintln!(
+        "[mcp] listening on http://{ADDR}{MCP_PATH} (auth: {})",
+        auth.backend().as_str()
+    );
     // The canonical endpoint is `/mcp`, but some provider connectors (Claude.ai)
     // treat the bare origin as the resource URL and POST `initialize` to `/`.
     // A 404 there is misread as an auth failure, so the same engine answers at
@@ -544,7 +742,7 @@ async fn serve(
     let router = axum::Router::new()
         .nest_service(MCP_PATH, service.clone())
         .route("/", axum::routing::any_service(service));
-    axum::serve(listener, router)
+    axum::serve(listener, with_auth(router, auth))
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))
 }
@@ -552,6 +750,7 @@ async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt;
 
     /// The READ_ONLY/WRITE split must exactly partition the SPECS canonical
     /// names — no SPECS tool may be silently missing from the MCP surface,
@@ -1045,5 +1244,271 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- the secure layer ----------------------------------------------------
+
+    /// The body the middleware tests send. Any valid JSON-RPC object would do;
+    /// this is the one a connector actually posts first.
+    const SAMPLE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+
+    /// A stand-in for the MCP service, reproducing the shape rmcp 3.2 actually
+    /// answers with: `text/event-stream` and **no** `Content-Length`, because
+    /// the body is streamed. An earlier version of this fixture returned
+    /// `application/json` with a declared length — the shape the signing path
+    /// was written against, and one this server never emits — so it passed
+    /// while every live response went out unsigned.
+    fn echo_router() -> axum::Router {
+        axum::Router::new().route(MCP_PATH, axum::routing::post(sse))
+    }
+
+    /// The SSE reply rmcp sends: a retry hint, one terminal `data:` frame.
+    async fn sse() -> Response {
+        let mut response = Response::new(Body::from(
+            "id: 0\nretry: 3000\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+        ));
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        response
+    }
+
+    fn post(body: &str) -> Request {
+        Request::builder()
+            .method("POST")
+            .uri(MCP_PATH)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn bearer(request: &mut Request, token: &str) {
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+    }
+
+    async fn body_bytes(response: Response) -> Vec<u8> {
+        use http_body_util::BodyExt;
+        response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes()
+            .to_vec()
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn a_request_without_a_token_is_refused() {
+        let auth = Auth::for_tests();
+        let response = with_auth(echo_router(), auth)
+            .oneshot(post(SAMPLE))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().contains_key(header::WWW_AUTHENTICATE));
+        // Nothing to probe with: an unauthenticated caller is not told which
+        // check failed.
+        let body = String::from_utf8(body_bytes(response).await).unwrap();
+        assert!(!body.contains("bad_token"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_wrong_token_is_refused() {
+        let auth = Auth::for_tests();
+        let mut request = post(SAMPLE);
+        bearer(&mut request, "not-the-token");
+        let response = with_auth(echo_router(), auth)
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The bearer alone gets a real request through — the path every stock MCP
+    /// host takes, since none of them signs.
+    #[tokio::test]
+    async fn a_valid_token_reaches_the_handler() {
+        let auth = Auth::for_tests();
+        let mut request = post(SAMPLE);
+        bearer(&mut request, &auth.reveal());
+        let response = with_auth(echo_router(), auth)
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // The reply arrives byte-for-byte as the handler wrote it — signing
+        // buffers it, and must not reshape it.
+        let body = String::from_utf8(body_bytes(response).await).unwrap();
+        assert!(
+            body.contains(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#),
+            "{body}"
+        );
+    }
+
+    /// What the server sends back is signed over the body it sent — including
+    /// the `text/event-stream` reply rmcp actually produces, which is the only
+    /// shape a live caller ever sees.
+    #[tokio::test]
+    async fn a_response_is_signed_over_its_body() {
+        let auth = Auth::for_tests();
+        let mut request = post(SAMPLE);
+        bearer(&mut request, &auth.reveal());
+        let response = with_auth(echo_router(), auth.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/event-stream",
+            "the fixture must answer the way rmcp does, or this proves nothing"
+        );
+        let signature = response
+            .headers()
+            .get(auth::SIGNATURE_HEADER)
+            .expect("every response is signed, streamed or not")
+            .to_str()
+            .unwrap()
+            .to_string();
+        // The reply arrived chunked, so buffering it must install the length the
+        // body now has — a missing or stale one truncates the reply.
+        let body = body_bytes(response).await;
+        assert!(auth.verify_response(&body, &signature));
+        // The signature is over these bytes specifically, not a constant.
+        assert!(!auth.verify_response(b"something else", &signature));
+    }
+
+    /// The session stream a GET opens is left alone. Buffering it would park
+    /// this middleware until the caller disconnected.
+    #[test]
+    fn a_session_stream_is_not_buffered() {
+        let mut stream = Response::new(Body::empty());
+        stream.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        assert!(!is_signable(&stream, &Method::GET));
+
+        // Everything else is signed: a POST reply streams too, and that is the
+        // path every tool call takes.
+        assert!(is_signable(&stream, &Method::POST));
+        let mut json = Response::new(Body::empty());
+        json.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        assert!(is_signable(&json, &Method::GET));
+    }
+
+    #[tokio::test]
+    async fn a_bad_signature_is_refused() {
+        let auth = Auth::for_tests();
+        let mut request = post(SAMPLE);
+        bearer(&mut request, &auth.reveal());
+        request.headers_mut().insert(
+            auth::TIMESTAMP_HEADER,
+            HeaderValue::from_str(&now_secs().to_string()).unwrap(),
+        );
+        request
+            .headers_mut()
+            .insert(auth::NONCE_HEADER, HeaderValue::from_static("nonce-1"));
+        request
+            .headers_mut()
+            .insert(auth::SIGNATURE_HEADER, HeaderValue::from_static("00"));
+        let response = with_auth(echo_router(), auth)
+            .oneshot(request)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // The bearer was valid, so this caller may be told which check failed.
+        let body = String::from_utf8(body_bytes(response).await).unwrap();
+        assert!(body.contains("bad_signature"), "{body}");
+    }
+
+    /// A correctly signed request is accepted once, and refused on replay.
+    #[tokio::test]
+    async fn a_signed_request_is_accepted_once() {
+        let auth = Auth::for_tests();
+        let app = with_auth(echo_router(), auth.clone());
+        let (timestamp, nonce, signature) = auth.sign_request(SAMPLE.as_bytes()).unwrap();
+
+        let build = || {
+            let mut request = post(SAMPLE);
+            bearer(&mut request, &auth.reveal());
+            request.headers_mut().insert(
+                auth::TIMESTAMP_HEADER,
+                HeaderValue::from_str(&timestamp).unwrap(),
+            );
+            request
+                .headers_mut()
+                .insert(auth::NONCE_HEADER, HeaderValue::from_str(&nonce).unwrap());
+            request.headers_mut().insert(
+                auth::SIGNATURE_HEADER,
+                HeaderValue::from_str(&signature).unwrap(),
+            );
+            request
+        };
+
+        assert_eq!(
+            app.clone().oneshot(build()).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone().oneshot(build()).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// The endpoint answers at `/` as well as `/mcp`, and the guard covers
+    /// both — otherwise "POST to the other path" would be a way around it.
+    #[tokio::test]
+    async fn the_root_alias_is_guarded_too() {
+        let auth = Auth::for_tests();
+        let unauthenticated = Request::builder()
+            .method("POST")
+            .uri("/")
+            .body(Body::from(SAMPLE.to_string()))
+            .unwrap();
+        let response = with_auth(echo_router(), auth)
+            .oneshot(unauthenticated)
+            .await
+            .unwrap();
+        // 401 rather than the 404 an unguarded router would give for a path it
+        // does not serve — proof the middleware ran on it.
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The coverage argument, stated so it fails if it stops being true: the
+    /// middleware wraps the router, and the router serves exactly the tools in
+    /// SPECS — so authenticating the router authenticates every tool.
+    #[test]
+    fn the_authed_surface_is_every_tool() {
+        assert_eq!(
+            bridge::SPECS.len(),
+            58,
+            "tool count changed — README.md, docs/protocol-v2.md and this \
+             coverage argument all say 58"
+        );
+        assert_eq!(
+            exposed_names(true).len(),
+            bridge::SPECS.len(),
+            "the write-enabled surface must be every SPECS tool"
+        );
+        assert_eq!(
+            READ_ONLY.len() + WRITE.len(),
+            bridge::SPECS.len(),
+            "the two halves partition SPECS, and auth covers both"
+        );
     }
 }

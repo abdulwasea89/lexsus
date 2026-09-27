@@ -139,6 +139,20 @@ export function mcpSetAllowWrite(enabled: boolean): Promise<McpStatus> {
   return invoke("mcp_set_allow_write", { enabled });
 }
 
+/**
+ * The bearer token a connector must present. Only reachable over Tauri IPC
+ * from this webview — the same process that already grants approvals — so
+ * showing it costs nothing the desktop surface did not already hold.
+ */
+export function mcpRevealToken(): Promise<string> {
+  return invoke("mcp_reveal_token");
+}
+
+/** Mint a new token. The old one stops working immediately, with no restart. */
+export function mcpRotateToken(): Promise<McpStatus> {
+  return invoke("mcp_rotate_token");
+}
+
 export function setObjective(text: string): Promise<void> {
   return invoke("set_objective", { text });
 }

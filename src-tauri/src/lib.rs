@@ -1,5 +1,7 @@
 pub mod archive;
 
+pub mod auth;
+
 pub mod bgproc;
 
 pub mod bridge;
@@ -708,9 +710,24 @@ struct McpStatus {
     /// is missing from `LEXSUS_MCP_ALLOWED_HOSTS` is visible in the UI rather
     /// than only in the connector's misleading sign-in error.
     allowed_hosts: Vec<String>,
+    /// Where the auth token actually lives: `env`, `keyring` or `file`. Worth
+    /// showing because the keyring is unavailable on a headless Linux box, and
+    /// the user should know which store holds their credential rather than
+    /// assume.
+    auth_backend: String,
+    /// A short digest of the live token, so the UI can say *which* token is in
+    /// force without ever rendering it. Never the token itself — revealing that
+    /// is a deliberate, separate action.
+    token_fingerprint: String,
+    /// How far a signed request's timestamp may be from now.
+    signature_ttl_secs: u64,
+    /// Whether a signature is required on inbound requests. Always false today
+    /// — no MCP client can produce one — and reported so the UI does not imply
+    /// a guarantee the wire does not carry. Responses are signed regardless.
+    signature_required: bool,
 }
 
-fn mcp_status_of(state: &AppState) -> McpStatus {
+fn mcp_status_of(state: &AppState, auth: &auth::Auth) -> McpStatus {
     McpStatus {
         listening: state.mcp_listening.load(Ordering::SeqCst),
         endpoint: format!("http://{}{}", mcp::ADDR, mcp::MCP_PATH),
@@ -722,22 +739,57 @@ fn mcp_status_of(state: &AppState) -> McpStatus {
             .clone()
             .map(|p| p.display().to_string()),
         allowed_hosts: mcp::effective_allowed_hosts(),
+        auth_backend: auth.backend().as_str().to_string(),
+        token_fingerprint: auth.fingerprint(),
+        signature_ttl_secs: auth.ttl_secs(),
+        signature_required: false,
     }
 }
 
 /// Read the connector state (the desktop polls this on mount).
 #[tauri::command]
-fn mcp_status(state: State<'_, AppState>) -> McpStatus {
-    mcp_status_of(&state)
+fn mcp_status(state: State<'_, AppState>, auth: State<'_, Arc<auth::Auth>>) -> McpStatus {
+    mcp_status_of(&state, &auth)
 }
 
 /// Open or close the connector's write surface at runtime. This is the only
 /// thing that moves `allow_write`, which seeds from `LEXSUS_MCP_ALLOW_WRITE`
 /// at launch and is otherwise read-only-first.
 #[tauri::command]
-fn mcp_set_allow_write(state: State<'_, AppState>, enabled: bool) -> McpStatus {
+fn mcp_set_allow_write(
+    state: State<'_, AppState>,
+    auth: State<'_, Arc<auth::Auth>>,
+    enabled: bool,
+) -> McpStatus {
     state.mcp_allow_write.store(enabled, Ordering::SeqCst);
-    mcp_status_of(&state)
+    mcp_status_of(&state, &auth)
+}
+
+/// Hand the connector's bearer token to the desktop so the user can copy it
+/// into their MCP host.
+///
+/// This is the one place the token crosses a boundary, and that boundary is
+/// Tauri IPC — same process, same user, and the desktop is already the sole
+/// approval authority for every gated call. It is never logged, never put in
+/// `mcp_status`, and never sent over the network.
+#[tauri::command]
+fn mcp_reveal_token(auth: State<'_, Arc<auth::Auth>>) -> String {
+    auth.reveal()
+}
+
+/// Replace the connector's bearer token, immediately and persistently.
+///
+/// The previous token stops working the moment this returns — there is no
+/// grace period, so a caller still holding it starts getting `401`. Fails
+/// rather than half-applying if the new token cannot be stored, since a
+/// rotation that did not persist would break on the next launch.
+#[tauri::command]
+fn mcp_rotate_token(
+    state: State<'_, AppState>,
+    auth: State<'_, Arc<auth::Auth>>,
+) -> Result<McpStatus, String> {
+    auth.rotate().map_err(|e| e.message())?;
+    Ok(mcp_status_of(&state, &auth))
 }
 
 /// Set the handoff objective (editable in the handoff panel).
@@ -1140,10 +1192,20 @@ pub fn run() {
             spawn_failover_ticker(app.handle().clone());
             // The durable endpoint: a desktop-local MCP server on loopback,
             // which a provider connector reaches through a tunnel.
+            //
+            // The secure layer comes up first, and the endpoint binds only if
+            // it did. A token that cannot be generated is fatal here on
+            // purpose: an endpoint that failed to bind is a visible, harmless
+            // failure, while one that bound without authentication looks
+            // exactly like it is working.
+            let auth = auth::Auth::load_or_init(&dir)
+                .map_err(|e| format!("refusing to start the MCP endpoint unauthenticated: {e}"))?;
+            app.manage(auth.clone());
             mcp::spawn_server(
                 app.handle().clone(),
                 state.mcp_allow_write.clone(),
                 state.mcp_listening.clone(),
+                auth,
             );
             Ok(())
         })
@@ -1174,6 +1236,8 @@ pub fn run() {
             processes_list,
             mcp_status,
             mcp_set_allow_write,
+            mcp_reveal_token,
+            mcp_rotate_token,
             set_objective,
             build_handoff,
             failover_status,

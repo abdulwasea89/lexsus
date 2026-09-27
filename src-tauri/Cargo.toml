@@ -32,12 +32,20 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # dependency set stays a superset of main's.
 walkdir = "2.5"
 
-# Local WebSocket server for the browser extension (M2) — loopback only,
-# plain ws:// on 127.0.0.1, no TLS needed. Not wired into the build; kept
-# because it exists on main.
-tungstenite = "0.24"
-# Pairing codes come from the OS CSPRNG (clock-derived codes were guessable).
+# Token generation for the connector's auth layer (auth.rs). The OS CSPRNG
+# rather than a seedable PRNG: a guessable bearer token is no token at all.
 getrandom = "0.2"
+
+# The connector's secure layer (auth.rs). `hmac`/`sha2` sign requests and
+# responses, `subtle` makes the token comparison constant-time, and `zeroize`
+# wipes secret material on drop. `keyring` keeps the token in the platform
+# credential store (Secret Service / Keychain / Credential Manager) instead of
+# a file in the app data dir.
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2.6"
+zeroize = "1.9"
+keyring = "3"
 
 # The tool engine's single remote transport: rmcp serves a Streamable-HTTP MCP
 # endpoint over loopback (axum drives its tower Service). Every call funnels
@@ -60,3 +68,10 @@ reqwest = { version = "0.12", default-features = false, features = [
 # Signal the process *group* when cancelling a running command (unix only).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# `ServiceExt::oneshot` drives the real MCP router in-process, so the auth
+# middleware is exercised through the same stack axum serves rather than
+# through a hand-rolled imitation of it.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

@@ -15,7 +15,8 @@ straight at the loopback URL.
 | Transport | MCP Streamable HTTP (`rmcp` 3.2 over axum/tokio) |
 | Endpoint | `http://127.0.0.1:45147/mcp` (`ADDR`, `MCP_PATH`) |
 | Bind | loopback only — never a public interface |
-| Auth | none at the protocol level; the loopback bind and rmcp's `Host` guard are the boundary |
+| Auth | `Authorization: Bearer <token>` on **every** request, loopback included; responses signed |
+| Signing | opportunistic on requests (`X-Lexsus-Signature`), always on responses |
 | Surface | `tools/list` + `tools/call`, derived from `SPECS` in `src-tauri/src/bridge.rs` |
 | Caller label | `mcp` (`bridge::SOURCE_MCP`) |
 | Approval | desktop only, waits ≤ 120 s (`APPROVAL_WAIT_SECS`) |
@@ -31,7 +32,7 @@ watcher grounding. The transport was replaced; the engine it feeds was not.
 
 ## 2. Server lifecycle and framing
 
-`mcp::spawn_server(app, allow_write, listening)` starts a dedicated thread
+`mcp::spawn_server(app, allow_write, listening, auth)` starts a dedicated thread
 holding a multi-threaded tokio runtime (`thread_name("mcp")`), so the server
 never interferes with the Tauri event loop and its blocking-pool waits for
 approvals cannot stall anything else.
@@ -64,7 +65,7 @@ axum::serve(listener, app).await
 
 ---
 
-## 3. Reachability and the DNS-rebinding guard
+## 3. Reachability, the DNS-rebinding guard, and the secure layer
 
 The endpoint can write files and run commands, so it is bound to loopback and
 is not reachable off the machine by default.
@@ -83,6 +84,64 @@ LEXSUS_MCP_ALLOWED_HOSTS=lexsus-proof.trycloudflare.com,localhost.example
 hosts are always **opt-in**, never hardcoded, and loopback remains allowed in
 every case.
 
+### The secure layer
+
+A `Host` guard only holds while the endpoint is genuinely loopback. The moment a
+tunnel host is allow-listed — the documented path to Claude.ai — anyone who
+learns the URL has the read surface, and the write surface whenever the gate is
+open. So authentication is enforced **on every request, loopback included**,
+with no bypass. It lives in `src-tauri/src/auth.rs` and is applied as one axum
+middleware over the whole router in `mcp.rs`, covering both `/mcp` and the `/`
+alias a provider connector POSTs `initialize` to.
+
+Every tool in `SPECS` is covered **by construction, not by enumeration**:
+`READ_ONLY` (30) and `WRITE` (28) partition `SPECS` (58), and both go through
+the one layer. A tool added later is covered the moment it is declared.
+
+| Header | Direction | Required | Meaning |
+|---|---|---|---|
+| `Authorization: Bearer <token>` | request | **yes** | the credential |
+| `X-Lexsus-Timestamp` | request | with a signature | unix seconds, ± 300 s (`LEXSUS_MCP_SIGNATURE_TTL_SECS`) |
+| `X-Lexsus-Nonce` | request | with a signature | single-use, so a captured request cannot be replayed |
+| `X-Lexsus-Signature` | request | no | `hex(HMAC-SHA256(key, ts "\n" nonce "\n" sha256hex(body)))` |
+| `X-Lexsus-Signature` | response | always, except a `GET` stream | HMAC-SHA256 over the response body |
+
+**Why the request signature is optional.** No MCP client can compute a
+per-request HMAC — the ecosystem standardises on `Authorization: Bearer`, custom
+headers are only partially supported, and MCP has no request-signing profile. A
+*required* signature would answer `401` to every stock MCP host (Claude Code,
+Inspector, Claude.ai) and leave a secured endpoint nothing could reach. So the
+bearer is mandatory and a signature is verified **strictly when presented**;
+when absent, the bearer carries it. Responses are signed unconditionally,
+because the server controls that direction.
+
+**The token.** 32 bytes from the OS CSPRNG, hex-encoded, resolved in this order:
+
+1. `LEXSUS_MCP_AUTH_TOKEN` — explicit override, reported as `env`
+2. the OS keyring (`lexsus-mcp` / `auth-token`) — reported as `keyring`
+3. `<app_data_dir>/mcp-auth-token`, mode `0600` — reported as `file`
+
+A keyring failure is a first-class path, not an error: headless Linux has no
+Secret Service on DBus, and the file fallback is the expected outcome there. The
+live backend is reported in `mcp_status.auth_backend` so the UI never implies the
+keyring when the file is in play. The signing key is
+`sha256("lexsus-mcp-hmac-v1" ‖ token)` — **never the token itself**, so a leaked
+signature reveals nothing that can be replayed as a bearer.
+
+`mcp_reveal_token` renders the token to the desktop webview, and
+`mcp_rotate_token` mints a new one and swaps it live — the previous token starts
+being refused on the next request, with no restart. Both are Tauri IPC commands,
+reachable only from the same process that already grants approvals.
+
+**Refusals.** A `401` carries a generic body so a probe cannot learn which check
+failed. The specific reason (`bad_signature`, `replayed_nonce`,
+`stale_timestamp`, …) is returned only once the bearer has already validated —
+that caller is authenticated, and a mismatch there is a debugging problem rather
+than a leak. `WWW-Authenticate` names the scheme but deliberately omits
+`resource_metadata`, preserving the `/.well-known/*` 404 so OAuth discovery
+still reads as "no auth advertised" instead of launching a flow this endpoint
+cannot complete.
+
 **Cloud providers.** Claude.ai runs in Anthropic's cloud and cannot dial
 `127.0.0.1`. The documented way to close that gap is a **short-lived HTTPS dev
 tunnel** (LocalCan or `cloudflared`) that connects *outbound* to the loopback
@@ -91,9 +150,20 @@ that proof — short tunnel TTL, read-only first, one bound workspace, kill swit
 armed — and the full step-by-step live test are in
 `docs/connector-native-proof-runbook.md`.
 
-A **local** MCP host needs none of this: Claude Code, Claude Desktop, or MCP
-Inspector points at `http://127.0.0.1:45147/mcp` directly. That is a free
-byproduct of using MCP as the transport rather than a bespoke channel.
+A tunnel must also **inject the bearer header at the edge**, because Claude.ai
+custom connectors cannot send one, and the endpoint now refuses an unauthenticated
+request. That edge injection is an interim measure; **OAuth 2.1 + PKCE** is the
+real fix for that path and is not implemented (see §12).
+
+A **local** MCP host needs none of this beyond the token: Claude Code, Claude
+Desktop, or MCP Inspector points at `http://127.0.0.1:45147/mcp` and passes
+`--header "Authorization: Bearer <token>"`. That is a free byproduct of using
+MCP as the transport rather than a bespoke channel.
+
+```bash
+claude mcp add --transport http lexsus http://127.0.0.1:45147/mcp \
+  --header "Authorization: Bearer <token from the Connector view>"
+```
 
 ---
 
@@ -489,13 +559,23 @@ what the connector currently is:
   "listening": true,                      // the loopback socket is bound
   "endpoint": "http://127.0.0.1:45147/mcp",
   "allow_write": false,                   // the live write gate
-  "workspace": "/home/me/code/project"    // null until a project is bound
+  "workspace": "/home/me/code/project",   // null until a project is bound
+  "allowed_hosts": ["localhost", "127.0.0.1", "::1"],
+  "auth_backend": "keyring",              // env | keyring | file
+  "token_fingerprint": "9f2c1ab4e0d3",    // never the token itself
+  "signature_ttl_secs": 300,
+  "signature_required": false             // request signatures are optional
 }
 ```
 
 `mcp_set_allow_write` returns the same payload after flipping the gate, so the
 UI never has to guess. The status bar renders `connector · ro` /
 `connector · rw` / `connector offline` from `listening` + `allow_write`.
+
+`token_fingerprint` is the first 12 hex characters of `sha256(token)`: enough to
+tell two tokens apart in the UI, useless as a credential. The token itself is
+never in `mcp_status` — showing it is the separate, deliberate
+`mcp_reveal_token` call, driven from the Connector authentication panel.
 
 ---
 
@@ -520,6 +600,15 @@ UI never has to guess. The status bar renders `connector · ro` /
   tools are still roadmap items (`docs/tool-roadmap.md`) and are absent from
   `SPECS`, so they never appear in `tools/list`. An unknown name is refused as
   an invalid-arguments tool error.
-- **No OAuth.** Authentication is the loopback bind plus the `Host` guard. A
-  stable public host behind the product gate would need OAuth 2.1 + PKCE; none
-  is implemented.
+- **No OAuth.** Authentication is a bearer token the desktop mints and stores,
+  plus signed responses. A stable public host behind the product gate would need
+  OAuth 2.1 + PKCE, which the endpoint advertises nowhere: `/.well-known/*` 404s
+  and `WWW-Authenticate` omits `resource_metadata`, so a connector reads it as
+  "no auth advertised" rather than starting a flow that cannot complete.
+- **No confidentiality past TLS termination.** Response signatures detect
+  tampering; they do not hide content. A tunnel that terminates TLS sees
+  plaintext, and sealing bodies in AES-GCM is not done. It is also unnecessary
+  while the tunnel's far end is a loopback socket.
+- **No mandatory request signature.** Accepted when present, never required —
+  see §3, and note that a `GET` session stream is the one response that goes
+  unsigned.
