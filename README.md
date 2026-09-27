@@ -93,8 +93,15 @@ When the app starts, the connector binds `http://127.0.0.1:45147/mcp` — the st
 
 Connect a web AI:
 
-1. **Claude.ai** — Customize → Connectors → **Add custom connector**, and give it the endpoint. Claude.ai connects from Anthropic's cloud, so in development expose the loopback server through a short-lived HTTPS tunnel (see [docs/connector-native-proof-runbook.md](docs/connector-native-proof-runbook.md)); add that tunnel's host to the DNS-rebinding allowlist (see env vars below).
-2. **A local MCP host** (Claude Code, Claude Desktop, the MCP Inspector) — point it straight at `http://127.0.0.1:45147/mcp`. No tunnel needed.
+1. **Claude.ai** — Customize → Connectors → **Add custom connector**, and give it the endpoint. Claude.ai connects from Anthropic's cloud, so in development expose the loopback server through a short-lived HTTPS tunnel (see [docs/connector-native-proof-runbook.md](docs/connector-native-proof-runbook.md)); add that tunnel's host to the DNS-rebinding allowlist (see env vars below), and have the tunnel **inject the bearer header at its edge**, since custom connectors cannot send one.
+2. **A local MCP host** (Claude Code, Claude Desktop, the MCP Inspector) — point it straight at `http://127.0.0.1:45147/mcp` and pass the token as a header. No tunnel needed:
+
+   ```bash
+   claude mcp add --transport http lexsus http://127.0.0.1:45147/mcp \
+     --header "Authorization: Bearer <token>"
+   ```
+
+   Reveal the token in **Web-AI connector → Connector authentication**; that panel also rotates it.
 
 The connector starts **read-only**. Flip **Allow writes & commands** in the Web-AI connector view when you want the write and command tools exposed — every one of them still asks for your approval on the desktop.
 
@@ -102,6 +109,8 @@ The connector starts **read-only**. Flip **Allow writes & commands** in the Web-
 | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `LEXSUS_MCP_ALLOW_WRITE=1`                         | Seed the connector with writes & commands exposed on launch (still approval-gated).                          |
 | `LEXSUS_MCP_ALLOWED_HOSTS=your-tunnel.example.com` | Allowlist additional hosts (e.g. a dev tunnel) for DNS-rebinding protection. Comma-separated, additive only. |
+| `LEXSUS_MCP_AUTH_TOKEN=<hex>`                      | Pin the bearer token instead of using the keyring or file. Reported as the `env` backend in the UI.           |
+| `LEXSUS_MCP_SIGNATURE_TTL_SECS=300`                | How far a signed request's timestamp may be from now.                                                        |
 
 Optional — the LLM context-compression service (Layer 3):
 
@@ -145,6 +154,8 @@ Large files come back one chunk at a time as numbered lines, with a footer namin
 ## Security Model
 
 - **Loopback-only:** the MCP server binds `127.0.0.1:45147` (see `src-tauri/src/mcp.rs`). Remote hosts are rejected unless explicitly allowlisted via `LEXSUS_MCP_ALLOWED_HOSTS`.
+- **Authenticated on every request, loopback included:** a bearer token (`Authorization: Bearer …`) is required with no bypass, so allowlisting a tunnel host does not hand the URL alone the read surface. The token is generated from the OS CSPRNG and kept in the OS keyring, falling back to a `0600` file where there is none; the UI shows which store is live, reveals the token on request, and rotates it without a restart.
+- **Signed responses:** every response carries `X-Lexsus-Signature`, an HMAC the caller can check to detect a tunnel or proxy that altered it. A request signature is verified strictly *when presented* but never required — no MCP client can compute one. This detects tampering; it is not confidentiality past TLS termination.
 - **Read-only first:** write/command tools stay hidden until you opt in, live, from the desktop.
 - **Every mutation is gated:** writes, commands, and destructive calls (`delete_file`, `move_file`, `git_checkout`, …) pause for approval, showing the resolved absolute path.
 - **Session grants + kill switch:** "don't ask again" grants a class of edits for the session only; the kill switch revokes all grants and pauses the bridge.
@@ -162,6 +173,7 @@ What's next: hardening the approval/audit surface, completing compression (Layer
 | Symptom                           | Likely cause / fix                                                                                                                                         |
 | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Web AI can't reach the endpoint   | Confirm the app is running and bound to `http://127.0.0.1:45147/mcp`; local hosts need no tunnel, Claude.ai cloud needs the HTTPS tunnel from the runbook. |
+| `401 unauthorized` from the AI    | Every request needs `Authorization: Bearer <token>`. Reveal the token in **Web-AI connector → Connector authentication**; rotate it if it leaked — the old one stops working at once. |
 | Tunnel host rejected              | Add it to `LEXSUS_MCP_ALLOWED_HOSTS` and restart; the allowlist is additive to loopback.                                                                   |
 | Write tools not visible to the AI | Flip **Allow writes & commands** in the Web-AI connector view (or launch with `LEXSUS_MCP_ALLOW_WRITE=1`).                                                 |
 | Approval card never resolves      | Check the desktop app is focused — approvals block the tool call until you Allow/Deny.                                                                     |

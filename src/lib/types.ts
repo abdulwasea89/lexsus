@@ -204,6 +204,26 @@ export interface McpStatus {
    * sign-in problem.
    */
   allowed_hosts: string[];
+  /**
+   * Where the bearer token actually lives: `env`, `keyring` or `file`. The
+   * keyring is unavailable on a headless Linux box, so the fallback is a
+   * normal outcome rather than an error — shown so you know which store
+   * holds your credential.
+   */
+  auth_backend: "env" | "keyring" | "file";
+  /**
+   * A short digest of the live token, so the UI can say *which* token is in
+   * force without rendering it. Revealing the token is a separate action.
+   */
+  token_fingerprint: string;
+  /** How far a signed request's timestamp may be from now, in seconds. */
+  signature_ttl_secs: number;
+  /**
+   * Whether inbound requests must carry a signature. Always false: no MCP
+   * client can compute one, so the bearer token carries authentication.
+   * Every *response* is signed regardless.
+   */
+  signature_required: boolean;
 }
 
 // --- failover ----------------------------------------------------------------

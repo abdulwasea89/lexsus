@@ -1040,7 +1040,12 @@ pub const SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "lsp_symbols",
-        aliases: &["symbols", "document_symbols", "workspace_symbols", "outline"],
+        aliases: &[
+            "symbols",
+            "document_symbols",
+            "workspace_symbols",
+            "outline",
+        ],
         args: "path?, query?",
         summary: "Symbols in a file, or matching a query across the workspace",
         approval: Approval::Auto,
@@ -3343,18 +3348,16 @@ pub fn detail(tool: &Tool) -> Option<String> {
         ),
         Tool::AskUser { question, .. } => Some(clip_chars(question, 60)),
         Tool::ProposePlan { plan, .. } => Some(clip_chars(plan, 60)),
-        Tool::Monitor { path, command_id, .. } => match (path, command_id) {
+        Tool::Monitor {
+            path, command_id, ..
+        } => match (path, command_id) {
             (Some(p), _) => Some(p.clone()),
             (None, Some(id)) => Some(format!("command #{id}")),
             (None, None) => None,
         },
         Tool::Notify { title, .. } => Some(clip_chars(title, 60)),
-        Tool::EnterWorktree { name } => {
-            Some(name.clone().unwrap_or_else(|| "new worktree".into()))
-        }
-        Tool::ExitWorktree { action } => {
-            Some(action.clone().unwrap_or_else(|| "keep".into()))
-        }
+        Tool::EnterWorktree { name } => Some(name.clone().unwrap_or_else(|| "new worktree".into())),
+        Tool::ExitWorktree { action } => Some(action.clone().unwrap_or_else(|| "keep".into())),
         Tool::ReportFindings { findings, .. } => Some(format!("{} finding(s)", findings.len())),
     }
 }
@@ -5988,10 +5991,7 @@ fn phase_path(root: &Path, path: &str) -> Result<PathBuf, ToolResult> {
 fn run_phase_tool(tool: &Tool, ctx: &ToolCtx<'_>) -> ToolResult {
     match tool {
         Tool::WebFetch { url, max_bytes } => run_web_fetch(url, *max_bytes),
-        Tool::WebSearch {
-            query,
-            max_results,
-        } => run_web_search(query, *max_results),
+        Tool::WebSearch { query, max_results } => run_web_search(query, *max_results),
         Tool::NotebookRead { path } => run_notebook_read(ctx, path),
         Tool::NotebookEdit {
             path,
@@ -6020,30 +6020,26 @@ fn run_phase_tool(tool: &Tool, ctx: &ToolCtx<'_>) -> ToolResult {
             character,
             include_declaration,
         } => run_lsp_references(ctx, path, *line, *character, *include_declaration),
-        Tool::LspSymbols { path, query } => {
-            run_lsp_symbols(ctx, path.as_deref(), query.as_deref())
-        }
-        Tool::AskUser { question, options } => {
-            run_ask_user(ctx, question, options)
-        }
+        Tool::LspSymbols { path, query } => run_lsp_symbols(ctx, path.as_deref(), query.as_deref()),
+        Tool::AskUser { question, options } => run_ask_user(ctx, question, options),
         Tool::ProposePlan { plan, steps } => run_propose_plan(ctx, plan, steps),
         Tool::Monitor {
             path,
             command_id,
             pattern,
             timeout_ms,
-        } => run_monitor(ctx, path.as_deref(), *command_id, pattern.as_deref(), *timeout_ms),
-        Tool::Notify {
-            title,
-            body,
-            level,
-        } => run_notify(ctx, title, body, level.as_deref()),
+        } => run_monitor(
+            ctx,
+            path.as_deref(),
+            *command_id,
+            pattern.as_deref(),
+            *timeout_ms,
+        ),
+        Tool::Notify { title, body, level } => run_notify(ctx, title, body, level.as_deref()),
         Tool::EnterWorktree { name } => run_enter_worktree(ctx, name.as_deref()),
         Tool::ExitWorktree { action } => run_exit_worktree(ctx, action.as_deref()),
         Tool::ReadMedia { path } => run_read_media(ctx, path),
-        Tool::PublishArtifact { path, title } => {
-            run_publish_artifact(ctx, path, title.as_deref())
-        }
+        Tool::PublishArtifact { path, title } => run_publish_artifact(ctx, path, title.as_deref()),
         Tool::ReportFindings { findings, summary } => {
             run_report_findings(findings, summary.as_deref())
         }
@@ -6101,15 +6097,7 @@ fn run_web_search(query: &str, max_results: Option<u32>) -> ToolResult {
                 results
                     .iter()
                     .enumerate()
-                    .map(|(i, r)| {
-                        format!(
-                            "{}. {}\n   {}\n   {}",
-                            i + 1,
-                            r.title,
-                            r.url,
-                            r.snippet
-                        )
-                    })
+                    .map(|(i, r)| format!("{}. {}\n   {}\n   {}", i + 1, r.title, r.url, r.snippet))
                     .collect::<Vec<_>>()
                     .join("\n")
             };
@@ -6136,9 +6124,10 @@ fn notebook_error(path: &str, e: notebook::NotebookError) -> ToolResult {
         notebook::NotebookError::Invalid(msg) => {
             ToolResult::err_code(ErrorCode::NotebookInvalid, format!("{path}: {msg}"))
         }
-        notebook::NotebookError::NoSuchCell(id) => {
-            ToolResult::err_code(ErrorCode::NotebookInvalid, format!("{path}: no cell '{id}'"))
-        }
+        notebook::NotebookError::NoSuchCell(id) => ToolResult::err_code(
+            ErrorCode::NotebookInvalid,
+            format!("{path}: no cell '{id}'"),
+        ),
     }
 }
 
@@ -6328,7 +6317,9 @@ fn run_lsp_diagnostics(
     diagnostics.sort_by(|a, b| {
         severity_rank(&a.severity)
             .cmp(&severity_rank(&b.severity))
-            .then_with(|| (a.path.as_str(), a.line, a.character).cmp(&(b.path.as_str(), b.line, b.character)))
+            .then_with(|| {
+                (a.path.as_str(), a.line, a.character).cmp(&(b.path.as_str(), b.line, b.character))
+            })
     });
     // Dedupe: servers happily report the same diagnostic from two passes.
     diagnostics.dedup_by(|a, b| {
@@ -6467,11 +6458,7 @@ fn run_lsp_references(
     )
 }
 
-fn run_lsp_symbols(
-    ctx: &ToolCtx<'_>,
-    path: Option<&str>,
-    query: Option<&str>,
-) -> ToolResult {
+fn run_lsp_symbols(ctx: &ToolCtx<'_>, path: Option<&str>, query: Option<&str>) -> ToolResult {
     let root = match phase_root(ctx) {
         Ok(r) => r,
         Err(e) => return e,
@@ -6509,12 +6496,7 @@ fn run_lsp_symbols(
     } else {
         symbols
             .iter()
-            .map(|s| {
-                format!(
-                    "{} {}  {}:{}",
-                    s.kind, s.name, s.path, s.line
-                )
-            })
+            .map(|s| format!("{} {}  {}:{}", s.kind, s.name, s.path, s.line))
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -6643,7 +6625,13 @@ fn run_propose_plan(ctx: &ToolCtx<'_>, plan: &str, steps: &[String]) -> ToolResu
                 if approved {
                     "plan approved".to_string()
                 } else {
-                    format!("plan denied{}", comment.as_deref().map(|c| format!(": {c}")).unwrap_or_default())
+                    format!(
+                        "plan denied{}",
+                        comment
+                            .as_deref()
+                            .map(|c| format!(": {c}"))
+                            .unwrap_or_default()
+                    )
                 },
                 serde_json::json!({
                     "approved": approved,
@@ -6693,9 +6681,8 @@ fn run_monitor(
     pattern: Option<&str>,
     timeout_ms: Option<u32>,
 ) -> ToolResult {
-    let timeout = Duration::from_millis(
-        timeout_ms.unwrap_or(60_000).clamp(1_000, MONITOR_CAP_MS) as u64,
-    );
+    let timeout =
+        Duration::from_millis(timeout_ms.unwrap_or(60_000).clamp(1_000, MONITOR_CAP_MS) as u64);
     let re = match pattern {
         Some(p) => match regex::Regex::new(p) {
             Ok(re) => Some(re),
@@ -6741,9 +6728,7 @@ fn monitor_path(
             let detail = match re {
                 None => Some(format!("{path} changed")),
                 Some(re) => match std::fs::read_to_string(&p) {
-                    Ok(text) => re.find(&text).map(|m| {
-                        format!("matched {:?}", m.as_str())
-                    }),
+                    Ok(text) => re.find(&text).map(|m| format!("matched {:?}", m.as_str())),
                     Err(_) => None,
                 },
             };
@@ -6909,13 +6894,13 @@ fn run_exit_worktree(ctx: &ToolCtx<'_>, action: Option<&str>) -> ToolResult {
     };
     let active = state.active_worktree.lock().unwrap().clone();
     let Some(wt_path) = active else {
-        return ToolResult::err_code(
-            ErrorCode::InvalidArguments,
-            "not inside a worktree",
-        );
+        return ToolResult::err_code(ErrorCode::InvalidArguments, "not inside a worktree");
     };
     let discard = action.map(|a| a.eq_ignore_ascii_case("discard")) == Some(true);
-    let project_root = ctx.root.map(Path::to_path_buf).unwrap_or_else(|| wt_path.clone());
+    let project_root = ctx
+        .root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| wt_path.clone());
     let repo = match git::open_repo(&project_root) {
         Ok(r) => r,
         Err(e) => return ToolResult::err_code(ErrorCode::NotAGitRepo, e.to_string()),
@@ -9109,6 +9094,88 @@ mod tests {
                 next_step: None,
             },
             Tool::GetHandoff,
+            // Phase 7–10. These were added to the enum without being added
+            // here, which left this test module uncompilable — the match below
+            // is exhaustive on purpose, so a missing variant is a build error
+            // rather than a quietly shrinking fixture.
+            Tool::WebFetch {
+                url: "https://example.invalid".into(),
+                max_bytes: None,
+            },
+            Tool::WebSearch {
+                query: "lexsus".into(),
+                max_results: None,
+            },
+            Tool::NotebookRead {
+                path: "n.ipynb".into(),
+            },
+            Tool::NotebookEdit {
+                path: "n.ipynb".into(),
+                cell_id: "cell-1".into(),
+                new_source: "print(1)".into(),
+                cell_type: None,
+            },
+            Tool::DelegateTask {
+                task: "summarise the module".into(),
+                context: None,
+            },
+            Tool::LspDiagnostics {
+                path: None,
+                severity: None,
+            },
+            Tool::LspDefinition {
+                path: "src/lib.rs".into(),
+                line: 1,
+                character: 1,
+            },
+            Tool::LspReferences {
+                path: "src/lib.rs".into(),
+                line: 1,
+                character: 1,
+                include_declaration: None,
+            },
+            Tool::LspSymbols {
+                path: None,
+                query: None,
+            },
+            Tool::AskUser {
+                question: "which crate?".into(),
+                options: vec![],
+            },
+            Tool::ProposePlan {
+                plan: "do the thing".into(),
+                steps: vec![],
+            },
+            Tool::Monitor {
+                path: None,
+                command_id: None,
+                pattern: None,
+                timeout_ms: None,
+            },
+            Tool::Notify {
+                title: "done".into(),
+                body: "the build finished".into(),
+                level: None,
+            },
+            Tool::EnterWorktree { name: None },
+            Tool::ExitWorktree { action: None },
+            Tool::ReadMedia {
+                path: "shot.png".into(),
+            },
+            Tool::PublishArtifact {
+                path: "report.md".into(),
+                title: None,
+            },
+            Tool::ReportFindings {
+                findings: vec![Finding {
+                    path: "src/lib.rs".into(),
+                    line: 1,
+                    severity: "warning".into(),
+                    claim: "the claim".into(),
+                    evidence: None,
+                }],
+                summary: None,
+            },
             Tool::DescribeTool {
                 name: "read_file".into(),
             },
@@ -9155,6 +9222,24 @@ mod tests {
                 | Tool::ListSessions { .. }
                 | Tool::RequestHandoff { .. }
                 | Tool::GetHandoff
+                | Tool::WebFetch { .. }
+                | Tool::WebSearch { .. }
+                | Tool::NotebookRead { .. }
+                | Tool::NotebookEdit { .. }
+                | Tool::DelegateTask { .. }
+                | Tool::LspDiagnostics { .. }
+                | Tool::LspDefinition { .. }
+                | Tool::LspReferences { .. }
+                | Tool::LspSymbols { .. }
+                | Tool::AskUser { .. }
+                | Tool::ProposePlan { .. }
+                | Tool::Monitor { .. }
+                | Tool::Notify { .. }
+                | Tool::EnterWorktree { .. }
+                | Tool::ExitWorktree { .. }
+                | Tool::ReadMedia { .. }
+                | Tool::PublishArtifact { .. }
+                | Tool::ReportFindings { .. }
                 | Tool::DescribeTool { .. }
                 | Tool::ListTools => {}
             }

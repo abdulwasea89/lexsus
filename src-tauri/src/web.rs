@@ -175,17 +175,17 @@ impl Refusal {
     pub fn message(&self) -> String {
         match self {
             Refusal::InvalidUrl(u) => format!("'{u}' is not a URL this tool can fetch"),
-            Refusal::UnsupportedScheme(s) => format!(
-                "scheme '{s}' is not fetchable — only http and https leave the machine"
-            ),
+            Refusal::UnsupportedScheme(s) => {
+                format!("scheme '{s}' is not fetchable — only http and https leave the machine")
+            }
             Refusal::MissingHost => "the URL has no host to fetch from".to_string(),
             Refusal::Credentials => {
                 "the URL carries credentials; fetch it without them and authenticate another way"
                     .to_string()
             }
-            Refusal::BlockedAddress { host, addr, range } => format!(
-                "'{host}' resolves to {addr}, which is {range} — refused before connecting"
-            ),
+            Refusal::BlockedAddress { host, addr, range } => {
+                format!("'{host}' resolves to {addr}, which is {range} — refused before connecting")
+            }
             Refusal::Unresolvable { host, error } => {
                 format!("could not resolve '{host}': {error}")
             }
@@ -516,9 +516,8 @@ fn parse_search(html: &str, want: usize) -> Vec<SearchResult> {
     let Ok(anchor) = Regex::new(r#"(?is)<a[^>]*class="[^"]*result__a[^"]*"[^>]*>.*?</a>"#) else {
         return Vec::new();
     };
-    let Ok(snippet) = Regex::new(
-        r#"(?is)<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>"#,
-    ) else {
+    let Ok(snippet) = Regex::new(r#"(?is)<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>"#)
+    else {
         return Vec::new();
     };
     let Ok(href) = Regex::new(r#"(?is)href="([^"]+)""#) else {
@@ -561,7 +560,10 @@ fn decode_result_url(href: &str) -> String {
     let Ok(url) = Url::parse(&absolute) else {
         return href.to_string();
     };
-    if !url.host_str().is_some_and(|h| h.ends_with("duckduckgo.com")) {
+    if !url
+        .host_str()
+        .is_some_and(|h| h.ends_with("duckduckgo.com"))
+    {
         return absolute;
     }
     match url.query_pairs().find(|(k, _)| k == "uddg") {
@@ -580,9 +582,35 @@ const DROPPED_ELEMENTS: &[&str] = &["script", "style", "noscript", "svg", "templ
 /// engine, so without this a whole page arrives as one line — which is not
 /// wrong, but is unreadable.
 const BLOCK_ELEMENTS: &[&str] = &[
-    "p", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "section", "article", "header",
-    "footer", "table", "ul", "ol", "pre", "blockquote", "br", "hr", "form", "nav", "aside", "main",
-    "dt", "dd", "figcaption", "figure",
+    "p",
+    "div",
+    "li",
+    "tr",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "section",
+    "article",
+    "header",
+    "footer",
+    "table",
+    "ul",
+    "ol",
+    "pre",
+    "blockquote",
+    "br",
+    "hr",
+    "form",
+    "nav",
+    "aside",
+    "main",
+    "dt",
+    "dd",
+    "figcaption",
+    "figure",
 ];
 
 /// Reduce HTML to readable text: drop the non-text subtrees, drop the tags,
@@ -903,8 +931,14 @@ mod tests {
 
     #[test]
     fn the_cap_is_a_ceiling_and_an_absent_one_is_a_default() {
-        assert_eq!(plan("https://a.test/", None).unwrap().max_bytes, DEFAULT_BYTES);
-        assert_eq!(plan("https://a.test/", Some(0)).unwrap().max_bytes, DEFAULT_BYTES);
+        assert_eq!(
+            plan("https://a.test/", None).unwrap().max_bytes,
+            DEFAULT_BYTES
+        );
+        assert_eq!(
+            plan("https://a.test/", Some(0)).unwrap().max_bytes,
+            DEFAULT_BYTES
+        );
         assert_eq!(plan("https://a.test/", Some(10)).unwrap().max_bytes, 10);
         assert_eq!(
             plan("https://a.test/", Some(u64::MAX)).unwrap().max_bytes,

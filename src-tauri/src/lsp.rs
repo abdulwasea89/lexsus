@@ -268,7 +268,10 @@ impl Client {
                         if let Some(err) = msg.get("error") {
                             return Err(LspError::Protocol(err.to_string()));
                         }
-                        return Ok(msg.get("result").cloned().unwrap_or(serde_json::Value::Null));
+                        return Ok(msg
+                            .get("result")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null));
                     }
                     self.absorb(&msg);
                 }
@@ -298,7 +301,10 @@ impl Client {
             .get("diagnostics")
             .and_then(|d| d.as_array())
             .map(|items| {
-                items.iter().filter_map(|d| diagnostic_from(d, &path)).collect()
+                items
+                    .iter()
+                    .filter_map(|d| diagnostic_from(d, &path))
+                    .collect()
             })
             .unwrap_or_default();
         self.diagnostics.insert(uri.to_string(), items);
@@ -401,10 +407,14 @@ impl Client {
                         Err(_) => break,
                     }
                 }
-                let mut all: Vec<Diagnostic> = self.diagnostics.values().flatten().cloned().collect();
+                let mut all: Vec<Diagnostic> =
+                    self.diagnostics.values().flatten().cloned().collect();
                 all.sort_by(|a, b| {
-                    (a.path.as_str(), a.line, a.character)
-                        .cmp(&(b.path.as_str(), b.line, b.character))
+                    (a.path.as_str(), a.line, a.character).cmp(&(
+                        b.path.as_str(),
+                        b.line,
+                        b.character,
+                    ))
                 });
                 Ok(all)
             }
@@ -506,7 +516,15 @@ fn path_to_uri(path: &Path) -> String {
     let mut encoded = String::new();
     for &b in path.to_string_lossy().as_bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':'
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b'/'
+            | b':'
             | b'\\' => encoded.push(b as char),
             other => encoded.push_str(&format!("%{other:02X}")),
         }
@@ -554,9 +572,10 @@ fn location_from(v: &serde_json::Value, root: &Path) -> Option<Location> {
 
 fn locations_from(result: &serde_json::Value, root: &Path) -> Vec<Location> {
     match result {
-        serde_json::Value::Array(items) => {
-            items.iter().filter_map(|v| location_from(v, root)).collect()
-        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|v| location_from(v, root))
+            .collect(),
         serde_json::Value::Object(_) => location_from(result, root).into_iter().collect(),
         _ => Vec::new(),
     }
@@ -646,7 +665,11 @@ fn symbols_from_document(result: &serde_json::Value, path: &Path, root: &Path) -
                 })
                 .unwrap_or_else(|| shown.clone());
             out.push(Symbol {
-                name: item.get("name").and_then(|n| n.as_str()).unwrap_or("").into(),
+                name: item
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .into(),
                 kind: symbol_kind(item.get("kind").and_then(|k| k.as_u64())).into(),
                 path,
                 line,
@@ -716,7 +739,11 @@ fn symbols_from_workspace(result: &serde_json::Value, root: &Path) -> Vec<Symbol
             .unwrap_or(0) as u32
             + 1;
         out.push(Symbol {
-            name: item.get("name").and_then(|n| n.as_str()).unwrap_or("").into(),
+            name: item
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .into(),
             kind: symbol_kind(item.get("kind").and_then(|k| k.as_u64())).into(),
             path,
             line,

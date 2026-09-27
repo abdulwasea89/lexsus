@@ -64,8 +64,7 @@ pub fn kind_for(mime: &str) -> MediaKind {
 
 /// The standard base64 alphabet with `=` padding, RFC 4648 §4.
 pub fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -141,7 +140,10 @@ mod tests {
     #[test]
     fn media_extensions_map_and_others_do_not() {
         assert_eq!(mime_for(&PathBuf::from("a/b/shot.PNG")), Some("image/png"));
-        assert_eq!(mime_for(PathBuf::from("doc.pdf").as_path()), Some("application/pdf"));
+        assert_eq!(
+            mime_for(PathBuf::from("doc.pdf").as_path()),
+            Some("application/pdf")
+        );
         assert_eq!(mime_for(PathBuf::from("x.rs").as_path()), None);
         assert_eq!(mime_for(PathBuf::from("noext").as_path()), None);
     }

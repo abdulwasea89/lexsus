@@ -57,6 +57,7 @@ The connector is deliberately thin. Everything that makes Lexsus safe — approv
    ┌────────────────────────────────────────────┐
    │ mcp.rs — rmcp Streamable HTTP              │
    │ 127.0.0.1:45147/mcp · loopback only        │
+   │ bearer auth + response signing (auth.rs)   │
    │ tools/list gated by the write flag         │
    │ tools/call → parse → tool_call("mcp")      │
    └────────────────────────────────────────────┘
@@ -72,11 +73,13 @@ The connector is deliberately thin. Everything that makes Lexsus safe — approv
             user-approved local workspace
 ```
 
-**Read-only first.** `mcp_allow_write` is an in-memory flag, default off. While it is off, `tools/list` simply does not advertise the write and command tools; flipping it hides or re-exposes them at runtime with no rebuild and no reconnect. It is seeded from `LEXSUS_MCP_ALLOW_WRITE` and toggled live from the Web-AI connector view (`mcp_set_allow_write`). The `mcp_status` command reports `{listening, endpoint, allow_write, workspace}` to the UI.
+**Read-only first.** `mcp_allow_write` is an in-memory flag, default off. While it is off, `tools/list` simply does not advertise the write and command tools; flipping it hides or re-exposes them at runtime with no rebuild and no reconnect. It is seeded from `LEXSUS_MCP_ALLOW_WRITE` and toggled live from the Web-AI connector view (`mcp_set_allow_write`). The `mcp_status` command reports `{listening, endpoint, allow_write, workspace, allowed_hosts, auth_backend, token_fingerprint, signature_ttl_secs, signature_required}` to the UI.
 
 **Loopback, and only loopback, by default.** rmcp's DNS-rebinding guard rejects requests whose `Host` it doesn't recognise, and Lexsus accepts loopback hosts out of the box. Because a cloud-hosted provider connects from *its* infrastructure rather than your machine, reaching it requires an explicit HTTPS tunnel — and that tunnel's host must be opted in via `LEXSUS_MCP_ALLOWED_HOSTS` (comma-separated). Nothing beyond loopback is ever hardcoded.
 
-A free byproduct of binding to loopback: any local MCP host — Claude Code, Claude Desktop, the MCP Inspector — can point at the same endpoint with no tunnel at all.
+**Authenticated, loopback included.** The `Host` guard only holds while the endpoint really is loopback; the moment a tunnel host is allow-listed, the URL is the only thing between a stranger and the read surface. So every request must carry `Authorization: Bearer <token>`, with no bypass for loopback, and every response is signed. One axum middleware over the whole router (`auth.rs`, applied in `mcp.rs`) covers both paths and therefore all 58 tools by construction — `READ_ONLY` and `WRITE` partition `SPECS`, and both pass through it. The token is generated from the OS CSPRNG and kept in the OS keyring, falling back to a `0600` file where no keyring exists (headless Linux); the UI shows which store is live, reveals the token on request, and rotates it without a restart. Request *signatures* are verified strictly when present but never required, because no MCP client can produce one.
+
+A free byproduct of binding to loopback: any local MCP host — Claude Code, Claude Desktop, the MCP Inspector — can point at the same endpoint with no tunnel at all, passing the token as a header.
 
 **The desktop is the only approval authority.** No provider exposes an approval primitive we can rely on, so gated calls block inside `tools/call` while the desktop banner decides, for at most 120 s — comfortably under provider connector timeouts. Results are capped at 140,000 characters so a connector result can't blow up a chat's context.
 
