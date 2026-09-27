@@ -205,7 +205,9 @@ fn init_database(state: State<'_, AppState>, db_path: String) -> Result<Vec<Stri
 /// Set the project folder this app monitors (persisted).
 #[tauri::command]
 fn set_project_root(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    let p = std::path::PathBuf::from(path);
+    // Trim stray whitespace/newlines a picker or paste may have included;
+    // `is_dir` follows symlinks, so a symlinked folder still counts.
+    let p = std::path::PathBuf::from(path.trim());
     if !p.is_dir() {
         return Err(format!("not a directory: {}", p.display()));
     }

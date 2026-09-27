@@ -45,6 +45,11 @@ function saveRecent(path: string) {
   localStorage.setItem(RECENTS_KEY, JSON.stringify(next));
 }
 
+function removeRecent(path: string) {
+  const next = loadRecents().filter((p) => p !== path);
+  localStorage.setItem(RECENTS_KEY, JSON.stringify(next));
+}
+
 /**
  * The whole app is the dashboard: connector lifecycle, public tunnel and
  * activity. Onboarding and the first-run project picker are untouched.
@@ -130,11 +135,25 @@ export default function App() {
       setRecents(loadRecents());
     } catch (e) {
       if (token !== switchToken.current) return;
-      toast.add({
-        title: "Could not open project",
-        description: String(e),
-        type: "error",
-      });
+      const msg = String(e);
+      // The most common case: a recent folder was moved or deleted. Drop it
+      // from recents and say so plainly instead of a cryptic OS error.
+      if (msg.includes("not a directory") || msg.includes("No such file")) {
+        removeRecent(path);
+        setRecents(loadRecents());
+        setRootInput("");
+        toast.add({
+          title: "Folder not found",
+          description: `${path} is not a folder anymore — pick another project.`,
+          type: "error",
+        });
+      } else {
+        toast.add({
+          title: "Could not open project",
+          description: msg,
+          type: "error",
+        });
+      }
     }
   }
 
