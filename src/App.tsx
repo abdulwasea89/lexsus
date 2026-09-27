@@ -12,47 +12,21 @@ import type { McpStatus, TunnelStatus } from "./lib/types";
 import ApprovalBanner from "./components/ApprovalBanner";
 import ErrorBoundary from "./components/ErrorBoundary";
 import GrantsBar from "./components/GrantsBar";
-import BridgeView from "./views/BridgeView";
 import DashboardView from "./views/DashboardView";
 import FailoverBanner from "./components/FailoverBanner";
-import GitView from "./views/GitView";
-import HandoffView from "./views/HandoffView";
-import MemoryView from "./views/MemoryView";
 import ProjectDialog from "./components/ProjectDialog";
 import Onboarding from "./components/Onboarding";
 import QuestionBanner from "./components/QuestionBanner";
-import TraceView from "./views/TraceView";
 import Statusbar from "./components/Statusbar";
-import TerminalPane from "./components/TerminalPane";
 import Titlebar from "./components/Titlebar";
-import WorkbenchRail, { type View } from "./components/WorkbenchRail";
 import { isOnboarded } from "./lib/onboarding";
 import { useApprovals } from "./hooks/useApprovals";
 import { useFailover } from "./hooks/useFailover";
 import { useQuestions } from "./hooks/useQuestions";
 import { useTauriEvent } from "./hooks/useTauriEvent";
 import { Alert, AlertDescription, AlertTitle } from "./components/ui/alert";
-import GettingStarted from "./components/GettingStarted";
 
 const RECENTS_KEY = "lexsus.recentProjects";
-const VIEW_KEY = "lexsus.view";
-const VIEWS: View[] = [
-  "dashboard",
-  "trace",
-  "git",
-  "handoff",
-  "memory",
-  "bridge",
-];
-
-const VIEW_LABELS: Record<View, string> = {
-  dashboard: "Dashboard",
-  trace: "Live activity trace",
-  git: "Git",
-  handoff: "Handoff",
-  memory: "Project memory",
-  bridge: "Web-AI connector",
-};
 
 function loadRecents(): string[] {
   try {
@@ -72,15 +46,9 @@ function saveRecent(path: string) {
   localStorage.setItem(RECENTS_KEY, JSON.stringify(next));
 }
 
-function loadView(): View {
-  const v = localStorage.getItem(VIEW_KEY) as View | null;
-  return v && VIEWS.includes(v) ? v : "dashboard";
-}
-
 /**
- * Workbench shell: icon rail (views + project/connector), a persistent
- * terminal on the left, the active view on the right, global approval
- * and failover banners on top, and a statusbar heartbeat below.
+ * The whole app is the dashboard: connector lifecycle, public tunnel and
+ * activity. Onboarding and the first-run project picker are untouched.
  */
 export default function App() {
   const [projectRoot, setRootInput] = useState("");
@@ -89,7 +57,6 @@ export default function App() {
   const [mcp, setMcp] = useState<McpStatus | null>(null);
   const [tunnel, setTunnel] = useState<TunnelStatus | null>(null);
   const [recents, setRecents] = useState<string[]>([]);
-  const [view, setView] = useState<View>(loadView);
   const [projectOpen, setProjectOpen] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(() => !isOnboarded());
   const { approvals, grantState, decide } = useApprovals();
@@ -97,10 +64,6 @@ export default function App() {
   const { status, localEvent, webEvent, dismiss } = useFailover();
   // Guards project switches: a slow switch must not clobber a newer one.
   const switchToken = useRef(0);
-
-  useEffect(() => {
-    localStorage.setItem(VIEW_KEY, view);
-  }, [view]);
 
   useEffect(() => {
     setRecents(loadRecents());
@@ -148,8 +111,7 @@ export default function App() {
     })();
   }, []);
 
-  // Keep the rail/statusbar in step with lifecycle changes made anywhere (the
-  // dashboard, the bridge view, a tunnel discovering its URL).
+  // Keep the statusbar in step with lifecycle changes made in the dashboard.
   useTauriEvent<McpStatus>("mcp://status", (payload) => setMcp(payload));
   useTauriEvent<null>("tunnel://update", () => {
     void tunnelStatus().then(setTunnel).catch(() => null);
@@ -204,16 +166,7 @@ export default function App() {
     <div className="flex h-screen w-full flex-col overflow-hidden bg-background text-foreground">
       <Titlebar />
 
-      <div className="flex min-h-0 flex-1 overflow-hidden">
-        <WorkbenchRail
-          view={view}
-          onViewChange={setView}
-          connector={mcp}
-          tunnel={tunnel}
-          onOpenProject={() => setProjectOpen(true)}
-        />
-
-        <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+      <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <ApprovalBanner approvals={approvals} onDecide={decide} />
         <QuestionBanner questions={questions} onAnswer={answer} />
         <GrantsBar grantState={grantState} />
@@ -239,37 +192,13 @@ export default function App() {
             <span className="animate-pulse">restoring session…</span>
           </div>
         ) : (
-          <div className="flex min-h-0 flex-1 flex-col gap-3 p-3 lg:flex-row">
-            <div className="flex h-[50vh] min-h-0 shrink-0 flex-col lg:h-auto lg:w-[55%] lg:shrink anim-fade-up">
-              {projectRoot ? (
-                <TerminalPane />
-              ) : (
-                <GettingStarted onOpenProject={() => setProjectOpen(true)} />
-              )}
+          <ErrorBoundary label="Dashboard">
+            <div className="flex min-h-0 flex-1 flex-col p-3">
+              <div className="min-h-0 flex-1">
+                <DashboardView />
+              </div>
             </div>
-
-            <div className="flex min-h-0 flex-1 flex-col">
-              {/* The trace stays mounted while you're on another tab, so its
-                  event stream and history survive — and no steps are dropped
-                  in the meantime. */}
-              <ErrorBoundary label={VIEW_LABELS.trace}>
-                <div className={view === "trace" ? "h-full" : "hidden"}>
-                  <TraceView />
-                </div>
-              </ErrorBoundary>
-              {view !== "trace" && (
-                <ErrorBoundary key={view} label={VIEW_LABELS[view]}>
-                  <div className="h-full anim-fade-up">
-                    {view === "dashboard" && <DashboardView />}
-                    {view === "git" && <GitView />}
-                    {view === "handoff" && <HandoffView />}
-                    {view === "memory" && <MemoryView />}
-                    {view === "bridge" && <BridgeView />}
-                  </div>
-                </ErrorBoundary>
-              )}
-            </div>
-          </div>
+          </ErrorBoundary>
         )}
 
         <Statusbar
@@ -291,7 +220,6 @@ export default function App() {
       />
 
       {showOnboarding && <Onboarding onDone={finishOnboarding} />}
-      </div>
     </div>
   );
 }
