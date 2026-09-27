@@ -23,6 +23,7 @@ import {
   activityToolSurface,
   activityToolUsage,
   activityTrace,
+  bridgeAudit,
   mcpRestart,
   mcpSetAllowWrite,
   mcpSetAllowedHosts,
@@ -37,6 +38,7 @@ import {
 } from "../lib/bridge";
 import type {
   ActivityStats,
+  AuditEntry,
   CommandRun,
   FileTouch,
   McpStatus,
@@ -177,6 +179,7 @@ export default function DashboardView() {
   const [files, setFiles] = useState<FileTouch[]>([]);
   const [commands, setCommands] = useState<CommandRun[]>([]);
   const [recent, setRecent] = useState<TraceRow[]>([]);
+  const [audit, setAudit] = useState<AuditEntry[]>([]);
 
   const [portInput, setPortInput] = useState("");
   const [hostsInput, setHostsInput] = useState("");
@@ -190,12 +193,13 @@ export default function DashboardView() {
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const refreshActivity = useCallback(async () => {
-    const [s, tu, f, c, r, t] = await Promise.all([
+    const [s, tu, f, c, r, au, t] = await Promise.all([
       activityStats().catch(() => null),
       activityToolUsage(20).catch(() => []),
       activityFiles(50).catch(() => []),
       activityCommands(50).catch(() => []),
       activityTrace(200).catch(() => []),
+      bridgeAudit(50).catch(() => []),
       tunnelStatus().catch(() => null),
     ]);
     setStats(s);
@@ -203,6 +207,7 @@ export default function DashboardView() {
     setFiles(f);
     setCommands(c);
     setRecent(r);
+    setAudit(au);
     if (t) setTunnel(t);
   }, []);
 
@@ -411,6 +416,10 @@ export default function DashboardView() {
   ) || 1;
   const maxApproval = (surface?.approvals ?? []).reduce(
     (n, a) => Math.max(n, a.count),
+    0,
+  ) || 1;
+  const maxKind = (stats?.by_kind ?? []).reduce(
+    (n, k) => Math.max(n, k.count),
     0,
   ) || 1;
   const readOnlyPct = surface
@@ -871,6 +880,40 @@ export default function DashboardView() {
           </div>
         </Section>
 
+        {/* Activity by kind */}
+        <Section
+          title="Activity by kind"
+          description="What the agent has been doing, grouped by trace kind"
+          badge={
+            <Badge variant="outline" className="font-mono text-[10px]">
+              {stats?.total ?? 0}
+            </Badge>
+          }
+        >
+          {(stats?.by_kind ?? []).length === 0 ? (
+            <EmptyHint
+              icon={ActivityIcon}
+              title="No activity yet"
+              desc="Reads, edits, commands and errors will break down here."
+            />
+          ) : (
+            <div className="flex flex-col gap-2">
+              {(stats?.by_kind ?? []).map((k) => (
+                <div key={k.kind} className="flex flex-col gap-0.5">
+                  <Progress value={Math.round((k.count / maxKind) * 100)}>
+                    <ProgressLabel className="text-xs capitalize">
+                      {k.kind}
+                    </ProgressLabel>
+                    <span className="ml-auto text-xs text-muted-foreground tabular-nums">
+                      {k.count}
+                    </span>
+                  </Progress>
+                </div>
+              ))}
+            </div>
+          )}
+        </Section>
+
         {/* Files + commands */}
         <div className="grid gap-3 xl:grid-cols-2">
           <Section
@@ -991,6 +1034,83 @@ export default function DashboardView() {
               )}
           </Section>
         </div>
+
+        {/* Audit trail */}
+        <Section
+          title="Audit trail"
+          description="Approvals and denials, newest first"
+          badge={
+            <Badge variant="outline" className="font-mono text-[10px]">
+              {audit.length}
+            </Badge>
+          }
+        >
+          {audit.length === 0 ? (
+            <EmptyHint
+              icon={ShieldAlertIcon}
+              title="No decisions yet"
+              desc="Approved and denied tool calls appear here."
+            />
+          ) : (
+            <ScrollArea className="h-56 min-h-0">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Time</TableHead>
+                    <TableHead>Agent</TableHead>
+                    <TableHead>Tool</TableHead>
+                    <TableHead>Decision</TableHead>
+                    <TableHead className="text-right">Outcome</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {audit.slice(0, 100).map((a, i) => (
+                    <TableRow key={`${a.ts}-${i}`}>
+                      <TableCell className="font-mono text-xs text-muted-foreground">
+                        {fmtTs(a.ts)}
+                      </TableCell>
+                      <TableCell>
+                        <Badge variant="outline" className="font-mono text-[10px]">
+                          {a.agent}
+                        </Badge>
+                      </TableCell>
+                      <TableCell className="max-w-0 font-mono text-xs">
+                        <span className="block truncate" title={a.tool}>
+                          {a.tool}
+                        </span>
+                      </TableCell>
+                      <TableCell>
+                        <span
+                          className={cn(
+                            "inline-flex items-center gap-1 text-xs",
+                            a.allowed ? "text-success" : "text-danger",
+                          )}
+                        >
+                          {a.allowed ? (
+                            <CheckIcon className="size-3" />
+                          ) : (
+                            <XIcon className="size-3" />
+                          )}
+                          {a.allowed ? `allowed (${a.approved_by})` : "denied"}
+                        </span>
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <span
+                          className={cn(
+                            "text-xs",
+                            a.ok ? "text-success" : "text-danger",
+                          )}
+                        >
+                          {a.ok ? "ok" : "failed"}
+                        </span>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </ScrollArea>
+          )}
+        </Section>
 
         {/* Recent activity */}
         <Card>
