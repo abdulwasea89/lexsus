@@ -52,7 +52,7 @@ keyring = "3"
 # through the same bridge policy engine — approvals, sensitive paths,
 # source-scoped grants, kill switch, audit — as the desktop sandbox.
 rmcp = { version = "3.2", features = ["transport-streamable-http-server"] }
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync"] }
 tokio-util = "0.7"
 regex = "1.13.1"

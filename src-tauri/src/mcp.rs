@@ -16,6 +16,7 @@
 
 use crate::auth::{self, Auth, AuthError};
 use crate::bridge;
+use crate::oauth;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, GetPromptRequestParams,
     GetPromptResponse, GetPromptResult, ListPromptsResult, ListToolsResult, PaginatedRequestParams,
@@ -32,7 +33,7 @@ use tauri::{AppHandle, Manager, Runtime};
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
 
@@ -551,7 +552,11 @@ const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// picking a path. It covers every tool in `SPECS` by construction rather than
 /// by enumeration: `READ_ONLY` and `WRITE` partition `SPECS`, and both go
 /// through here.
-async fn require_auth(State(auth): State<Arc<Auth>>, request: Request, next: Next) -> Response {
+async fn require_auth(
+    State((auth, oauth)): State<(Arc<Auth>, Arc<oauth::OAuthServer>)>,
+    request: Request,
+    next: Next,
+) -> Response {
     let (parts, body) = request.into_parts();
 
     // The body is buffered because a signature covers it and the handler needs
@@ -568,14 +573,22 @@ async fn require_auth(State(auth): State<Arc<Auth>>, request: Request, next: Nex
         }
     };
 
-    if let Err(error) = auth.verify(&parts.headers, &body) {
-        // The specific reason is always logged. It goes to the caller only once
-        // their bearer token has already checked out — at that point they are
-        // entitled to know why their signature failed, and a caller who has not
-        // gets nothing to probe with.
-        let authenticated = !matches!(error, AuthError::MissingCredentials | AuthError::BadToken);
-        eprintln!("[mcp] rejected: {} ({})", error.code(), error.message());
-        return unauthorized(&error, authenticated);
+    // OAuth-issued access tokens are accepted alongside the static bearer.
+    let oauth_ok = bearer_token(&parts.headers)
+        .map(|t| oauth.check_access_token(&t))
+        .unwrap_or(false);
+
+    if !oauth_ok {
+        if let Err(error) = auth.verify(&parts.headers, &body) {
+            // The specific reason is always logged. It goes to the caller only once
+            // their bearer token has already checked out — at that point they are
+            // entitled to know why their signature failed, and a caller who has not
+            // gets nothing to probe with.
+            let authenticated =
+                !matches!(error, AuthError::MissingCredentials | AuthError::BadToken);
+            eprintln!("[mcp] rejected: {} ({})", error.code(), error.message());
+            return unauthorized(&error, authenticated, &parts.headers);
+        }
     }
 
     let method = parts.method.clone();
@@ -586,8 +599,31 @@ async fn require_auth(State(auth): State<Arc<Auth>>, request: Request, next: Nex
 /// Attach the secure layer to whatever router serves the endpoint. Named so
 /// the tests drive the same wrapping the server does, rather than a paraphrase
 /// of it.
-fn with_auth(router: axum::Router, auth: Arc<Auth>) -> axum::Router {
-    router.layer(axum::middleware::from_fn_with_state(auth, require_auth))
+fn with_auth(
+    router: axum::Router,
+    auth: Arc<Auth>,
+    oauth: Arc<oauth::OAuthServer>,
+) -> axum::Router {
+    router.layer(axum::middleware::from_fn_with_state(
+        (auth, oauth),
+        require_auth,
+    ))
+}
+
+/// Extract the bearer token from an `Authorization` header, without requiring
+/// the rest of [`Auth::verify`].
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, rest) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = rest.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
 }
 
 /// Sign the response body, so a caller that checks can tell it was not altered
@@ -679,11 +715,10 @@ fn is_signable(response: &Response, method: &Method) -> bool {
 
 /// A `401` for a refused request.
 ///
-/// `WWW-Authenticate` names the scheme but deliberately does **not** point at
-/// `resource_metadata`, preserving the existing decision that `/.well-known/*`
-/// 404s: a hosted connector reads that as "no auth advertised" instead of
-/// launching an OAuth flow this endpoint cannot complete.
-fn unauthorized(error: &AuthError, authenticated: bool) -> Response {
+/// `WWW-Authenticate` points at both the authorization-server metadata and the
+/// protected-resource metadata, which is what a hosted connector needs to
+/// launch its OAuth flow.
+fn unauthorized(error: &AuthError, authenticated: bool, headers: &HeaderMap) -> Response {
     let payload = if authenticated {
         serde_json::json!({
             "error": "unauthorized",
@@ -697,10 +732,15 @@ fn unauthorized(error: &AuthError, authenticated: bool) -> Response {
         })
     };
     let mut response = plain(StatusCode::UNAUTHORIZED, payload.to_string());
-    response.headers_mut().insert(
-        header::WWW_AUTHENTICATE,
-        HeaderValue::from_static("Bearer realm=\"lexsus\""),
+    let base = oauth::base_url(headers);
+    let www = format!(
+        "Bearer resource_metadata=\"{base}/.well-known/oauth-protected-resource\", oauth_metadata=\"{base}/.well-known/oauth-authorization-server\""
     );
+    if let Ok(value) = HeaderValue::from_str(&www) {
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, value);
+    }
     response
 }
 
@@ -951,14 +991,17 @@ async fn serve<R: Runtime>(
     );
     // The canonical endpoint is `/mcp`, but some provider connectors (Claude.ai)
     // treat the bare origin as the resource URL and POST `initialize` to `/`.
-    // A 404 there is misread as an auth failure, so the same engine answers at
-    // both paths. `/.well-known/*` is left to 404 so OAuth discovery still
-    // reads as "no auth advertised".
-    let router = axum::Router::new()
+    // The OAuth discovery + authorize + token routes are public; `/mcp` and
+    // `/` sit behind the auth middleware (which now also accepts OAuth tokens).
+    let oauth = oauth::OAuthServer::new();
+    let oauth_router = oauth::router(oauth.clone());
+    let mcp_router = axum::Router::new()
         .nest_service(MCP_PATH, service.clone())
         .route("/", axum::routing::any_service(service));
+    let mcp_router = with_auth(mcp_router, auth.clone(), oauth);
+    let router = axum::Router::new().merge(oauth_router).merge(mcp_router);
     tokio::select! {
-        result = axum::serve(listener, with_auth(router, auth)) => {
+        result = axum::serve(listener, router) => {
             result.map_err(|e| std::io::Error::other(e.to_string()))?;
         }
         _ = shutdown => {
@@ -1664,7 +1707,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_without_a_token_is_refused() {
         let auth = Auth::for_tests();
-        let response = with_auth(echo_router(), auth)
+        let response = with_auth(echo_router(), auth, oauth::OAuthServer::new())
             .oneshot(post(SAMPLE))
             .await
             .unwrap();
@@ -1681,7 +1724,7 @@ mod tests {
         let auth = Auth::for_tests();
         let mut request = post(SAMPLE);
         bearer(&mut request, "not-the-token");
-        let response = with_auth(echo_router(), auth)
+        let response = with_auth(echo_router(), auth, oauth::OAuthServer::new())
             .oneshot(request)
             .await
             .unwrap();
@@ -1695,7 +1738,7 @@ mod tests {
         let auth = Auth::for_tests();
         let mut request = post(SAMPLE);
         bearer(&mut request, &auth.reveal());
-        let response = with_auth(echo_router(), auth)
+        let response = with_auth(echo_router(), auth, oauth::OAuthServer::new())
             .oneshot(request)
             .await
             .unwrap();
@@ -1717,7 +1760,7 @@ mod tests {
         let auth = Auth::for_tests();
         let mut request = post(SAMPLE);
         bearer(&mut request, &auth.reveal());
-        let response = with_auth(echo_router(), auth.clone())
+        let response = with_auth(echo_router(), auth.clone(), oauth::OAuthServer::new())
             .oneshot(request)
             .await
             .unwrap();
@@ -1779,7 +1822,7 @@ mod tests {
         request
             .headers_mut()
             .insert(auth::SIGNATURE_HEADER, HeaderValue::from_static("00"));
-        let response = with_auth(echo_router(), auth)
+        let response = with_auth(echo_router(), auth, oauth::OAuthServer::new())
             .oneshot(request)
             .await
             .unwrap();
@@ -1794,7 +1837,7 @@ mod tests {
     #[tokio::test]
     async fn a_signed_request_is_accepted_once() {
         let auth = Auth::for_tests();
-        let app = with_auth(echo_router(), auth.clone());
+        let app = with_auth(echo_router(), auth.clone(), oauth::OAuthServer::new());
         let (timestamp, nonce, signature) = auth.sign_request(SAMPLE.as_bytes()).unwrap();
 
         let build = || {
@@ -1834,7 +1877,7 @@ mod tests {
             .uri("/")
             .body(Body::from(SAMPLE.to_string()))
             .unwrap();
-        let response = with_auth(echo_router(), auth)
+        let response = with_auth(echo_router(), auth, oauth::OAuthServer::new())
             .oneshot(unauthenticated)
             .await
             .unwrap();
