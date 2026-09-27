@@ -8,6 +8,7 @@ import {
   CircleAlertIcon,
   CopyIcon,
   FileIcon,
+  FolderOpenIcon,
   GlobeIcon,
   Loader2Icon,
   RefreshCwIcon,
@@ -171,7 +172,11 @@ function EmptyHint({
 }
 
 /** The control surface: connector lifecycle, tunnel, tool surface, activity. */
-export default function DashboardView() {
+export default function DashboardView({
+  onOpenProject,
+}: {
+  onOpenProject: () => void;
+}) {
   const [mcp, setMcp] = useState<McpStatus | null>(null);
   const [tunnel, setTunnel] = useState<TunnelStatus | null>(null);
   const [detections, setDetections] = useState<TunnelDetection[]>([]);
@@ -670,8 +675,19 @@ export default function DashboardView() {
                     {mcp?.running ? fmtUptime(mcp.uptime_secs) : "—"}
                   </span>
                 </div>
-                <div className="flex min-w-0 flex-col gap-0.5 rounded-md border border-border/60 bg-background/60 px-3 py-2">
-                  <span className="text-[11px] text-muted-foreground">Workspace</span>
+                <div className="flex min-w-0 flex-col gap-1 rounded-md border border-border/60 bg-background/60 px-3 py-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] text-muted-foreground">Workspace</span>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={onOpenProject}
+                      title={mcp?.workspace ? "Change project folder" : "Select a project folder"}
+                    >
+                      <FolderOpenIcon className="size-3.5" />
+                      {mcp?.workspace ? "Change" : "Select"}
+                    </Button>
+                  </div>
                   <span
                     className="truncate font-mono text-xs"
                     title={mcp?.workspace ?? ""}
