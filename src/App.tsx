@@ -137,7 +137,7 @@ export default function App() {
       if (token !== switchToken.current) return;
       const msg = String(e);
       // A folder that no longer resolves: drop it from recents and say so.
-      if (msg.includes("does not exist") || msg.includes("is not a folder")) {
+      if (msg.includes("not a directory") || msg.includes("No such file")) {
         removeRecent(path);
         setRecents(loadRecents());
         setRootInput("");
@@ -163,9 +163,12 @@ export default function App() {
         multiple: false,
         title: "Select project folder",
       });
-      if (typeof selected === "string" && selected) {
-        setRootInput(selected);
-        await applyProject(selected);
+      // The plugin types this as `string | null`, but on some Linux portal
+      // setups it comes back as a single-element array. Accept either shape.
+      const path = Array.isArray(selected) ? selected[0] : selected;
+      if (typeof path === "string" && path) {
+        setRootInput(path);
+        await applyProject(path);
       }
     } catch (e) {
       toast.add({
