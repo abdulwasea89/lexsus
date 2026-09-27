@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   ActivityIcon,
   CheckIcon,
@@ -162,6 +162,9 @@ export default function DashboardView() {
     { provider: string; command?: string } | null
   >(null);
   const [busy, setBusy] = useState<string | null>(null);
+  // Debounce the live trace stream: a burst of tool steps is one refresh, not
+  // one IPC round-trip per event.
+  const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const refreshActivity = useCallback(async () => {
     const [s, tu, f, c, r, t] = await Promise.all([
@@ -208,12 +211,16 @@ export default function DashboardView() {
     void tunnelDetect().then(setDetections).catch(() => []);
   });
   useTauriEvent<TraceStep>("trace://step", () => {
-    void refreshActivity();
+    if (refreshTimer.current) clearTimeout(refreshTimer.current);
+    refreshTimer.current = setTimeout(() => void refreshActivity(), 250);
   });
 
   useEffect(() => {
     const id = setInterval(() => void refreshActivity(), 15_000);
-    return () => clearInterval(id);
+    return () => {
+      clearInterval(id);
+      if (refreshTimer.current) clearTimeout(refreshTimer.current);
+    };
   }, [refreshActivity]);
 
   function fail(title: string, e: unknown) {

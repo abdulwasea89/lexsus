@@ -282,49 +282,49 @@ body {
  * tokens and HeroUI's dark styles.
  */
 :root {
-  /* surfaces — off-white paper hierarchy */
-  --background: oklch(0.955 0.003 260);
-  --surface: oklch(0.965 0.002 260);
-  --surface-2: oklch(0.93 0.004 260);
+  /* surfaces — warm, near-white paper hierarchy */
+  --background: oklch(0.972 0.004 250);
+  --surface: oklch(0.99 0.002 250);
+  --surface-2: oklch(0.948 0.005 250);
 
-  --foreground: oklch(0.17 0 0);
-  --muted-foreground: oklch(0.45 0 0);
+  --foreground: oklch(0.205 0.01 260);
+  --muted-foreground: oklch(0.5 0.015 260);
 
   --card: var(--surface);
   --card-foreground: var(--foreground);
-  --popover: oklch(0.975 0.002 260);
+  --popover: oklch(0.995 0.001 250);
   --popover-foreground: var(--foreground);
 
-  /* one accent — the same teal, darkened for white surfaces */
-  --primary: oklch(0.62 0.11 180);
-  --primary-foreground: oklch(0.98 0.005 180);
+  /* one accent — a saturated teal that reads as deliberate on white */
+  --primary: oklch(0.55 0.155 195);
+  --primary-foreground: oklch(0.99 0.005 195);
 
-  --secondary: oklch(0.92 0.004 260);
+  --secondary: oklch(0.94 0.008 260);
   --secondary-foreground: var(--foreground);
-  --muted: oklch(0.92 0.004 260);
-  --accent: oklch(0.9 0.005 260);
+  --muted: oklch(0.94 0.008 260);
+  --accent: oklch(0.92 0.01 260);
   --accent-foreground: var(--foreground);
 
   /* semantic status — darkened for contrast on white */
-  --success: oklch(0.6 0.13 165);
-  --success-foreground: oklch(0.98 0.01 165);
-  --warning: oklch(0.68 0.13 80);
-  --warning-foreground: oklch(0.98 0.01 80);
-  --danger: oklch(0.55 0.19 25);
-  --danger-foreground: oklch(0.98 0.01 25);
-  --info: oklch(0.58 0.11 235);
-  --info-foreground: oklch(0.98 0.01 235);
+  --success: oklch(0.58 0.14 165);
+  --success-foreground: oklch(0.99 0.01 165);
+  --warning: oklch(0.66 0.14 80);
+  --warning-foreground: oklch(0.99 0.01 80);
+  --danger: oklch(0.56 0.19 25);
+  --danger-foreground: oklch(0.99 0.01 25);
+  --info: oklch(0.56 0.12 235);
+  --info-foreground: oklch(0.99 0.01 235);
   --destructive: var(--danger);
   --destructive-foreground: var(--danger-foreground);
 
-  /* near-black borders — the light theme's signature */
-  --border: oklch(0.15 0 0);
-  --input: oklch(0.15 0 0);
-  --ring: oklch(0.62 0.11 180 / 50%);
+  /* soft hairline borders instead of near-black — calmer, more modern */
+  --border: oklch(0.88 0.006 260);
+  --input: oklch(0.88 0.006 260);
+  --ring: oklch(0.55 0.155 195 / 40%);
 
   /* terminal surfaces (xterm needs concrete values; TerminalPane mirrors) */
-  --terminal: #fbfbf8;
-  --terminal-foreground: #26262b;
+  --terminal: #fdfdfc;
+  --terminal-foreground: #1c1e24;
 
   --chart-1: var(--primary);
   --chart-2: var(--info);
@@ -358,9 +358,9 @@ body {
   --popover: oklch(0.215 0.006 260);
   --popover-foreground: var(--foreground);
 
-  /* one accent — teal, kin to the terminal green */
-  --primary: oklch(0.77 0.12 180);
-  --primary-foreground: oklch(0.18 0.03 190);
+  /* one accent — the same teal as light, lifted for dark surfaces */
+  --primary: oklch(0.72 0.15 195);
+  --primary-foreground: oklch(0.15 0.03 195);
 
   --secondary: oklch(0.215 0.006 260);
   --secondary-foreground: var(--foreground);
@@ -382,7 +382,7 @@ body {
 
   --border: oklch(1 0 0 / 8%);
   --input: oklch(1 0 0 / 12%);
-  --ring: oklch(0.77 0.12 180 / 50%);
+  --ring: oklch(0.72 0.15 195 / 50%);
 
   --terminal: #16171c;
   --terminal-foreground: #eceef2;
@@ -416,9 +416,21 @@ body {
   }
   body {
     @apply bg-background text-foreground;
+    /* smooth the theme switch and any background/color change */
+    transition:
+      background-color 240ms ease,
+      color 240ms ease;
   }
   html {
     @apply font-sans;
+    scroll-behavior: smooth;
+  }
+  /* Major surfaces fade between themes instead of snapping. `:where` keeps
+     specificity at zero so a component's own transition always wins. */
+  :where(.glass, .glass-sidebar, [data-slot="card"]) {
+    transition:
+      background-color 240ms ease,
+      border-color 240ms ease;
   }
   /* Tailwind v4 preflight makes buttons cursor:default — restore pointer */
   button:not(:disabled),
