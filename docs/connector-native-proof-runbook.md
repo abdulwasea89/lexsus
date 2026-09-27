@@ -104,67 +104,44 @@ immediately (Auto approval, no banner). `read_file` of a **sensitive** path
 or Deny resolves it and the result returns. This gate needs no Claude plan and
 no tunnel; it is the fastest way to confirm the connector is healthy.
 
-## 4. Pre-flight: enabling the write leg (temporary, local-only)
+## 4. Pre-flight: the connector is configured from the dashboard
 
-There is **no code patch** for the tunnel host any more: the connector reads
-the extra hosts from the environment (§4a). The write leg still seeds off by
-default; §4b keeps the proof honest.
+There is **no code patch** and **no env var** for the tunnel host any more: the
+connector is started, stopped, re-ported and allowlisted from the dashboard,
+and the tunnel is managed there too.
 
 **4a. Allow the tunnel Host.** rmcp validates the inbound `Host` header and
-rejects anything not loopback by default (DNS-rebinding guard). A dev tunnel
-forwards the **public** host, so without this every request 403s. Launch the
-app with the tunnel host listed:
-
-```bash
-LEXSUS_MCP_ALLOWED_HOSTS=lexsus-proof.trycloudflare.com pnpm tauri dev
-```
-
-Comma-separate multiple hosts. Loopback is always allowed and is the default;
-anything beyond it is opt-in via this variable, never hardcoded. Use your actual
-stable subdomain; if you are using a throwaway `*.trycloudflare.com` URL whose
-host changes every run, either pin it first (§5b) or re-launch with the new host.
+rejects anything not loopback by default (DNS-rebinding guard). When you start
+an in-app tunnel (§5), its public host is **auto-allowlisted** and the
+connector restarts to apply it — no relaunch. You can also edit the allowlist
+directly in the dashboard's **Public tunnel** card (`Apply hosts`); loopback is
+always allowed and is the default, and anything beyond it is opt-in, never
+hardcoded.
 
 **4b. Enable the write leg.** `mcp_allow_write` seeds false at startup. For the
 write/command proof in §7 it must be true **before** Claude re-fetches tools,
-so seed it at launch:
-
-```bash
-LEXSUS_MCP_ALLOW_WRITE=1 pnpm tauri dev
-```
-
-`mcp_status` must then report `allow_write: true`. You can also flip it live
-from the BridgeView switch — no rebuild, no relaunch — and the same switch turns
-it back off when you are done with the write leg.
-
-After 4a/4b: `cargo clippy --lib --all-targets -- -D warnings` clean, then
-launch with the env vars above.
+so flip the dashboard's **Allow writes & commands** switch — no rebuild, no
+relaunch — and flip it back off when you are done with the write leg. (The
+`LEXSUS_MCP_ALLOW_WRITE=1` env seed still works for a headless launch.)
 
 ## 5. Expose the loopback endpoint over HTTPS
 
-Choose **one** tunnel. Claude connects from Anthropic's cloud, so it needs a
-**public HTTPS** URL with a real certificate.
+Open the dashboard's **Public tunnel** card and press **Start** on a provider
+your machine has (`cloudflared`, `ngrok`, or a custom command). The app spawns
+the tunnel, scrapes its public HTTPS URL, prints it in the card, auto-adds the
+host to the allowlist and restarts the connector. Claude connects from
+Anthropic's cloud, so it needs that **public HTTPS** URL with a real
+certificate.
 
-### 5a. Recommended: LocalCan (documented for this use case)
+For a **stable** host (needed if you ever switch to OAuth), use a named
+tunnel — `cloudflared tunnel create` / `ngrok` reserved domain — and drive it
+from the dashboard's **Custom command** field with `{port}` as the placeholder:
 
-Add a local endpoint `127.0.0.1:45147` → it gives you a stable `https://…` URL
-with a real cert. **Give the tunnel a stable subdomain** — do not rely on a
-host that reshuffles.
-
-### 5b. cloudflared
-
-Named tunnel (stable host — needed if you ever switch to OAuth):
-
-```bash
-cloudflared tunnel --url http://127.0.0.1:45147            # throwaway URL
-# or, for a stable host on a domain you control:
-cloudflared tunnel login && cloudflared tunnel create lexsus-proof
-# put the hostname in the tunnel config, then:
+```
 cloudflared tunnel run lexsus-proof
 ```
 
-Quick tunnels get a random `https://<random>.trycloudflare.com`; copy the exact
-host into `LEXSUS_MCP_ALLOWED_HOSTS` (§4a) and relaunch. Confirm the endpoint
-answers:
+Confirm the endpoint answers through the tunnel:
 
 ```bash
 curl -i https://<your-host>/mcp           # expect 405/400 with server headers, not 403
@@ -259,12 +236,13 @@ banner wording for `mcp` source, timing) — those feed the next stage.
 
 ## 9. Cleanup (do this the same session)
 
-1. Quit the desktop app (kills the endpoint + approvals).
-2. Tear down the tunnel (LocalCan stop / `cloudflared tunnel` Ctrl-C).
+1. In the dashboard, press **Stop tunnel** (withdraws the host from the
+   allowlist and kills the tunnel process group).
+2. Quit the desktop app (kills the endpoint + approvals; any tunnel is also
+   stopped on exit).
 3. In Claude.ai: remove the custom connector.
-4. Unset `LEXSUS_MCP_ALLOWED_HOSTS` / `LEXSUS_MCP_ALLOW_WRITE`, or confirm the
-   BridgeView switch is back to read-only, so the app matches its default
-   read-only posture again.
+4. Unset `LEXSUS_MCP_ALLOW_WRITE` if you used it, or confirm the dashboard's
+   write switch is back off, so the app matches its default read-only posture.
 
 ## 10. Known deferrals to later stages
 
@@ -272,8 +250,8 @@ banner wording for `mcp` source, timing) — those feed the next stage.
   into a chat, so the handoff is built and copied to the clipboard from the
   Handoff view today. A `get_handoff` connector **pull tool** is the planned
   replacement; it is not built yet.
-- **Configurable secret MCP path + host allow-list in the UI** — the
-  `LEXSUS_MCP_ALLOWED_HOSTS` env var works today; surfacing it as config is
-  later work.
+- **Configurable secret MCP path** — the port and host allow-list are now
+  configurable from the dashboard; a configurable secret path (`/mcp`) is
+  still hardcoded.
 - **Stable production-grade exposure (hosted gateway + outbound relay)** — the
   loopback endpoint plus a dev tunnel is the proof-time path.

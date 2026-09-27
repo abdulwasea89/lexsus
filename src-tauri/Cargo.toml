@@ -70,6 +70,10 @@ reqwest = { version = "0.12", default-features = false, features = [
 libc = "0.2"
 
 [dev-dependencies]
+# `mock_app()` builds a real Tauri app over the mock runtime, so the connector
+# lifecycle can be driven end to end in a test without a window. Test-only:
+# the feature is not enabled for normal builds.
+tauri = { version = "2", features = ["test"] }
 # `ServiceExt::oneshot` drives the real MCP router in-process, so the auth
 # middleware is exercised through the same stack axum serves rather than
 # through a hand-rolled imitation of it.

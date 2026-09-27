@@ -2,12 +2,14 @@ import { useState } from "react";
 import {
   FolderIcon,
   RadioIcon,
+  ShieldAlertIcon,
   SquareTerminalIcon,
 } from "lucide-react";
 import type {
   FailoverStatus,
   McpStatus,
   TerminalRunEvent,
+  TunnelStatus,
 } from "../lib/types";
 import { useTauriEvent } from "../hooks/useTauriEvent";
 import { cn } from "../lib/utils";
@@ -28,6 +30,8 @@ function stateColor(state: string): string {
 interface StatusbarProps {
   projectRoot: string;
   connector: McpStatus | null;
+  /** The public tunnel, so a live exposure is visible at the bottom edge too. */
+  tunnel: TunnelStatus | null;
   /** Failover state, owned by `useFailover` and shared with FailoverBanner. */
   status: FailoverStatus | null;
 }
@@ -40,6 +44,7 @@ interface StatusbarProps {
 export default function Statusbar({
   projectRoot,
   connector,
+  tunnel,
   status,
 }: StatusbarProps) {
   const [running, setRunning] = useState(false);
@@ -83,6 +88,15 @@ export default function Statusbar({
             : "connector · ro"
           : "connector offline"}
       </span>
+      {tunnel?.running && (
+        <span
+          className="flex items-center gap-1 text-danger"
+          title={tunnel.url ?? "public tunnel live"}
+        >
+          <ShieldAlertIcon className="size-3" />
+          public
+        </span>
+      )}
       <span className="flex items-center gap-1.5">
         <SquareTerminalIcon className="size-3" />
         <span className={cn(running && "text-success")}>
