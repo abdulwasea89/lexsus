@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
 import {
   getProjectRoot,
   mcpStatus,
+  pickProjectFolder,
   setProjectRoot,
   startWatch,
   tunnelStatus,
@@ -158,19 +158,14 @@ export default function App() {
 
   async function onBrowse() {
     try {
-      const selected = await open({
-        directory: true,
-        multiple: false,
-        title: "Select project folder",
-      });
-      // The plugin types this as `string | null`, but on some Linux portal
-      // setups it comes back as a single-element array. Accept either shape.
-      const path = Array.isArray(selected) ? selected[0] : selected;
+      const path = await pickProjectFolder();
+      console.log("[project] picked folder:", path);
       if (typeof path === "string" && path) {
         setRootInput(path);
         await applyProject(path);
       }
     } catch (e) {
+      console.error("[project] pick failed:", e);
       toast.add({
         title: "Could not browse",
         description: String(e),

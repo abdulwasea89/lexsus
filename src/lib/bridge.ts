@@ -40,6 +40,11 @@ export function getProjectRoot(): Promise<string | null> {
   return invoke("get_project_root");
 }
 
+/** Pick a folder with the native dialog (driven from Rust, not the JS wrapper). */
+export function pickProjectFolder(): Promise<string | null> {
+  return invoke("pick_project_folder");
+}
+
 // --- git ---------------------------------------------------------------------
 
 export function gitStatus(): Promise<GitFileStatus[]> {

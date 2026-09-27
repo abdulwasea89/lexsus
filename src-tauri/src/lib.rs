@@ -239,6 +239,23 @@ fn get_project_root(state: State<'_, AppState>) -> Result<Option<String>, String
     Ok(root.clone().map(|p| p.display().to_string()))
 }
 
+/// Pick a project folder with the native directory dialog, driven directly
+/// from Rust. Bypasses the JS `open` wrapper and its fs-scope bookkeeping,
+/// which can fail (or return `null`) on some Linux portal setups and swallow
+/// a perfectly valid folder selection.
+#[tauri::command]
+async fn pick_project_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let picked = app
+        .dialog()
+        .file()
+        .set_title("Select project folder")
+        .blocking_pick_folder();
+    Ok(picked
+        .and_then(|p| p.into_path().ok())
+        .map(|p| p.to_string_lossy().into_owned()))
+}
+
 // --- git panel ---------------------------------------------------------------
 
 #[tauri::command]
@@ -1749,6 +1766,7 @@ pub fn run() {
             init_database,
             set_project_root,
             get_project_root,
+            pick_project_folder,
             git_status,
             git_branch,
             git_commit,
