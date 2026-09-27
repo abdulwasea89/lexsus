@@ -1,14 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  ActivityStats,
   ArchiveReport,
   AuditEntry,
   BranchInfo,
   BridgeTool,
+  CommandRun,
   CommitInfo,
   FailoverLogEntry,
   FailoverStatus,
   FactsSnapshot,
   FileDiff,
+  FileTouch,
   GitFileStatus,
   GrantState,
   Handoff,
@@ -16,6 +19,11 @@ import type {
   SessionEvent,
   SessionSummary,
   ToolResult,
+  ToolSurface,
+  ToolUsage,
+  TraceRow,
+  TunnelDetection,
+  TunnelStatus,
 } from "./types";
 
 /** Thin typed wrapper around the Rust core's Tauri commands. */
@@ -139,6 +147,31 @@ export function mcpSetAllowWrite(enabled: boolean): Promise<McpStatus> {
   return invoke("mcp_set_allow_write", { enabled });
 }
 
+/** Start the MCP endpoint. Errors (e.g. port in use) surface to the caller. */
+export function mcpStart(): Promise<McpStatus> {
+  return invoke("mcp_start");
+}
+
+/** Stop the MCP endpoint and release its port. Abrupt, by design. */
+export function mcpStop(): Promise<McpStatus> {
+  return invoke("mcp_stop");
+}
+
+/** Restart the endpoint (applies a new port or allowlist). */
+export function mcpRestart(): Promise<McpStatus> {
+  return invoke("mcp_restart");
+}
+
+/** Change the connector's port and apply it, persisting for next launch. */
+export function mcpSetPort(port: number): Promise<McpStatus> {
+  return invoke("mcp_set_port", { port });
+}
+
+/** Replace the editable allowlist and restart the connector to apply it. */
+export function mcpSetAllowedHosts(hosts: string[]): Promise<McpStatus> {
+  return invoke("mcp_set_allowed_hosts", { hosts });
+}
+
 /**
  * The bearer token a connector must present. Only reachable over Tauri IPC
  * from this webview — the same process that already grants approvals — so
@@ -151,6 +184,61 @@ export function mcpRevealToken(): Promise<string> {
 /** Mint a new token. The old one stops working immediately, with no restart. */
 export function mcpRotateToken(): Promise<McpStatus> {
   return invoke("mcp_rotate_token");
+}
+
+// --- public tunnel -----------------------------------------------------------
+
+/** Which tunnel tools this machine has, so the UI offers what will work. */
+export function tunnelDetect(): Promise<TunnelDetection[]> {
+  return invoke("tunnel_detect");
+}
+
+/** The live tunnel state (running flag, URL, host, log tail). */
+export function tunnelStatus(): Promise<TunnelStatus> {
+  return invoke("tunnel_status");
+}
+
+/**
+ * Start a tunnel to the connector. The public host is discovered
+ * asynchronously and auto-allowlisted once the provider prints it.
+ */
+export function tunnelStart(
+  provider: string,
+  command?: string,
+): Promise<TunnelStatus> {
+  return invoke("tunnel_start", { provider, command: command ?? null });
+}
+
+/** Stop the tunnel and everything it spawned. */
+export function tunnelStop(): Promise<TunnelStatus> {
+  return invoke("tunnel_stop");
+}
+
+// --- activity dashboard ------------------------------------------------------
+
+/** Newest-first trace steps with tool/source/outcome. */
+export function activityTrace(limit?: number): Promise<TraceRow[]> {
+  return invoke("activity_trace", { limit: limit ?? null });
+}
+
+export function activityStats(): Promise<ActivityStats> {
+  return invoke("activity_stats");
+}
+
+export function activityToolUsage(limit?: number): Promise<ToolUsage[]> {
+  return invoke("activity_tool_usage", { limit: limit ?? null });
+}
+
+export function activityFiles(limit?: number): Promise<FileTouch[]> {
+  return invoke("activity_files", { limit: limit ?? null });
+}
+
+export function activityCommands(limit?: number): Promise<CommandRun[]> {
+  return invoke("activity_commands", { limit: limit ?? null });
+}
+
+export function activityToolSurface(): Promise<ToolSurface> {
+  return invoke("activity_tool_surface");
 }
 
 export function setObjective(text: string): Promise<void> {

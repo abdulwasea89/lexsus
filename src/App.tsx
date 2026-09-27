@@ -1,47 +1,31 @@
 import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { CircleAlertIcon } from "lucide-react";
 import {
   getProjectRoot,
   mcpStatus,
   setProjectRoot,
   startWatch,
+  tunnelStatus,
 } from "./lib/bridge";
-import type { McpStatus } from "./lib/types";
+import type { McpStatus, TunnelStatus } from "./lib/types";
 import ApprovalBanner from "./components/ApprovalBanner";
 import ErrorBoundary from "./components/ErrorBoundary";
 import GrantsBar from "./components/GrantsBar";
-import BridgeView from "./views/BridgeView";
+import DashboardView from "./views/DashboardView";
 import FailoverBanner from "./components/FailoverBanner";
-import GitView from "./views/GitView";
-import HandoffView from "./views/HandoffView";
-import MemoryView from "./views/MemoryView";
 import ProjectDialog from "./components/ProjectDialog";
 import Onboarding from "./components/Onboarding";
 import QuestionBanner from "./components/QuestionBanner";
-import TraceView from "./views/TraceView";
 import Statusbar from "./components/Statusbar";
-import TerminalPane from "./components/TerminalPane";
 import Titlebar from "./components/Titlebar";
-import WorkbenchRail, { type View } from "./components/WorkbenchRail";
 import { isOnboarded } from "./lib/onboarding";
 import { useApprovals } from "./hooks/useApprovals";
 import { useFailover } from "./hooks/useFailover";
 import { useQuestions } from "./hooks/useQuestions";
-import { Alert, AlertDescription, AlertTitle } from "./components/ui/alert";
-import GettingStarted from "./components/GettingStarted";
+import { useTauriEvent } from "./hooks/useTauriEvent";
+import { toast } from "./components/ui/toast";
 
 const RECENTS_KEY = "lexsus.recentProjects";
-const VIEW_KEY = "lexsus.view";
-const VIEWS: View[] = ["trace", "git", "handoff", "memory", "bridge"];
-
-const VIEW_LABELS: Record<View, string> = {
-  trace: "Live activity trace",
-  git: "Git",
-  handoff: "Handoff",
-  memory: "Project memory",
-  bridge: "Web-AI connector",
-};
 
 function loadRecents(): string[] {
   try {
@@ -61,23 +45,21 @@ function saveRecent(path: string) {
   localStorage.setItem(RECENTS_KEY, JSON.stringify(next));
 }
 
-function loadView(): View {
-  const v = localStorage.getItem(VIEW_KEY) as View | null;
-  return v && VIEWS.includes(v) ? v : "trace";
+function removeRecent(path: string) {
+  const next = loadRecents().filter((p) => p !== path);
+  localStorage.setItem(RECENTS_KEY, JSON.stringify(next));
 }
 
 /**
- * Workbench shell: icon rail (views + project/connector), a persistent
- * terminal on the left, the active view on the right, global approval
- * and failover banners on top, and a statusbar heartbeat below.
+ * The whole app is the dashboard: connector lifecycle, public tunnel and
+ * activity. Onboarding and the first-run project picker are untouched.
  */
 export default function App() {
   const [projectRoot, setRootInput] = useState("");
   const [restored, setRestored] = useState(false);
-  const [error, setError] = useState("");
   const [mcp, setMcp] = useState<McpStatus | null>(null);
+  const [tunnel, setTunnel] = useState<TunnelStatus | null>(null);
   const [recents, setRecents] = useState<string[]>([]);
-  const [view, setView] = useState<View>(loadView);
   const [projectOpen, setProjectOpen] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(() => !isOnboarded());
   const { approvals, grantState, decide } = useApprovals();
@@ -85,10 +67,6 @@ export default function App() {
   const { status, localEvent, webEvent, dismiss } = useFailover();
   // Guards project switches: a slow switch must not clobber a newer one.
   const switchToken = useRef(0);
-
-  useEffect(() => {
-    localStorage.setItem(VIEW_KEY, view);
-  }, [view]);
 
   useEffect(() => {
     setRecents(loadRecents());
@@ -110,29 +88,39 @@ export default function App() {
 
   useEffect(() => {
     void (async () => {
-      try {
-        const [saved, connector] = await Promise.all([
-          getProjectRoot(),
-          mcpStatus().catch(() => null),
-        ]);
-        if (saved) {
-          setRootInput(saved);
-          saveRecent(saved);
-          setRecents(loadRecents());
+      const [saved, connector, tunnelState] = await Promise.all([
+        getProjectRoot().catch(() => null),
+        mcpStatus().catch(() => null),
+        tunnelStatus().catch(() => null),
+      ]);
+      setMcp(connector);
+      setTunnel(tunnelState);
+      if (saved) {
+        setRootInput(saved);
+        saveRecent(saved);
+        setRecents(loadRecents());
+        try {
           await startWatch();
-        } else if (isOnboarded()) {
-          // First-run users meet the onboarding stage first; the project
-          // dialog opens when they finish it.
+        } catch {
+          // The saved folder no longer exists (deleted or renamed). Don't
+          // error — clear it and hand back to the project picker.
+          setRootInput("");
           setProjectOpen(true);
         }
-        setMcp(connector);
-      } catch (e) {
-        setError(String(e));
-      } finally {
-        setRestored(true);
+      } else if (isOnboarded()) {
+        // First-run users meet the onboarding stage first; the project
+        // dialog opens when they finish it.
+        setProjectOpen(true);
       }
+      setRestored(true);
     })();
   }, []);
+
+  // Keep the statusbar in step with lifecycle changes made in the dashboard.
+  useTauriEvent<McpStatus>("mcp://status", (payload) => setMcp(payload));
+  useTauriEvent<null>("tunnel://update", () => {
+    void tunnelStatus().then(setTunnel).catch(() => null);
+  });
 
   async function applyProject(path: string) {
     const token = ++switchToken.current;
@@ -143,12 +131,29 @@ export default function App() {
       const connector = await mcpStatus().catch(() => null);
       if (token !== switchToken.current) return;
       setMcp(connector);
-      setError("");
       saveRecent(path);
       setRecents(loadRecents());
     } catch (e) {
       if (token !== switchToken.current) return;
-      setError(String(e));
+      const msg = String(e);
+      // The most common case: a recent folder was moved or deleted. Drop it
+      // from recents and say so plainly instead of a cryptic OS error.
+      if (msg.includes("not a directory") || msg.includes("No such file")) {
+        removeRecent(path);
+        setRecents(loadRecents());
+        setRootInput("");
+        toast.add({
+          title: "Folder not found",
+          description: `${path} is not a folder anymore — pick another project.`,
+          type: "error",
+        });
+      } else {
+        toast.add({
+          title: "Could not open project",
+          description: msg,
+          type: "error",
+        });
+      }
     }
   }
 
@@ -164,7 +169,11 @@ export default function App() {
         await applyProject(selected);
       }
     } catch (e) {
-      setError(String(e));
+      toast.add({
+        title: "Could not browse",
+        description: String(e),
+        type: "error",
+      });
     }
   }
 
@@ -183,15 +192,7 @@ export default function App() {
     <div className="flex h-screen w-full flex-col overflow-hidden bg-background text-foreground">
       <Titlebar />
 
-      <div className="flex min-h-0 flex-1 overflow-hidden">
-        <WorkbenchRail
-          view={view}
-          onViewChange={setView}
-          connector={mcp}
-          onOpenProject={() => setProjectOpen(true)}
-        />
-
-        <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+      <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <ApprovalBanner approvals={approvals} onDecide={decide} />
         <QuestionBanner questions={questions} onAnswer={answer} />
         <GrantsBar grantState={grantState} />
@@ -202,54 +203,26 @@ export default function App() {
           dismiss={dismiss}
         />
 
-        {error && (
-          <Alert variant="destructive" className="m-3 mb-0 anim-pop">
-            <CircleAlertIcon />
-            <AlertTitle>Something went wrong</AlertTitle>
-            <AlertDescription className="font-mono text-xs">
-              {error}
-            </AlertDescription>
-          </Alert>
-        )}
-
         {!restored ? (
           <div className="flex flex-1 items-center justify-center p-8 text-sm text-muted-foreground">
             <span className="animate-pulse">restoring session…</span>
           </div>
         ) : (
-          <div className="flex min-h-0 flex-1 flex-col gap-3 p-3 lg:flex-row">
-            <div className="flex h-[50vh] min-h-0 shrink-0 flex-col lg:h-auto lg:w-[55%] lg:shrink anim-fade-up">
-              {projectRoot ? (
-                <TerminalPane />
-              ) : (
-                <GettingStarted onOpenProject={() => setProjectOpen(true)} />
-              )}
-            </div>
-
+          <ErrorBoundary label="Dashboard">
             <div className="flex min-h-0 flex-1 flex-col">
-              {/* The trace stays mounted while you're on another tab, so its
-                  event stream and history survive — and no steps are dropped
-                  in the meantime. */}
-              <ErrorBoundary label={VIEW_LABELS.trace}>
-                <div className={view === "trace" ? "h-full" : "hidden"}>
-                  <TraceView />
-                </div>
-              </ErrorBoundary>
-              {view !== "trace" && (
-                <ErrorBoundary key={view} label={VIEW_LABELS[view]}>
-                  <div className="h-full anim-fade-up">
-                    {view === "git" && <GitView />}
-                    {view === "handoff" && <HandoffView />}
-                    {view === "memory" && <MemoryView />}
-                    {view === "bridge" && <BridgeView />}
-                  </div>
-                </ErrorBoundary>
-              )}
+              <div className="min-h-0 flex-1">
+                <DashboardView onOpenProject={() => setProjectOpen(true)} />
+              </div>
             </div>
-          </div>
+          </ErrorBoundary>
         )}
 
-        <Statusbar projectRoot={projectRoot} connector={mcp} status={status} />
+        <Statusbar
+          projectRoot={projectRoot}
+          connector={mcp}
+          tunnel={tunnel}
+          status={status}
+        />
       </main>
 
       <ProjectDialog
@@ -263,7 +236,6 @@ export default function App() {
       />
 
       {showOnboarding && <Onboarding onDone={finishOnboarding} />}
-      </div>
     </div>
   );
 }

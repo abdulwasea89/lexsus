@@ -4,12 +4,12 @@ export type Theme = "dark" | "light";
 
 export const THEME_KEY = "lexsus.theme";
 
-/** Persisted preference — dark unless explicitly set to light. */
+/** Persisted preference — white/light unless explicitly set to dark. */
 export function loadTheme(): Theme {
   try {
-    return localStorage.getItem(THEME_KEY) === "light" ? "light" : "dark";
+    return localStorage.getItem(THEME_KEY) === "dark" ? "dark" : "light";
   } catch {
-    return "dark";
+    return "light";
   }
 }
 

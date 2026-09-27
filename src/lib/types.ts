@@ -193,7 +193,15 @@ export interface FactsSnapshot {
 export interface McpStatus {
   /** True once the loopback endpoint actually bound. */
   listening: boolean;
+  /** True from start until stop; may diverge from `listening` on a self-exit. */
+  running: boolean;
   endpoint: string;
+  /** The port actually bound — the OS's pick when 0 was configured. */
+  port: number;
+  /** Seconds since the connector was last started. */
+  uptime_secs: number;
+  /** Why the last start attempt failed, if it did — e.g. "port in use". */
+  bind_error: string | null;
   /** Read-only-first: writes stay hidden until this is flipped. */
   allow_write: boolean;
   /** The bound workspace — the connector's whole blast radius. */
@@ -224,6 +232,106 @@ export interface McpStatus {
    * Every *response* is signed regardless.
    */
   signature_required: boolean;
+  /**
+   * The user's editable allowlist, without the loopback defaults the guard
+   * always adds. `allowed_hosts` is what is enforced; this is what is edited.
+   */
+  configured_hosts: string[];
+}
+
+// --- connector tunnel + activity dashboard -----------------------------------
+
+/** One tunnel provider the desktop can offer (mirrors Rust `Detection`). */
+export interface TunnelDetection {
+  provider: string;
+  label: string;
+  available: boolean;
+  path: string | null;
+  hint: string;
+  preview: string;
+}
+
+/** A live tunnel's state (mirrors Rust `TunnelStatus`). */
+export interface TunnelStatus {
+  running: boolean;
+  provider: string;
+  url: string | null;
+  host: string | null;
+  port: number;
+  log: string[];
+}
+
+/** A labelled count in the tool-surface breakdown. */
+export interface CountEntry {
+  name: string;
+  count: number;
+}
+
+/** The tool catalogue derived from SPECS (mirrors Rust `ToolSurface`). */
+export interface ToolSurface {
+  total: number;
+  read_only: number;
+  write: number;
+  groups: CountEntry[];
+  approvals: CountEntry[];
+  kinds: CountEntry[];
+}
+
+/** A `kind` bucket for the dashboard's by-kind breakdown. */
+export interface KindCount {
+  kind: string;
+  count: number;
+}
+
+/** Dashboard headline numbers (mirrors Rust `ActivityStats`). */
+export interface ActivityStats {
+  total: number;
+  tool_calls: number;
+  files_read: number;
+  files_written: number;
+  commands_run: number;
+  failures: number;
+  denied: number;
+  files: number;
+  commands: number;
+  span: [string, string] | null;
+  by_kind: KindCount[];
+}
+
+/** One recent trace step, read back from the DB (mirrors Rust `TraceRow`). */
+export interface TraceRow {
+  ts: string;
+  kind: string;
+  tool: string | null;
+  source: string | null;
+  file: string | null;
+  command: string | null;
+  detail: string | null;
+  ok: boolean;
+}
+
+/** Per-tool aggregate usage (mirrors Rust `ToolUsage`). */
+export interface ToolUsage {
+  tool: string;
+  calls: number;
+  failures: number;
+  last_ts: string | null;
+}
+
+/** Per-file aggregate activity (mirrors Rust `FileTouch`). */
+export interface FileTouch {
+  file: string;
+  reads: number;
+  writes: number;
+  last_ts: string | null;
+}
+
+/** Per-command aggregate history (mirrors Rust `CommandRun`). */
+export interface CommandRun {
+  command: string;
+  runs: number;
+  last_ok: boolean;
+  last_ts: string | null;
 }
 
 // --- failover ----------------------------------------------------------------

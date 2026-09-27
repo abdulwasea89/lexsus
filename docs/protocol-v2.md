@@ -13,8 +13,10 @@ straight at the loopback URL.
 | | |
 |---|---|
 | Transport | MCP Streamable HTTP (`rmcp` 3.2 over axum/tokio) |
-| Endpoint | `http://127.0.0.1:45147/mcp` (`ADDR`, `MCP_PATH`) |
+| Endpoint | `http://127.0.0.1:<port>/mcp` (`MCP_HOST`, `MCP_PATH`) |
+| Port | configurable, persisted; default `45147` (`DEFAULT_PORT`); `0` = OS picks |
 | Bind | loopback only — never a public interface |
+| Allowlist | editable from the dashboard (`mcp_set_allowed_hosts`); `LEXSUS_MCP_ALLOWED_HOSTS` stays as an additive headless/CI override |
 | Auth | `Authorization: Bearer <token>` on **every** request, loopback included; responses signed |
 | Signing | opportunistic on requests (`X-Lexsus-Signature`), always on responses |
 | Surface | `tools/list` + `tools/call`, derived from `SPECS` in `src-tauri/src/bridge.rs` |
@@ -32,21 +34,29 @@ watcher grounding. The transport was replaced; the engine it feeds was not.
 
 ## 2. Server lifecycle and framing
 
-`mcp::spawn_server(app, allow_write, listening, auth)` starts a dedicated thread
-holding a multi-threaded tokio runtime (`thread_name("mcp")`), so the server
-never interferes with the Tauri event loop and its blocking-pool waits for
-approvals cannot stall anything else.
+A `mcp::Connector` owns the running server: its shutdown `oneshot`, thread,
+bound port and start time. `Connector::start(app, allow_write, auth, port,
+allowed_hosts)` spawns the dedicated multi-threaded tokio runtime
+(`thread_name("mcp")`) and **blocks until the bind succeeds**, so "port already
+in use" is returned to the UI as `bind_error` rather than a background-thread
+stderr line. `Connector::stop()` fires the shutdown signal and joins the
+thread. Stop is abrupt by design: it severs live SSE sessions and cancels
+in-flight calls, because rmcp's `legacy_session_mode` GET stream stays open for
+the session's life and a graceful drain would hang until the client left.
 
 ```rust
-// src-tauri/src/mcp.rs
-let mut config = StreamableHttpServerConfig::default();
-config.json_response = true;
-config.allowed_hosts.extend(allowed_hosts_from_env());
+// src-tauri/src/mcp.rs (abridged)
+let config = server_config(&allowed_hosts);
 let service = StreamableHttpService::new(factory, Arc::new(LocalSessionManager::default()), config);
-let listener = tokio::net::TcpListener::bind(ADDR).await?;   // 127.0.0.1:45147
+let listener = tokio::net::TcpListener::bind((MCP_HOST, port)).await?; // loopback
+let bound = listener.local_addr()?.port();
+let _ = startup.send(Ok(bound));
 listening.store(true, Ordering::SeqCst);
-let app = axum::Router::new().nest_service(MCP_PATH, service);
-axum::serve(listener, app).await
+tokio::select! {
+    result = axum::serve(listener, with_auth(router, auth)) => result?,
+    _ = shutdown => eprintln!("[mcp] stopped on request"),
+}
+listening.store(false, Ordering::SeqCst);
 ```
 
 - **Framing:** JSON-RPC over MCP Streamable HTTP. `json_response = true` makes
@@ -57,7 +67,8 @@ axum::serve(listener, app).await
   `LexsusServer` for each connection, each sharing the same `AppHandle` and the
   same live `Arc<AtomicBool>` write flag.
 - **`listening`** flips to `true` only once the socket is actually bound, and is
-  what `mcp_status` reports.
+  cleared on every exit path; `mcp_status` also reports `running` (issued a
+  start and not yet stopped), `port`, `uptime_secs` and `bind_error`.
 - **One protocol-level error exists:** if the blocking execution task itself
   panics, the server returns `McpError::internal_error("mcp execution task
   failed")` — a JSON-RPC error, not a tool result. Every other failure below is
@@ -76,13 +87,19 @@ reverse proxy forwards **its own** `Host`, so pointing a cloud provider at the
 endpoint through a tunnel means either listing that host or rewriting `Host` at
 the proxy.
 
+The desktop drives the allowlist through `mcp_set_allowed_hosts` (persisted in
+`settings.mcp_allowed_hosts` as a JSON array); the environment stays as an
+additive headless/CI override:
+
 ```
 LEXSUS_MCP_ALLOWED_HOSTS=lexsus-proof.trycloudflare.com,localhost.example
 ```
 
-`allowed_hosts_from_env()` splits on `,`, trims, and drops empties — the extra
-hosts are always **opt-in**, never hardcoded, and loopback remains allowed in
-every case.
+Both paths split on `,`, trim, and drop empties — the extra hosts are always
+**opt-in**, never hardcoded, and loopback remains allowed in every case. A
+UI-managed tunnel appends its discovered host to the configured list and
+restarts the connector to apply it (rmcp consumes the allowlist when the
+service is built).
 
 ### The secure layer
 

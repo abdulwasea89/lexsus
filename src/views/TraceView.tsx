@@ -1,16 +1,20 @@
-import { useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Chip } from "@heroui/react";
 import {
   ActivityIcon,
   BookOpenIcon,
+  BotIcon,
   CheckIcon,
   CircleIcon,
   FileIcon,
   FlaskConicalIcon,
+  GlobeIcon,
+  ListChecksIcon,
   PlayIcon,
   SquarePenIcon,
 } from "lucide-react";
 import type { FsEvent, TraceStep } from "../lib/types";
+import { activityTrace } from "../lib/bridge";
 import { useTauriEvent } from "../hooks/useTauriEvent";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
@@ -20,6 +24,11 @@ import { ViewShell } from "./ViewShell";
 interface TraceItem extends TraceStep {
   confirmed: boolean;
   id: number;
+  /** Attribution from the persisted record (not on the live event). */
+  tool?: string | null;
+  ok?: boolean | null;
+  /** Persisted timestamp text, when hydrated from the database. */
+  tsText?: string | null;
 }
 
 const ICONS: Record<string, ReactNode> = {
@@ -29,6 +38,9 @@ const ICONS: Record<string, ReactNode> = {
   test: <FlaskConicalIcon />,
   error: <CircleIcon className="text-danger" />,
   fs: <FileIcon />,
+  planning: <ListChecksIcon />,
+  web: <GlobeIcon />,
+  agent: <BotIcon />,
 };
 
 /** Live activity trace view: web-AI tool steps + watcher grounding.
@@ -38,6 +50,36 @@ export default function TraceView() {
   const [items, setItems] = useState<TraceItem[]>([]);
   const [collapsed, setCollapsed] = useState(true);
   const idRef = useRef(0);
+
+  // Hydrate from the persisted trace so the activity survives a reload; the
+  // live `trace://step` stream is a stream, not a record.
+  useEffect(() => {
+    let cancelled = false;
+    void activityTrace(200)
+      .then((rows) => {
+        if (cancelled) return;
+        // Newest-first from the DB, reversed so the newest sit at the end —
+        // the same order the live stream produces.
+        const hydrated: TraceItem[] = [...rows].reverse().map((r) => ({
+          kind: r.kind,
+          file: r.file,
+          command: r.command,
+          detail: r.detail,
+          confirmed: false,
+          agent: r.source ?? "unknown",
+          ts: Date.now(),
+          id: ++idRef.current,
+          tool: r.tool,
+          ok: r.ok,
+          tsText: r.ts,
+        }));
+        setItems(hydrated);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useTauriEvent<TraceStep>("trace://step", (step) => {
     setItems((prev) => [
@@ -92,6 +134,7 @@ export default function TraceView() {
         : it.kind === "test" || it.kind === "error"
           ? (it.detail ?? "")
           : it.file ?? it.command ?? "";
+    const time = it.tsText ?? (it.ts ? new Date(it.ts).toLocaleTimeString() : "");
     return (
       <li
         key={it.id}
@@ -103,7 +146,22 @@ export default function TraceView() {
         <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground [&_svg]:size-3.5">
           {icon}
         </span>
+        {it.tool && (
+          <code className="shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+            {it.tool}
+          </code>
+        )}
         <span className="min-w-0 flex-1 truncate text-xs">{label}</span>
+        {it.ok === false && (
+          <Badge variant="outline" className="shrink-0 text-danger">
+            failed
+          </Badge>
+        )}
+        {time && (
+          <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
+            {time}
+          </span>
+        )}
         {it.kind === "editing" &&
           (it.confirmed ? (
             <Badge

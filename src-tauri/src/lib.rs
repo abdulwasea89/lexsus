@@ -30,6 +30,8 @@ pub mod shell;
 
 pub mod transcript;
 
+pub mod tunnel;
+
 pub mod watcher;
 
 pub mod web;
@@ -38,7 +40,7 @@ use std::collections::{HashMap, VecDeque};
 
 use std::path::PathBuf;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 
 use std::sync::{Arc, Mutex};
 
@@ -68,10 +70,29 @@ pub(crate) struct AppState {
     /// which then also re-exposes the write/command tools. Toggled at runtime
     /// from the desktop — no rebuild, no reconnect.
     pub(crate) mcp_allow_write: Arc<AtomicBool>,
-    /// Whether the connector actually bound its loopback socket. Set by
-    /// [`mcp::spawn_server`] once the listener is up, so the UI can tell
-    /// "endpoint live" from "endpoint failed to bind".
-    pub(crate) mcp_listening: Arc<AtomicBool>,
+    /// The connector's lifecycle: whether it is up, on which port, and how to
+    /// stop it. Owning the socket state here rather than in a global is what
+    /// lets the desktop start, stop and restart the endpoint — and what makes
+    /// a second app instance start its own rather than fight over this one's.
+    pub(crate) connector: mcp::Connector,
+    /// The public tunnel, if the user started one. Killed on stop and on exit:
+    /// a tunnel must never outlive the window that opened it.
+    pub(crate) tunnel: tunnel::Tunnel,
+    /// The port the connector is configured for. Persisted, so a restart comes
+    /// back on the same endpoint rather than a new one.
+    pub(crate) mcp_port: std::sync::atomic::AtomicU16,
+    /// Extra `Host` values the user has allowlisted, beyond loopback. Kept in
+    /// state because it is editable at runtime: a tunnel's host is discovered
+    /// after the tunnel starts, and rmcp bakes the allowlist into the service
+    /// at construction, so applying one means restarting the connector.
+    pub(crate) mcp_configured_hosts: Mutex<Vec<String>>,
+    /// Why the last start attempt failed, if it did.
+    ///
+    /// The auto-start in `setup()` has nobody to return an error to, and a
+    /// connector that silently failed to bind is exactly the "endpoint looks
+    /// fine, nothing answers" case this app keeps having to explain. Held here
+    /// so `mcp_status` can report it.
+    pub(crate) mcp_bind_error: Mutex<Option<String>>,
     /// Commands started with `run_command_background` and not yet stopped.
     ///
     /// In state rather than in a global, unlike [`process::registry`], so a
@@ -132,7 +153,11 @@ pub(crate) fn test_state(root: &std::path::Path) -> AppState {
         recent_edits: Mutex::new(VecDeque::new()),
         failover: Mutex::new(failover::ActivityMonitor::new()),
         mcp_allow_write: Arc::new(AtomicBool::new(false)),
-        mcp_listening: Arc::new(AtomicBool::new(false)),
+        connector: mcp::Connector::new(),
+        tunnel: tunnel::Tunnel::new(),
+        mcp_port: std::sync::atomic::AtomicU16::new(mcp::DEFAULT_PORT),
+        mcp_configured_hosts: Mutex::new(Vec::new()),
+        mcp_bind_error: Mutex::new(None),
         bgproc: bgproc::Manager::new(),
         active_worktree: Mutex::new(None),
         lsp_clients: Mutex::new(HashMap::new()),
@@ -140,6 +165,19 @@ pub(crate) fn test_state(root: &std::path::Path) -> AppState {
         question_seq: AtomicU64::new(1),
         questions: Mutex::new(HashMap::new()),
     }
+}
+
+/// A Tauri app over the mock runtime, for tests that need a real app to hang
+/// state, events and managed values off.
+///
+/// `mock_app()` is a genuine `App`, not a stub: `State` resolution, event
+/// emission and `manage` all behave as they do at runtime. That is what lets
+/// the connector's real bind/serve/shutdown path run in a test — and therefore
+/// what gets the tunnel and the lifecycle tests out of the "mocked it and hoped"
+/// category. Requires the `test` feature's `mock_app`, so it is test-only.
+#[cfg(test)]
+pub(crate) fn test_app() -> tauri::AppHandle<tauri::test::MockRuntime> {
+    tauri::test::mock_app().handle().clone()
 }
 
 /// A trace step emitted to the UI (mirrors `TraceStep` in the frontend).
@@ -167,7 +205,9 @@ fn init_database(state: State<'_, AppState>, db_path: String) -> Result<Vec<Stri
 /// Set the project folder this app monitors (persisted).
 #[tauri::command]
 fn set_project_root(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    let p = std::path::PathBuf::from(path);
+    // Trim stray whitespace/newlines a picker or paste may have included;
+    // `is_dir` follows symlinks, so a symlinked folder still counts.
+    let p = std::path::PathBuf::from(path.trim());
     if !p.is_dir() {
         return Err(format!("not a directory: {}", p.display()));
     }
@@ -181,14 +221,22 @@ fn set_project_root(state: State<'_, AppState>, path: String) -> Result<(), Stri
 }
 
 /// Restore the persisted project root (frontend calls on startup).
+///
+/// A root that no longer exists (a deleted or renamed folder) is cleared
+/// rather than returned, so the watcher never tries to watch a missing
+/// directory and the frontend never has to surface "No such file or
+/// directory" to the user.
 #[tauri::command]
 fn get_project_root(state: State<'_, AppState>) -> Result<Option<String>, String> {
-    Ok(state
-        .project_root
-        .lock()
-        .unwrap()
-        .clone()
-        .map(|p| p.display().to_string()))
+    let mut root = state.project_root.lock().unwrap();
+    if let Some(p) = root.as_ref() {
+        if !p.is_dir() {
+            let _ = db::delete_setting(&state.conn.lock().unwrap(), "project_root");
+            *root = None;
+            return Ok(None);
+        }
+    }
+    Ok(root.clone().map(|p| p.display().to_string()))
 }
 
 // --- git panel ---------------------------------------------------------------
@@ -358,7 +406,14 @@ pub(crate) fn command_stream(app: &AppHandle) -> impl FnMut(bridge::CommandEvent
 
 /// Route a tool call through the approval policy. Shared by the
 /// `bridge_tool` command (desktop) and the native MCP server (`mcp.rs`).
-pub(crate) fn tool_call(app: &AppHandle, tool: bridge::Tool, source: &str) -> bridge::ToolResult {
+///
+/// Generic over the runtime so the MCP server can be driven over Tauri's mock
+/// runtime in tests; every caller in the app instantiates it with `Wry`.
+pub(crate) fn tool_call<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    tool: bridge::Tool,
+    source: &str,
+) -> bridge::ToolResult {
     let state = app.state::<AppState>();
     let root = state.project_root.lock().unwrap().clone();
     // A full context, not just a root: a call may reach the database (the
@@ -373,18 +428,19 @@ pub(crate) fn tool_call(app: &AppHandle, tool: bridge::Tool, source: &str) -> br
             .submit_with_ctx(tool.clone(), source, &ctx);
     let Some(id) = approval_id else {
         // Auto-approved (or covered by a session grant): audit and trace.
+        // The spec name, not a literal: the audit trail used to read
+        // `mcp · tool · {"ReadFile":…}`, with the only copy of the tool name
+        // buried in the args blob.
         let _ = db::record_audit(
             &state.conn.lock().unwrap(),
             source,
-            "tool",
+            bridge::spec(&tool).name,
             &serde_json::json!(tool).to_string(),
             true,
             &authorized_by,
             result.ok,
         );
-        if result.ok {
-            record_tool_trace(&state, app, &tool);
-        }
+        record_tool_trace(&state, app, &tool, source, result.ok);
         return result;
     };
     // What the card shows: destructive tools carry resolved absolute paths,
@@ -440,7 +496,7 @@ pub(crate) fn tool_call(app: &AppHandle, tool: bridge::Tool, source: &str) -> br
                 let _ = db::record_audit(
                     &state.conn.lock().unwrap(),
                     &req.source,
-                    "tool",
+                    bridge::spec(&req.tool).name,
                     &serde_json::json!(req.tool).to_string(),
                     false,
                     "timeout",
@@ -546,14 +602,14 @@ fn bridge_approve(
     let _ = db::record_audit(
         &state.conn.lock().unwrap(),
         &req.source,
-        "tool",
+        bridge::spec(&req.tool).name,
         &serde_json::json!(req.tool).to_string(),
         allow,
         if allow { "user" } else { "denied" },
         result.ok,
     );
-    if allow && result.ok {
-        record_tool_trace(&state, &app, &req.tool);
+    if allow {
+        record_tool_trace(&state, &app, &req.tool, &req.source, result.ok);
     }
     if allow {
         if let Some(g) = &grant {
@@ -636,7 +692,17 @@ fn processes_list() -> Vec<process::ProcessEntry> {
 
 /// Record an executed tool call as a trace step, so the live activity
 /// trace and handoff reflect real web-AI work.
-pub(crate) fn record_tool_trace(state: &AppState, app: &AppHandle, tool: &bridge::Tool) {
+///
+/// Called on **every** executed call, successful or not: a failed write is
+/// activity, and a trace that only shows the successes cannot answer "what has
+/// this agent been trying".
+pub(crate) fn record_tool_trace<R: tauri::Runtime>(
+    state: &AppState,
+    app: &AppHandle<R>,
+    tool: &bridge::Tool,
+    source: &str,
+    ok: bool,
+) {
     let Some(kind) = bridge::spec(tool).trace_kind else {
         return;
     };
@@ -656,6 +722,9 @@ pub(crate) fn record_tool_trace(state: &AppState, app: &AppHandle, tool: &bridge
         command.as_deref(),
         None,
         false,
+        bridge::spec(tool).name,
+        Some(source),
+        ok,
     );
     let _ = app.emit(
         "trace://step",
@@ -665,16 +734,20 @@ pub(crate) fn record_tool_trace(state: &AppState, app: &AppHandle, tool: &bridge
             command: command.clone(),
             detail: None,
             confirmed: false,
-            agent: "web".to_string(),
+            // The real source. Hardcoding `web` labelled every desktop-sandbox
+            // call as remote traffic.
+            agent: source.to_string(),
             ts: now_millis(),
         },
     );
     // Web-direction activity: the remote caller is making real tool calls.
-    state
-        .failover
-        .lock()
-        .unwrap()
-        .record_activity(failover::Agent::Web, "tool");
+    if source == bridge::SOURCE_MCP {
+        state
+            .failover
+            .lock()
+            .unwrap()
+            .record_activity(failover::Agent::Web, "tool");
+    }
     if kind == "editing" {
         if let Some(file) = file {
             let mut ring = state.recent_edits.lock().unwrap();
@@ -700,16 +773,30 @@ fn now_millis() -> u64 {
 /// surface is currently exposed, and which `Host` values the endpoint accepts.
 #[derive(Clone, serde::Serialize)]
 struct McpStatus {
+    /// Whether an endpoint is live (a served socket, not merely a start).
     listening: bool,
+    /// Whether a start has been issued and not yet stopped. Diverges from
+    /// `listening` only if the serve loop ends on its own.
+    running: bool,
     endpoint: String,
+    /// The bound port, which is the OS's pick when `0` was configured.
+    port: u16,
+    uptime_secs: u64,
+    /// Why the last start attempt failed, if it did — so the UI can say
+    /// "port in use" instead of an unexplained "offline".
+    bind_error: Option<String>,
     allow_write: bool,
     workspace: Option<String>,
     /// Host authorities the DNS-rebinding guard accepts. Anything else is
     /// answered with a bare `403` — which a remote connector reads as "no MCP
     /// server here" and retries as OAuth. Reported here so a tunnel host that
-    /// is missing from `LEXSUS_MCP_ALLOWED_HOSTS` is visible in the UI rather
-    /// than only in the connector's misleading sign-in error.
+    /// is missing from the allowlist is visible in the UI rather than only in
+    /// the connector's misleading sign-in error.
     allowed_hosts: Vec<String>,
+    /// The user's editable allowlist, without the loopback values the guard
+    /// always adds. This is what the dashboard edits; `allowed_hosts` is what
+    /// is actually enforced.
+    configured_hosts: Vec<String>,
     /// Where the auth token actually lives: `env`, `keyring` or `file`. Worth
     /// showing because the keyring is unavailable on a headless Linux box, and
     /// the user should know which store holds their credential rather than
@@ -728,9 +815,19 @@ struct McpStatus {
 }
 
 fn mcp_status_of(state: &AppState, auth: &auth::Auth) -> McpStatus {
+    let running = state.connector.running();
+    let port = running
+        .as_ref()
+        .map(|r| r.port)
+        .unwrap_or_else(|| state.mcp_port.load(std::sync::atomic::Ordering::SeqCst));
+    let configured = state.mcp_configured_hosts.lock().unwrap().clone();
     McpStatus {
-        listening: state.mcp_listening.load(Ordering::SeqCst),
-        endpoint: format!("http://{}{}", mcp::ADDR, mcp::MCP_PATH),
+        listening: state.connector.is_listening(),
+        running: state.connector.is_running(),
+        endpoint: format!("http://{}:{}{}", mcp::MCP_HOST, port, mcp::MCP_PATH),
+        port,
+        uptime_secs: running.map(|r| r.uptime_secs).unwrap_or(0),
+        bind_error: state.mcp_bind_error.lock().unwrap().clone(),
         allow_write: state.mcp_allow_write.load(Ordering::SeqCst),
         workspace: state
             .project_root
@@ -738,12 +835,61 @@ fn mcp_status_of(state: &AppState, auth: &auth::Auth) -> McpStatus {
             .unwrap()
             .clone()
             .map(|p| p.display().to_string()),
-        allowed_hosts: mcp::effective_allowed_hosts(),
+        allowed_hosts: mcp::effective_allowed_hosts(&configured),
+        configured_hosts: configured,
         auth_backend: auth.backend().as_str().to_string(),
         token_fingerprint: auth.fingerprint(),
         signature_ttl_secs: auth.ttl_secs(),
         signature_required: false,
     }
+}
+
+/// Start the connector from whatever is in state right now.
+///
+/// The one place a start happens, so the desktop button, the auto-start in
+/// `setup` and the restart that applies an allowlist change cannot drift apart.
+/// A failure is recorded in state as well as returned, because `setup` has
+/// nobody to return it to.
+fn start_connector<R: tauri::Runtime>(
+    state: &AppState,
+    app: &AppHandle<R>,
+    auth: &Arc<auth::Auth>,
+) -> Result<u16, String> {
+    let port = state.mcp_port.load(std::sync::atomic::Ordering::SeqCst);
+    let hosts = state.mcp_configured_hosts.lock().unwrap().clone();
+    match state.connector.start(
+        app.clone(),
+        state.mcp_allow_write.clone(),
+        auth.clone(),
+        port,
+        hosts,
+    ) {
+        Ok(bound) => {
+            *state.mcp_bind_error.lock().unwrap() = None;
+            // Persist what was bound, not what was asked for: with port `0` the
+            // OS picks, and recording the pick is what makes the endpoint the
+            // same one on the next launch.
+            state
+                .mcp_port
+                .store(bound, std::sync::atomic::Ordering::SeqCst);
+            let _ = db::set_setting(&state.conn.lock().unwrap(), "mcp_port", &bound.to_string());
+            Ok(bound)
+        }
+        Err(e) => {
+            *state.mcp_bind_error.lock().unwrap() = Some(e.clone());
+            Err(e)
+        }
+    }
+}
+
+/// Stop and start, to apply a change that is baked in at bind time.
+fn restart_connector<R: tauri::Runtime>(
+    state: &AppState,
+    app: &AppHandle<R>,
+    auth: &Arc<auth::Auth>,
+) -> Result<u16, String> {
+    let _ = state.connector.stop();
+    start_connector(state, app, auth)
 }
 
 /// Read the connector state (the desktop polls this on mount).
@@ -752,17 +898,162 @@ fn mcp_status(state: State<'_, AppState>, auth: State<'_, Arc<auth::Auth>>) -> M
     mcp_status_of(&state, &auth)
 }
 
+/// Start the MCP endpoint. Errors rather than silently doing nothing when the
+/// port is taken, so the dashboard can show why.
+#[tauri::command]
+fn mcp_start(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    auth: State<'_, Arc<auth::Auth>>,
+) -> Result<McpStatus, String> {
+    start_connector(&state, &app, &auth)?;
+    let status = mcp_status_of(&state, &auth);
+    let _ = app.emit("mcp://status", &status);
+    Ok(status)
+}
+
+/// Stop the MCP endpoint and release the port.
+///
+/// **Abrupt, and that is the point:** live SSE sessions are severed and any
+/// in-flight `tools/call` is cancelled — including one parked on an approval,
+/// which then resolves to nothing. See [`mcp::Connector::stop`].
+#[tauri::command]
+fn mcp_stop(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    auth: State<'_, Arc<auth::Auth>>,
+) -> Result<McpStatus, String> {
+    state.connector.stop()?;
+    let status = mcp_status_of(&state, &auth);
+    let _ = app.emit("mcp://status", &status);
+    Ok(status)
+}
+
+/// Restart the endpoint: the only way to apply a new port or allowlist, both
+/// of which rmcp consumes when the service is constructed.
+#[tauri::command]
+fn mcp_restart(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    auth: State<'_, Arc<auth::Auth>>,
+) -> Result<McpStatus, String> {
+    restart_connector(&state, &app, &auth)?;
+    let status = mcp_status_of(&state, &auth);
+    let _ = app.emit("mcp://status", &status);
+    Ok(status)
+}
+
+/// Change the port and apply it. Persisted, so the endpoint survives a relaunch.
+#[tauri::command]
+fn mcp_set_port(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    auth: State<'_, Arc<auth::Auth>>,
+    port: u16,
+) -> Result<McpStatus, String> {
+    let previous = state
+        .mcp_port
+        .swap(port, std::sync::atomic::Ordering::SeqCst);
+    if state.connector.is_running() {
+        if let Err(e) = restart_connector(&state, &app, &auth) {
+            // Put the old port back: a failed rebind should not leave the app
+            // configured for a port it could not actually serve on.
+            state
+                .mcp_port
+                .store(previous, std::sync::atomic::Ordering::SeqCst);
+            return Err(e);
+        }
+    } else {
+        let _ = db::set_setting(&state.conn.lock().unwrap(), "mcp_port", &port.to_string());
+    }
+    let status = mcp_status_of(&state, &auth);
+    let _ = app.emit("mcp://status", &status);
+    Ok(status)
+}
+
+/// Replace the allowlist and apply it, restarting the endpoint if it was up.
+///
+/// Restarting costs the connected sessions — rmcp bakes the allowed hosts into
+/// the service when it is built, so there is no way to apply one to a live
+/// server. The UI says so rather than letting a client drop mysteriously.
+#[tauri::command]
+fn mcp_set_allowed_hosts(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    auth: State<'_, Arc<auth::Auth>>,
+    hosts: Vec<String>,
+) -> Result<McpStatus, String> {
+    let status = apply_allowed_hosts(&state, &app, &auth, hosts)?;
+    let _ = app.emit("mcp://status", &status);
+    Ok(status)
+}
+
+/// The shared apply path for the editable allowlist: normalise, persist, and
+/// restart the connector if it was up. Used by the dashboard command and by
+/// the tunnel watcher, so a discovered host and a typed host cannot behave
+/// differently.
+fn apply_allowed_hosts<R: tauri::Runtime>(
+    state: &AppState,
+    app: &AppHandle<R>,
+    auth: &Arc<auth::Auth>,
+    hosts: Vec<String>,
+) -> Result<McpStatus, String> {
+    let normalised = normalise_hosts(hosts);
+    {
+        let mut current = state.mcp_configured_hosts.lock().unwrap();
+        if *current == normalised {
+            return Ok(mcp_status_of(state, auth));
+        }
+        *current = normalised.clone();
+    }
+    let _ = db::set_setting(
+        &state.conn.lock().unwrap(),
+        "mcp_allowed_hosts",
+        &serde_json::json!(normalised).to_string(),
+    );
+    if state.connector.is_running() {
+        restart_connector(state, app, auth)?;
+    }
+    Ok(mcp_status_of(state, auth))
+}
+
+/// Normalise host values on the way in: a stray scheme, path or port in a
+/// host value silently never matches a `Host` header, which is the failure
+/// this whole path exists to make visible.
+fn normalise_hosts(hosts: Vec<String>) -> Vec<String> {
+    hosts
+        .into_iter()
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .map(|h| {
+            let without_scheme = h.split_once("://").map(|(_, rest)| rest).unwrap_or(&h);
+            let authority = without_scheme
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or(without_scheme);
+            let host = authority.split(':').next().unwrap_or(authority);
+            host.trim_end_matches('.').to_string()
+        })
+        .filter(|h| !h.is_empty())
+        .collect()
+}
+
 /// Open or close the connector's write surface at runtime. This is the only
 /// thing that moves `allow_write`, which seeds from `LEXSUS_MCP_ALLOW_WRITE`
 /// at launch and is otherwise read-only-first.
 #[tauri::command]
 fn mcp_set_allow_write(
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
     auth: State<'_, Arc<auth::Auth>>,
     enabled: bool,
 ) -> McpStatus {
     state.mcp_allow_write.store(enabled, Ordering::SeqCst);
-    mcp_status_of(&state, &auth)
+    let status = mcp_status_of(&state, &auth);
+    // Announced like every other state change, so the rail and status bar stay
+    // in step with a toggle made in the dashboard.
+    let _ = app.emit("mcp://status", &status);
+    status
 }
 
 /// Hand the connector's bearer token to the desktop so the user can copy it
@@ -797,6 +1088,232 @@ fn mcp_rotate_token(
 fn set_objective(state: State<'_, AppState>, text: String) -> Result<(), String> {
     *state.objective.lock().unwrap() = Some(text);
     Ok(())
+}
+
+// --- public tunnel -----------------------------------------------------------
+
+/// Which tunnel tools this machine has, so the UI offers what will work.
+#[tauri::command]
+fn tunnel_detect(state: State<'_, AppState>) -> Vec<tunnel::Detection> {
+    let port = state.mcp_port.load(std::sync::atomic::Ordering::SeqCst);
+    tunnel::Tunnel::detect(port)
+}
+
+#[tauri::command]
+fn tunnel_status(state: State<'_, AppState>) -> tunnel::TunnelStatus {
+    state.tunnel.status()
+}
+
+/// Start a tunnel to the connector and allowlist whatever host it publishes.
+///
+/// **This is the one action in the app that can put a local tool server on the
+/// internet**, so it is explicit and never automatic. The connector itself is
+/// unchanged by it: the bearer token is still required on every request, so a
+/// tunnel widens reachability, not authority. The endpoint must already be up —
+/// a tunnel to a port nothing is listening on would publish a URL that only
+/// ever 502s.
+///
+/// Returns as soon as the process is spawned. The public URL is not known until
+/// the provider prints it, which is why this also spawns a watcher: when the
+/// host arrives it is appended to the allowlist, persisted, and the connector
+/// restarts to apply it (rmcp bakes the allowlist in at construction).
+#[tauri::command]
+fn tunnel_start(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    auth: State<'_, Arc<auth::Auth>>,
+    provider: String,
+    command: Option<String>,
+) -> Result<tunnel::TunnelStatus, String> {
+    if !state.connector.is_listening() {
+        return Err("the MCP connector is not running — start it before exposing it".to_string());
+    }
+    let port = state.mcp_port.load(std::sync::atomic::Ordering::SeqCst);
+    let status = state
+        .tunnel
+        .start(app.clone(), &provider, command.as_deref(), port)?;
+
+    // Watch for the host to be discovered, then allowlist it. The tunnel's
+    // reader threads emit `tunnel://update`; this waits on the state instead of
+    // subscribing, so it works whichever thread wins the race. The `Arc` is
+    // cloned out of the `State` because the watcher outlives the command, and
+    // a `State` handle does not.
+    let app_for_watch = app.clone();
+    let auth_for_watch: Arc<auth::Auth> = auth.inner().clone();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(45);
+        while Instant::now() < deadline {
+            let Some(state) = app_for_watch.try_state::<AppState>() else {
+                return;
+            };
+            let tunnel_state = state.tunnel.status();
+            if !tunnel_state.running {
+                return; // exited on its own; the tunnel log already says so
+            }
+            let Some(host) = tunnel_state.host else {
+                drop(state);
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            };
+            let already = state.mcp_configured_hosts.lock().unwrap().contains(&host);
+            if already {
+                return;
+            }
+            let mut hosts = state.mcp_configured_hosts.lock().unwrap().clone();
+            hosts.push(host.clone());
+            // The same path the dashboard's edit takes, so the restart that
+            // applies a discovered host cannot behave differently from a typed
+            // one.
+            if let Err(e) = apply_allowed_hosts(&state, &app_for_watch, &auth_for_watch, hosts) {
+                eprintln!("[tunnel] could not allowlist {host}: {e}");
+            }
+            return;
+        }
+    });
+
+    Ok(status)
+}
+
+/// Stop the tunnel. Idempotent, and called on quit too, so a tunnel can never
+/// outlive the window that opened it.
+///
+/// Also withdraws the tunnel's discovered host from the allowlist, so a URL
+/// that is no longer being forwarded stops being accepted — a stale host in a
+/// DNS-rebinding allowlist is reachability nobody is guarding any more.
+#[tauri::command]
+fn tunnel_stop(state: State<'_, AppState>, app: tauri::AppHandle) -> tunnel::TunnelStatus {
+    let host = state.tunnel.status().host;
+    let status = state.tunnel.stop();
+    let _ = app.emit(tunnel::UPDATE_EVENT, ());
+    if let Some(host) = host {
+        let mut hosts = state.mcp_configured_hosts.lock().unwrap().clone();
+        if hosts.iter().any(|h| h == &host) {
+            hosts.retain(|h| h != &host);
+            let auth: Arc<auth::Auth> = app.state::<Arc<auth::Auth>>().inner().clone();
+            if let Err(e) = apply_allowed_hosts(&state, &app, &auth, hosts) {
+                eprintln!("[tunnel] could not withdraw {host} from the allowlist: {e}");
+            }
+        }
+    }
+    status
+}
+
+// --- activity ----------------------------------------------------------------
+
+/// The tool catalogue, derived from `SPECS` so it cannot drift from the engine
+/// that actually enforces it.
+fn tool_surface() -> ToolSurface {
+    let specs = bridge::SPECS;
+    let mut groups: Vec<CountEntry> = Vec::new();
+    let mut approvals: Vec<CountEntry> = Vec::new();
+    let mut kinds: Vec<CountEntry> = Vec::new();
+    for spec in specs {
+        bump(&mut groups, spec.group);
+        bump(&mut approvals, approval_name(spec.approval));
+        bump(&mut kinds, spec.trace_kind.unwrap_or("untraced"));
+    }
+    sort_desc(&mut groups);
+    sort_desc(&mut approvals);
+    sort_desc(&mut kinds);
+    // The read/write split is the MCP surface partition, not the approval
+    // class: READ_ONLY is what a connector sees while writes are off, and
+    // WRITE is the rest. Reusing `exposed_names` means the catalogue cannot
+    // drift from the gate that actually enforces it.
+    let read_only = mcp::exposed_names(false).len();
+    let write = mcp::exposed_names(true).len() - read_only;
+    ToolSurface {
+        total: specs.len(),
+        read_only,
+        write,
+        groups,
+        approvals,
+        kinds,
+    }
+}
+
+fn approval_name(approval: bridge::Approval) -> &'static str {
+    match approval {
+        bridge::Approval::Auto => "Auto",
+        bridge::Approval::SensitivePathOnly => "SensitivePathOnly",
+        bridge::Approval::Always => "Always",
+        bridge::Approval::Destructive => "Destructive",
+    }
+}
+
+#[derive(Clone, serde::Serialize)]
+struct CountEntry {
+    name: String,
+    count: usize,
+}
+
+fn bump(entries: &mut Vec<CountEntry>, name: &str) {
+    match entries.iter_mut().find(|e| e.name == name) {
+        Some(entry) => entry.count += 1,
+        None => entries.push(CountEntry {
+            name: name.to_string(),
+            count: 1,
+        }),
+    }
+}
+
+fn sort_desc(entries: &mut [CountEntry]) {
+    entries.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+}
+
+#[derive(Clone, serde::Serialize)]
+struct ToolSurface {
+    total: usize,
+    read_only: usize,
+    write: usize,
+    groups: Vec<CountEntry>,
+    approvals: Vec<CountEntry>,
+    kinds: Vec<CountEntry>,
+}
+
+/// Recent trace steps, newest first — read back from the database so the
+/// activity history survives a reload. The live `trace://step` event is a
+/// stream, not a record; this is the record.
+#[tauri::command]
+fn activity_trace(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<db::TraceRow>, String> {
+    db::recent_trace(&state.conn.lock().unwrap(), limit.unwrap_or(200)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn activity_stats(state: State<'_, AppState>) -> Result<db::ActivityStats, String> {
+    db::activity_stats(&state.conn.lock().unwrap()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn activity_tool_usage(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<db::ToolUsage>, String> {
+    db::tool_usage(&state.conn.lock().unwrap(), limit.unwrap_or(50)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn activity_files(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<db::FileTouch>, String> {
+    db::file_touches(&state.conn.lock().unwrap(), limit.unwrap_or(50)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn activity_commands(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<db::CommandRun>, String> {
+    db::command_history(&state.conn.lock().unwrap(), limit.unwrap_or(50)).map_err(|e| e.to_string())
+}
+
+/// The static half of the dashboard: the tool surface, which is code, not data.
+#[tauri::command]
+fn activity_tool_surface() -> ToolSurface {
+    tool_surface()
 }
 
 /// Handoff card payload, built from persisted trace state + (optionally)
@@ -1162,7 +1679,11 @@ pub fn run() {
             // Read-only first: the connector exposes no write tool until the
             // desktop flips it live (or `LEXSUS_MCP_ALLOW_WRITE` seeds it on).
             mcp_allow_write: Arc::new(AtomicBool::new(mcp_allow_write_seed())),
-            mcp_listening: Arc::new(AtomicBool::new(false)),
+            connector: mcp::Connector::new(),
+            tunnel: tunnel::Tunnel::new(),
+            mcp_port: AtomicU16::new(mcp::DEFAULT_PORT),
+            mcp_configured_hosts: Mutex::new(Vec::new()),
+            mcp_bind_error: Mutex::new(None),
             bgproc: bgproc::Manager::new(),
             active_worktree: Mutex::new(None),
             lsp_clients: Mutex::new(HashMap::new()),
@@ -1189,6 +1710,23 @@ pub fn run() {
             let state = app.state::<AppState>();
             *state.conn.lock().unwrap() = conn;
             *state.project_root.lock().unwrap() = root.map(PathBuf::from);
+            // Persisted connector config: the port and the editable allowlist
+            // the user chose last time, so a relaunch comes back on the same
+            // endpoint and still accepts the same tunnel host.
+            let persisted_port = db::get_setting(&state.conn.lock().unwrap(), "mcp_port")
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<u16>().ok())
+                .unwrap_or(mcp::DEFAULT_PORT);
+            state
+                .mcp_port
+                .store(persisted_port, std::sync::atomic::Ordering::SeqCst);
+            let persisted_hosts = db::get_setting(&state.conn.lock().unwrap(), "mcp_allowed_hosts")
+                .ok()
+                .flatten()
+                .and_then(|v| serde_json::from_str::<Vec<String>>(&v).ok())
+                .unwrap_or_default();
+            *state.mcp_configured_hosts.lock().unwrap() = persisted_hosts;
             spawn_failover_ticker(app.handle().clone());
             // The durable endpoint: a desktop-local MCP server on loopback,
             // which a provider connector reaches through a tunnel.
@@ -1201,12 +1739,10 @@ pub fn run() {
             let auth = auth::Auth::load_or_init(&dir)
                 .map_err(|e| format!("refusing to start the MCP endpoint unauthenticated: {e}"))?;
             app.manage(auth.clone());
-            mcp::spawn_server(
-                app.handle().clone(),
-                state.mcp_allow_write.clone(),
-                state.mcp_listening.clone(),
-                auth,
-            );
+            // Auto-start from persisted config, preserving the read-only-first
+            // posture. A bind failure is recorded in state (and reported by
+            // `mcp_status`) rather than printed to stderr and forgotten.
+            let _ = start_connector(&state, app.handle(), &auth);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1235,9 +1771,24 @@ pub fn run() {
             cancel_request,
             processes_list,
             mcp_status,
+            mcp_start,
+            mcp_stop,
+            mcp_restart,
+            mcp_set_port,
+            mcp_set_allowed_hosts,
             mcp_set_allow_write,
             mcp_reveal_token,
             mcp_rotate_token,
+            tunnel_detect,
+            tunnel_start,
+            tunnel_stop,
+            tunnel_status,
+            activity_trace,
+            activity_stats,
+            activity_tool_usage,
+            activity_files,
+            activity_commands,
+            activity_tool_surface,
             set_objective,
             build_handoff,
             failover_status,
@@ -1262,6 +1813,11 @@ pub fn run() {
             // exiting without ever running it.
             if let Some(state) = handle.try_state::<AppState>() {
                 state.bgproc.kill_all();
+                // Stop the connector and any public tunnel before the window
+                // goes away: a tunnel must never outlive the app that opened
+                // it, and the connector thread should be joined, not detached.
+                let _ = state.connector.stop();
+                let _ = state.tunnel.stop();
             }
         }
     });

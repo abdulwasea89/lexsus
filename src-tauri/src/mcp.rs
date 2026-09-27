@@ -28,7 +28,7 @@ use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, Runtime};
 
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -36,10 +36,15 @@ use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
 
-/// Loopback bind address for the connector's MCP endpoint. Bound to loopback
-/// only, which is the security posture; reaching it from anywhere else is an
-/// explicit opt-in (`LEXSUS_MCP_ALLOWED_HOSTS`).
-pub const ADDR: &str = "127.0.0.1:45147";
+/// Loopback interface the connector binds. Bound to loopback only, which is
+/// the security posture; reaching it from anywhere else is an explicit opt-in
+/// (a tunnel host in the allowlist).
+pub const MCP_HOST: &str = "127.0.0.1";
+/// The port the connector binds unless the desktop has configured another.
+/// Configurable at runtime, persisted in settings, and reported through
+/// `McpStatus` — the endpoint a user pastes into their MCP host has to be the
+/// one actually bound.
+pub const DEFAULT_PORT: u16 = 45147;
 /// MCP endpoints are usually mounted under `/mcp`.
 pub const MCP_PATH: &str = "/mcp";
 /// How long an MCP-originated call waits for the desktop approval. Kept well
@@ -203,12 +208,19 @@ fn mcp_tool(name: &'static str) -> Option<Tool> {
 /// constant, so the exposed surface reflects the current policy without a
 /// reconnect.
 #[derive(Clone)]
-struct LexsusServer {
-    app: AppHandle,
+/// One MCP session's view of the engine.
+///
+/// Generic over the Tauri runtime rather than pinned to `Wry` so the server
+/// can be driven in a test over `tauri::test`'s mock runtime — which is the
+/// only way to exercise the connector's real bind/serve/shutdown path without
+/// opening a window. Nothing here depends on which runtime it is; the handle
+/// is only ever passed through to `crate::tool_call`.
+struct LexsusServer<R: Runtime> {
+    app: AppHandle<R>,
     allow_write: Arc<AtomicBool>,
 }
 
-impl ServerHandler for LexsusServer {
+impl<R: Runtime> ServerHandler for LexsusServer<R> {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
@@ -382,7 +394,7 @@ fn continue_work_text(handoff: &crate::Handoff) -> String {
 }
 
 /// Build the `continue_work` prompt — the effectful half of the pair.
-fn continue_work_prompt(app: &AppHandle) -> Result<GetPromptResult, McpError> {
+fn continue_work_prompt<R: Runtime>(app: &AppHandle<R>) -> Result<GetPromptResult, McpError> {
     let state = app.state::<crate::AppState>();
     let handoff = crate::build_handoff_impl(&state)
         .map_err(|e| McpError::internal_error(format!("could not build the handoff: {e}"), None))?;
@@ -470,6 +482,10 @@ pub fn cap_text(text: &str) -> String {
 /// forwards its own `Host`, so reaching the endpoint through one means either
 /// listing that host here or rewriting `Host` at the proxy. Loopback is always
 /// allowed and is the default; anything beyond it is opt-in, never hardcoded.
+///
+/// The environment remains the headless/CI path. The desktop's editable list
+/// ([`effective_allowed_hosts`]'s `configured` argument) is the one the UI
+/// drives; both are additive, and neither can ever remove loopback.
 fn allowed_hosts_from_env() -> Vec<String> {
     std::env::var("LEXSUS_MCP_ALLOWED_HOSTS")
         .unwrap_or_default()
@@ -484,23 +500,38 @@ fn allowed_hosts_from_env() -> Vec<String> {
 /// stateless calls (SEP-2567) rather than text/event-stream where possible,
 /// plus whichever hosts the DNS-rebinding guard should accept.
 ///
-/// Rebuilt on demand rather than shared, so [`effective_allowed_hosts`] can
-/// report the enforced list without a second, hand-maintained copy of rmcp's
-/// loopback defaults drifting away from the ones `serve` passes in.
-fn server_config() -> StreamableHttpServerConfig {
+/// Rebuilt on demand rather than shared, so a `mcp_status` caller can report
+/// the list `serve` was handed without a second, hand-maintained copy of
+/// rmcp's loopback defaults drifting away from it.
+///
+/// **The returned config is consumed once**, at `StreamableHttpService::new`.
+/// Changing the allowlist therefore requires the connector to be restarted —
+/// which is why the desktop restarts it when the list changes rather than
+/// pretending the change took effect.
+fn server_config(allowed_hosts: &[String]) -> StreamableHttpServerConfig {
     let mut config = StreamableHttpServerConfig::default();
     config.json_response = true;
-    config.allowed_hosts.extend(allowed_hosts_from_env());
+    config.allowed_hosts.extend(allowed_hosts.iter().cloned());
     config
 }
 
 /// Host authorities the DNS-rebinding guard accepts, in the order rmcp checks
-/// them. Surfaced through `mcp_status` because a tunnel whose host is missing
-/// here is answered with a bare `403` — which a connector reads as "no MCP
-/// server here" and falls back to OAuth, blaming the sign-in service for what
-/// is really a Host mismatch.
-pub fn effective_allowed_hosts() -> Vec<String> {
-    server_config().allowed_hosts
+/// them: rmcp's loopback defaults, then the environment, then whatever the
+/// desktop has configured. Surfaced through `McpStatus` because a tunnel host
+/// that is missing here is answered with a bare `403` — which a connector reads
+/// as "no MCP server here" and falls back to OAuth, blaming the sign-in service
+/// for what is really a `Host` mismatch.
+pub fn effective_allowed_hosts(configured: &[String]) -> Vec<String> {
+    let mut hosts = server_config(&[]).allowed_hosts;
+    for host in allowed_hosts_from_env()
+        .into_iter()
+        .chain(configured.iter().cloned())
+    {
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    hosts
 }
 
 /// Ceiling on a buffered request body. Comfortably above the largest a tool
@@ -685,38 +716,214 @@ fn plain(status: StatusCode, body: String) -> Response {
     response
 }
 
-/// Bind and serve the MCP endpoint forever. Runs on its own tokio runtime on
-/// a detached thread (the same pattern as the rest of the core's background
-/// work) so it never interferes with the Tauri event loop, and its
-/// blocking-pool wait for approvals cannot stall anything else. `listening`
-/// is flipped once the loopback socket is actually bound.
-pub fn spawn_server(
-    app: AppHandle,
-    allow_write: Arc<AtomicBool>,
+/// The connector's lifecycle: a running endpoint, or the reason there isn't
+/// one.
+///
+/// The server used to be fire-and-forget — spawned once from `setup` and
+/// unreachable afterwards, with a bind failure visible only as a line on
+/// stderr and a `listening` flag stuck at false. Owning the thread here lets
+/// the desktop start, stop, re-port and re-allowlist the endpoint, and makes
+/// the failure modes say what went wrong.
+///
+/// Every method takes `&self` and locks only for the bookkeeping, so a caller
+/// holding `State<'_, AppState>` can drive it without borrowing gymnastics.
+pub struct Connector {
+    /// Whether the loopback socket is bound right now.
+    ///
+    /// Distinct from [`Connector::is_running`], which is true from the moment
+    /// `start` returns. The two diverge if the serve loop ends on its own — an
+    /// accept error, say — leaving a handle behind and no socket under it, and
+    /// the UI is entitled to tell those apart.
     listening: Arc<AtomicBool>,
-    auth: Arc<Auth>,
-) {
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("mcp")
-            .build()
-            .expect("mcp tokio runtime");
-        rt.block_on(async move {
-            if let Err(e) = serve(app, allow_write, listening, auth).await {
-                eprintln!("[mcp] server exited: {e}");
-            }
-        });
-    });
+    running: std::sync::Mutex<Option<Running>>,
 }
 
-async fn serve(
-    app: AppHandle,
+impl Default for Connector {
+    fn default() -> Self {
+        Self {
+            listening: Arc::new(AtomicBool::new(false)),
+            running: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+/// A live endpoint. Dropping this does **not** stop the server — [`Connector::stop`]
+/// is the only thing that does, so an accidental drop cannot silently take the
+/// endpoint down. `Connector::drop` calls it for the exiting-app case.
+struct Running {
+    /// Fires the `select!` in [`serve`]; sending it is the stop.
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    thread: std::thread::JoinHandle<()>,
+    /// The port actually bound, which is the OS's choice when `0` was asked
+    /// for. Reported rather than assumed, so the endpoint shown in the UI is
+    /// the one really listening.
+    port: u16,
+    started_at: std::time::Instant,
+}
+
+/// What a caller needs to know about a running (or stopped) endpoint.
+#[derive(Clone)]
+pub struct RunningInfo {
+    pub port: u16,
+    pub uptime_secs: u64,
+}
+
+impl Connector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether an endpoint is live right now.
+    pub fn is_running(&self) -> bool {
+        self.running.lock().unwrap().is_some()
+    }
+
+    /// Whether the socket is bound. See the field's note on why this is not
+    /// the same question as [`Connector::is_running`].
+    pub fn is_listening(&self) -> bool {
+        self.listening.load(Ordering::SeqCst)
+    }
+
+    pub fn running(&self) -> Option<RunningInfo> {
+        self.running.lock().unwrap().as_ref().map(|r| RunningInfo {
+            port: r.port,
+            uptime_secs: r.started_at.elapsed().as_secs(),
+        })
+    }
+
+    /// Bind and serve. Returns the port actually bound.
+    ///
+    /// **Waits for the bind** rather than returning once the thread is
+    /// spawned, so "port already in use" reaches the caller as an error it can
+    /// show. Port `0` asks the OS to pick a free port, which is how the tests
+    /// get a socket that cannot collide with a real one.
+    ///
+    /// `auth` is taken here rather than at construction because the connector
+    /// outlives any one run: rotating the token swaps the secret inside the
+    /// same [`Auth`], so a restart is not needed for that — only a change to
+    /// the port or the allowlist needs one, both of which are baked into the
+    /// service this builds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start<R: Runtime>(
+        &self,
+        app: AppHandle<R>,
+        allow_write: Arc<AtomicBool>,
+        auth: Arc<Auth>,
+        port: u16,
+        allowed_hosts: Vec<String>,
+    ) -> Result<u16, String> {
+        if self.is_running() {
+            return Err("the connector is already running".to_string());
+        }
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        // The startup channel is how a bind failure stops being a stderr line.
+        let (startup_tx, startup_rx) = std::sync::mpsc::channel::<Result<u16, String>>();
+        let listening = self.listening.clone();
+
+        let thread = std::thread::Builder::new()
+            .name("mcp".to_string())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .thread_name("mcp")
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let _ = startup_tx.send(Err(format!("cannot start the MCP runtime: {e}")));
+                        return;
+                    }
+                };
+                rt.block_on(async move {
+                    if let Err(e) = serve(
+                        app,
+                        allow_write,
+                        listening,
+                        auth,
+                        port,
+                        allowed_hosts,
+                        startup_tx,
+                        shutdown_rx,
+                    )
+                    .await
+                    {
+                        eprintln!("[mcp] server exited: {e}");
+                    }
+                });
+            })
+            .map_err(|e| format!("cannot spawn the MCP thread: {e}"))?;
+
+        match startup_rx.recv() {
+            Ok(Ok(bound)) => {
+                *self.running.lock().unwrap() = Some(Running {
+                    shutdown: shutdown_tx,
+                    thread,
+                    port: bound,
+                    started_at: std::time::Instant::now(),
+                });
+                Ok(bound)
+            }
+            Ok(Err(e)) => {
+                // The thread already reported; let it finish so the runtime
+                // and its socket are fully wound down before we return.
+                let _ = thread.join();
+                Err(e)
+            }
+            Err(_) => {
+                let _ = thread.join();
+                Err("the connector thread died before it could bind".to_string())
+            }
+        }
+    }
+
+    /// Stop the endpoint and release the port.
+    ///
+    /// **Abrupt, not graceful.** The `select!` in [`serve`] drops the server
+    /// on the shutdown signal, which severs live SSE sessions and cancels any
+    /// in-flight `tools/call` (including one parked on an approval). Graceful
+    /// shutdown is not available here: rmcp serves the GET stream in
+    /// `legacy_session_mode`, and that stream stays open for the session's
+    /// life, so waiting for connections to drain would block until the client
+    /// chose to leave. For a Stop button, cancelling is the point.
+    pub fn stop(&self) -> Result<(), String> {
+        let Some(running) = self.running.lock().unwrap().take() else {
+            return Ok(());
+        };
+        // A send error means the receiver is already gone — the server
+        // stopped on its own, which is the outcome being asked for anyway.
+        let _ = running.shutdown.send(());
+        running
+            .thread
+            .join()
+            .map_err(|_| "the MCP thread panicked while stopping".to_string())
+    }
+}
+
+impl Drop for Connector {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+/// Bind and serve the MCP endpoint until told to stop.
+///
+/// Runs on its own tokio runtime on a dedicated thread (the same pattern as
+/// the rest of the core's background work) so it never interferes with the
+/// Tauri event loop, and its blocking-pool wait for approvals cannot stall
+/// anything else. `listening` is flipped once the loopback socket is actually
+/// bound and back off whenever this returns.
+#[allow(clippy::too_many_arguments)]
+async fn serve<R: Runtime>(
+    app: AppHandle<R>,
     allow_write: Arc<AtomicBool>,
     listening: Arc<AtomicBool>,
     auth: Arc<Auth>,
+    port: u16,
+    allowed_hosts: Vec<String>,
+    startup: std::sync::mpsc::Sender<Result<u16, String>>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
-    let config = server_config();
+    let config = server_config(&allowed_hosts);
     // A fresh handler per connection/session, each sharing the live flag and
     // the app handle.
     let factory = move || {
@@ -725,13 +932,21 @@ async fn serve(
             allow_write: allow_write.clone(),
         })
     };
-    let service: StreamableHttpService<LexsusServer, LocalSessionManager> =
+    let service: StreamableHttpService<LexsusServer<R>, LocalSessionManager> =
         StreamableHttpService::new(factory, Arc::new(LocalSessionManager::default()), config);
 
-    let listener = tokio::net::TcpListener::bind(ADDR).await?;
+    let listener = match tokio::net::TcpListener::bind((MCP_HOST, port)).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            let _ = startup.send(Err(format!("cannot bind {MCP_HOST}:{port}: {e}")));
+            return Ok(());
+        }
+    };
+    let bound = listener.local_addr().map(|a| a.port()).unwrap_or(port);
+    let _ = startup.send(Ok(bound));
     listening.store(true, Ordering::SeqCst);
     eprintln!(
-        "[mcp] listening on http://{ADDR}{MCP_PATH} (auth: {})",
+        "[mcp] listening on http://{MCP_HOST}:{bound}{MCP_PATH} (auth: {})",
         auth.backend().as_str()
     );
     // The canonical endpoint is `/mcp`, but some provider connectors (Claude.ai)
@@ -742,9 +957,18 @@ async fn serve(
     let router = axum::Router::new()
         .nest_service(MCP_PATH, service.clone())
         .route("/", axum::routing::any_service(service));
-    axum::serve(listener, with_auth(router, auth))
-        .await
-        .map_err(|e| std::io::Error::other(e.to_string()))
+    tokio::select! {
+        result = axum::serve(listener, with_auth(router, auth)) => {
+            result.map_err(|e| std::io::Error::other(e.to_string()))?;
+        }
+        _ = shutdown => {
+            eprintln!("[mcp] stopped on request");
+        }
+    }
+    // Both arms land here, so the flag cannot be left claiming a socket that
+    // this call has already released.
+    listening.store(false, Ordering::SeqCst);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -924,19 +1148,149 @@ mod tests {
         }
     }
 
-    /// The loopback defaults are the guard's floor, and
-    /// `LEXSUS_MCP_ALLOWED_HOSTS` may only add to them — never replace them.
-    /// `mcp_status.allowed_hosts` reports exactly this list, so pinning it
-    /// keeps the UI honest about which `Host` values the endpoint answers.
+    /// The loopback defaults are the guard's floor, and neither
+    /// `LEXSUS_MCP_ALLOWED_HOSTS` nor the desktop's configured list may replace
+    /// them — only add. `mcp_status.allowed_hosts` reports exactly this list,
+    /// so pinning it keeps the UI honest about which `Host` values the
+    /// endpoint answers.
     #[test]
     fn loopback_hosts_are_always_allowed() {
-        let hosts = effective_allowed_hosts();
+        let hosts = effective_allowed_hosts(&[]);
         for loopback in ["localhost", "127.0.0.1", "::1"] {
             assert!(
                 hosts.iter().any(|h| h == loopback),
                 "loopback host {loopback} missing from {hosts:?}"
             );
         }
+    }
+
+    /// A configured host is additive, de-duplicated, and cannot evict a
+    /// loopback default — the same property a tunnel host depends on.
+    #[test]
+    fn configured_hosts_are_additive_to_loopback() {
+        let configured = vec!["proof.example.test".to_string()];
+        let hosts = effective_allowed_hosts(&configured);
+        assert!(hosts.iter().any(|h| h == "proof.example.test"));
+        for loopback in ["localhost", "127.0.0.1", "::1"] {
+            assert!(hosts.iter().any(|h| h == loopback));
+        }
+        // Duplicates are not appended twice; the list is what the guard walks.
+        let repeated = effective_allowed_hosts(&[
+            "proof.example.test".to_string(),
+            "proof.example.test".to_string(),
+        ]);
+        assert_eq!(
+            repeated
+                .iter()
+                .filter(|h| *h == "proof.example.test")
+                .count(),
+            1
+        );
+    }
+
+    /// Start, stop, start again on the *same* port. The second bind is the
+    /// assertion that matters: it proves `stop` really released the socket
+    /// rather than only clearing the bookkeeping.
+    #[tokio::test]
+    async fn the_connector_stops_and_rebinds() {
+        let connector = Connector::new();
+        let (app, auth, allow_write) = connector_fixture();
+
+        let port = connector
+            .start(
+                app.clone(),
+                allow_write.clone(),
+                auth.clone(),
+                // Port 0 lets the OS pick, so this cannot collide with a real
+                // running app on 45147.
+                0,
+                Vec::new(),
+            )
+            .expect("first bind");
+        assert!(port > 0, "the OS-assigned port is reported back");
+        assert!(connector.is_running());
+        assert!(connector.is_listening());
+        assert!(connector.running().is_some_and(|r| r.port == port));
+
+        connector.stop().expect("stop");
+        assert!(!connector.is_running());
+        assert!(
+            !connector.is_listening(),
+            "stopping must clear the flag the UI reads"
+        );
+
+        // Rebinding the same port is the real proof of release.
+        let again = connector
+            .start(app, allow_write, auth, port, Vec::new())
+            .expect("rebind on the port just released");
+        assert_eq!(again, port);
+        connector.stop().expect("second stop");
+        assert!(!connector.is_listening());
+    }
+
+    /// A port already held must come back as an error naming the address,
+    /// not as a thread that quietly died — that silent failure is what this
+    /// whole type exists to remove.
+    #[tokio::test]
+    async fn a_held_port_is_reported_not_swallowed() {
+        let held = tokio::net::TcpListener::bind((MCP_HOST, 0))
+            .await
+            .expect("hold a port");
+        let port = held.local_addr().unwrap().port();
+
+        let connector = Connector::new();
+        let (app, auth, allow_write) = connector_fixture();
+        let error = connector
+            .start(app, allow_write, auth, port, Vec::new())
+            .expect_err("binding a held port must fail");
+        assert!(
+            error.contains(&port.to_string()),
+            "unhelpful error: {error}"
+        );
+        assert!(!connector.is_running());
+        assert!(!connector.is_listening());
+    }
+
+    /// Starting twice is refused rather than silently orphaning the first
+    /// server — two listeners on one connector has no meaning.
+    #[tokio::test]
+    async fn a_double_start_is_refused() {
+        let connector = Connector::new();
+        let (app, auth, allow_write) = connector_fixture();
+        connector
+            .start(
+                app.clone(),
+                allow_write.clone(),
+                auth.clone(),
+                0,
+                Vec::new(),
+            )
+            .expect("first bind");
+        let error = connector
+            .start(app, allow_write, auth, 0, Vec::new())
+            .expect_err("already running");
+        assert!(error.contains("already running"), "unexpected: {error}");
+        connector.stop().expect("stop");
+    }
+
+    /// Stopping a connector that was never started is a no-op, so the quit
+    /// path can call it unconditionally.
+    #[test]
+    fn stopping_a_stopped_connector_is_fine() {
+        let connector = Connector::new();
+        assert!(!connector.is_running());
+        connector.stop().expect("stop on a stopped connector");
+        assert!(connector.running().is_none());
+    }
+
+    /// The pieces `Connector::start` needs, built the way the app builds them.
+    fn connector_fixture() -> (
+        AppHandle<tauri::test::MockRuntime>,
+        Arc<Auth>,
+        Arc<AtomicBool>,
+    ) {
+        let app = crate::test_app();
+        (app, Auth::for_tests(), Arc::new(AtomicBool::new(false)))
     }
 
     /// Declaring `outputSchema` is a promise about `structuredContent`, so
