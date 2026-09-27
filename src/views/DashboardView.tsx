@@ -9,6 +9,7 @@ import {
   CopyIcon,
   FileIcon,
   GlobeIcon,
+  Loader2Icon,
   RefreshCwIcon,
   ShieldAlertIcon,
   SquareIcon,
@@ -70,6 +71,7 @@ import {
 import { Input } from "../components/ui/input";
 import { Progress, ProgressLabel } from "../components/ui/progress";
 import { ScrollArea } from "../components/ui/scroll-area";
+import { Skeleton } from "../components/ui/skeleton";
 import { Stat } from "../components/ui/stat";
 import { Switch } from "../components/ui/switch";
 import {
@@ -125,7 +127,7 @@ function Section({
         type="button"
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
-        className="group flex w-full items-start gap-2 rounded-t-xl px-(--card-spacing) text-left"
+        className="group flex w-full items-start gap-2 rounded-t-xl px-(--card-spacing) text-left transition-colors hover:bg-muted/40"
       >
         <span className="flex min-w-0 flex-1 flex-col gap-0.5">
           <span className="flex items-center gap-2 font-heading text-base leading-snug font-medium">
@@ -188,6 +190,7 @@ export default function DashboardView() {
     { provider: string; command?: string } | null
   >(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
   // Debounce the live trace stream: a burst of tool steps is one refresh, not
   // one IPC round-trip per event.
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -212,12 +215,17 @@ export default function DashboardView() {
   }, []);
 
   async function refreshAll() {
-    await Promise.all([
-      refreshActivity(),
-      activityToolSurface().then(setSurface).catch(() => null),
-      tunnelDetect().then(setDetections).catch(() => []),
-      mcpStatus().then(setMcp).catch(() => null),
-    ]);
+    setRefreshing(true);
+    try {
+      await Promise.all([
+        refreshActivity(),
+        activityToolSurface().then(setSurface).catch(() => null),
+        tunnelDetect().then(setDetections).catch(() => []),
+        mcpStatus().then(setMcp).catch(() => null),
+      ]);
+    } finally {
+      setRefreshing(false);
+    }
   }
 
   // Initial load: everything, plus the editable inputs seeded from live state.
@@ -447,10 +455,14 @@ export default function DashboardView() {
         <Button
           size="sm"
           variant="ghost"
+          disabled={refreshing}
           onClick={() => void refreshAll()}
           title="Refresh activity"
         >
-          <RefreshCwIcon className="size-3.5" /> Refresh
+          <RefreshCwIcon
+            className={cn("size-3.5", refreshing && "animate-spin")}
+          />
+          {refreshing ? "Refreshing…" : "Refresh"}
         </Button>
       }
     >
@@ -487,32 +499,40 @@ export default function DashboardView() {
         </div>
 
         {/* KPI strip */}
-        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-6">
-          <Stat
-            label="Tools exposed"
-            value={surface?.total ?? "—"}
-            sub={`${surface?.read_only ?? 0} read-only · ${surface?.write ?? 0} write`}
-            icon={BoxesIcon}
-          />
-          <Stat label="Tool calls" value={stats?.tool_calls ?? "—"} icon={ActivityIcon} />
-          <Stat label="Files read" value={stats?.files_read ?? "—"} icon={BookOpenIcon} />
-          <Stat
-            label="Files written"
-            value={stats?.files_written ?? "—"}
-            icon={SquarePenIcon}
-          />
-          <Stat
-            label="Commands run"
-            value={stats?.commands_run ?? "—"}
-            icon={SquareTerminalIcon}
-          />
-          <Stat
-            label="Failures"
-            value={stats?.failures ?? "—"}
-            sub={`${stats?.denied ?? 0} denied`}
-            icon={CircleAlertIcon}
-          />
-        </div>
+        {surface === null || stats === null ? (
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-6">
+            {Array.from({ length: 6 }).map((_, i) => (
+              <Skeleton key={i} className="h-20 w-full" />
+            ))}
+          </div>
+        ) : (
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-6">
+            <Stat
+              label="Tools exposed"
+              value={surface.total}
+              sub={`${surface.read_only} read-only · ${surface.write} write`}
+              icon={BoxesIcon}
+            />
+            <Stat label="Tool calls" value={stats.tool_calls} icon={ActivityIcon} />
+            <Stat label="Files read" value={stats.files_read} icon={BookOpenIcon} />
+            <Stat
+              label="Files written"
+              value={stats.files_written}
+              icon={SquarePenIcon}
+            />
+            <Stat
+              label="Commands run"
+              value={stats.commands_run}
+              icon={SquareTerminalIcon}
+            />
+            <Stat
+              label="Failures"
+              value={stats.failures}
+              sub={`${stats.denied} denied`}
+              icon={CircleAlertIcon}
+            />
+          </div>
+        )}
 
         {/* Connector + tunnel */}
         <div className="grid gap-3 xl:grid-cols-2">
@@ -552,17 +572,28 @@ export default function DashboardView() {
                   </span>
                   <div className="flex min-w-0 flex-col">
                     <span className="text-sm font-semibold">
-                      {mcp?.running ? "Running" : "Stopped"}
+                      {busy === "connector"
+                        ? mcp?.running
+                          ? "Stopping…"
+                          : "Starting…"
+                        : mcp?.running
+                          ? "Running"
+                          : "Stopped"}
                     </span>
                     <span className="truncate text-[11px] text-muted-foreground">
-                      {mcp?.running
-                        ? mcp.listening
-                          ? `listening on port ${mcp.port}`
-                          : "started, not bound"
-                        : "switch it on to start the local MCP server"}
+                      {busy === "connector"
+                        ? "please wait"
+                        : mcp?.running
+                          ? mcp.listening
+                            ? `listening on port ${mcp.port}`
+                            : "started, not bound"
+                          : "switch it on to start the local MCP server"}
                     </span>
                   </div>
                 </div>
+                {busy === "connector" && (
+                  <Loader2Icon className="size-4 shrink-0 animate-spin text-muted-foreground" />
+                )}
                 <Switch
                   checked={mcp?.running ?? false}
                   onCheckedChange={(on) => {
