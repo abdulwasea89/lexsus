@@ -219,14 +219,22 @@ fn set_project_root(state: State<'_, AppState>, path: String) -> Result<(), Stri
 }
 
 /// Restore the persisted project root (frontend calls on startup).
+///
+/// A root that no longer exists (a deleted or renamed folder) is cleared
+/// rather than returned, so the watcher never tries to watch a missing
+/// directory and the frontend never has to surface "No such file or
+/// directory" to the user.
 #[tauri::command]
 fn get_project_root(state: State<'_, AppState>) -> Result<Option<String>, String> {
-    Ok(state
-        .project_root
-        .lock()
-        .unwrap()
-        .clone()
-        .map(|p| p.display().to_string()))
+    let mut root = state.project_root.lock().unwrap();
+    if let Some(p) = root.as_ref() {
+        if !p.is_dir() {
+            let _ = db::delete_setting(&state.conn.lock().unwrap(), "project_root");
+            *root = None;
+            return Ok(None);
+        }
+    }
+    Ok(root.clone().map(|p| p.display().to_string()))
 }
 
 // --- git panel ---------------------------------------------------------------

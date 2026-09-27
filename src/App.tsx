@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { CircleAlertIcon } from "lucide-react";
 import {
   getProjectRoot,
   mcpStatus,
@@ -24,7 +23,7 @@ import { useApprovals } from "./hooks/useApprovals";
 import { useFailover } from "./hooks/useFailover";
 import { useQuestions } from "./hooks/useQuestions";
 import { useTauriEvent } from "./hooks/useTauriEvent";
-import { Alert, AlertDescription, AlertTitle } from "./components/ui/alert";
+import { toast } from "./components/ui/toast";
 
 const RECENTS_KEY = "lexsus.recentProjects";
 
@@ -53,7 +52,6 @@ function saveRecent(path: string) {
 export default function App() {
   const [projectRoot, setRootInput] = useState("");
   const [restored, setRestored] = useState(false);
-  const [error, setError] = useState("");
   const [mcp, setMcp] = useState<McpStatus | null>(null);
   const [tunnel, setTunnel] = useState<TunnelStatus | null>(null);
   const [recents, setRecents] = useState<string[]>([]);
@@ -85,29 +83,31 @@ export default function App() {
 
   useEffect(() => {
     void (async () => {
-      try {
-        const [saved, connector, tunnelState] = await Promise.all([
-          getProjectRoot(),
-          mcpStatus().catch(() => null),
-          tunnelStatus().catch(() => null),
-        ]);
-        if (saved) {
-          setRootInput(saved);
-          saveRecent(saved);
-          setRecents(loadRecents());
+      const [saved, connector, tunnelState] = await Promise.all([
+        getProjectRoot().catch(() => null),
+        mcpStatus().catch(() => null),
+        tunnelStatus().catch(() => null),
+      ]);
+      setMcp(connector);
+      setTunnel(tunnelState);
+      if (saved) {
+        setRootInput(saved);
+        saveRecent(saved);
+        setRecents(loadRecents());
+        try {
           await startWatch();
-        } else if (isOnboarded()) {
-          // First-run users meet the onboarding stage first; the project
-          // dialog opens when they finish it.
+        } catch {
+          // The saved folder no longer exists (deleted or renamed). Don't
+          // error — clear it and hand back to the project picker.
+          setRootInput("");
           setProjectOpen(true);
         }
-        setMcp(connector);
-        setTunnel(tunnelState);
-      } catch (e) {
-        setError(String(e));
-      } finally {
-        setRestored(true);
+      } else if (isOnboarded()) {
+        // First-run users meet the onboarding stage first; the project
+        // dialog opens when they finish it.
+        setProjectOpen(true);
       }
+      setRestored(true);
     })();
   }, []);
 
@@ -126,12 +126,15 @@ export default function App() {
       const connector = await mcpStatus().catch(() => null);
       if (token !== switchToken.current) return;
       setMcp(connector);
-      setError("");
       saveRecent(path);
       setRecents(loadRecents());
     } catch (e) {
       if (token !== switchToken.current) return;
-      setError(String(e));
+      toast.add({
+        title: "Could not open project",
+        description: String(e),
+        type: "error",
+      });
     }
   }
 
@@ -147,7 +150,11 @@ export default function App() {
         await applyProject(selected);
       }
     } catch (e) {
-      setError(String(e));
+      toast.add({
+        title: "Could not browse",
+        description: String(e),
+        type: "error",
+      });
     }
   }
 
@@ -176,16 +183,6 @@ export default function App() {
           webEvent={webEvent}
           dismiss={dismiss}
         />
-
-        {error && (
-          <Alert variant="destructive" className="m-3 mb-0 anim-pop">
-            <CircleAlertIcon />
-            <AlertTitle>Something went wrong</AlertTitle>
-            <AlertDescription className="font-mono text-xs">
-              {error}
-            </AlertDescription>
-          </Alert>
-        )}
 
         {!restored ? (
           <div className="flex flex-1 items-center justify-center p-8 text-sm text-muted-foreground">
