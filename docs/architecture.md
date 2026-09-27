@@ -4,7 +4,7 @@ Lexsus connects your local coding work to **MCP-capable web AIs** (Claude.ai fir
 
 There is one transport, and four layers behind it.
 
-- **The transport — the native MCP connector.** A desktop-local MCP server (`src-tauri/src/mcp.rs`) bound to loopback on `http://127.0.0.1:45147/mcp`. The web AI calls Lexsus tools through its **own native tool channel**; Lexsus never touches the provider's page.
+- **The transport — the native MCP connector.** A desktop-local MCP server (`src-tauri/src/mcp.rs`) bound to loopback, by default on `http://127.0.0.1:45147/mcp` with the port configurable from the dashboard. The web AI calls Lexsus tools through its **own native tool channel**; Lexsus never touches the provider's page.
 - **Bridge A — Local Agent Capture.** Gathers real project state for the handoff (git, filesystem watcher, Claude Code transcripts, web-AI tool activity). The developer's own terminal (Claude Code) is not hosted or mirrored by the app.
 - **Bridge B — Web AI Coding-Agent Bridge.** The connector above. Its `run_command` output streams live into the app's single read-only terminal.
 
@@ -53,13 +53,22 @@ The connector is deliberately thin. Everything that makes Lexsus safe — approv
 ```
       web AI (Claude.ai, or any MCP host)
                     │  native tool channel
+                    │  (optionally through a public tunnel)
+                    ▼
+   ┌────────────────────────────────────────────┐
+   │ tunnel.rs — UI-managed public tunnel       │
+   │ cloudflared / ngrok / custom, killed on    │
+   │ stop + quit, URL scraped, host allowlisted │
+   └────────────────────────────────────────────┘
+                    │
                     ▼
    ┌────────────────────────────────────────────┐
    │ mcp.rs — rmcp Streamable HTTP              │
-   │ 127.0.0.1:45147/mcp · loopback only        │
+   │ 127.0.0.1:<port>/mcp · loopback only       │
    │ bearer auth + response signing (auth.rs)   │
    │ tools/list gated by the write flag         │
    │ tools/call → parse → tool_call("mcp")      │
+   │ Connector: start / stop / restart / port   │
    └────────────────────────────────────────────┘
                     │
                     ▼
@@ -73,9 +82,13 @@ The connector is deliberately thin. Everything that makes Lexsus safe — approv
             user-approved local workspace
 ```
 
-**Read-only first.** `mcp_allow_write` is an in-memory flag, default off. While it is off, `tools/list` simply does not advertise the write and command tools; flipping it hides or re-exposes them at runtime with no rebuild and no reconnect. It is seeded from `LEXSUS_MCP_ALLOW_WRITE` and toggled live from the Web-AI connector view (`mcp_set_allow_write`). The `mcp_status` command reports `{listening, endpoint, allow_write, workspace, allowed_hosts, auth_backend, token_fingerprint, signature_ttl_secs, signature_required}` to the UI.
+**Read-only first.** `mcp_allow_write` is an in-memory flag, default off. While it is off, `tools/list` simply does not advertise the write and command tools; flipping it hides or re-exposes them at runtime with no rebuild and no reconnect. It is seeded from `LEXSUS_MCP_ALLOW_WRITE` and toggled live from the dashboard (`mcp_set_allow_write`). The `mcp_status` command reports `{running, listening, port, uptime_secs, bind_error, endpoint, allow_write, workspace, allowed_hosts, configured_hosts, auth_backend, token_fingerprint, signature_ttl_secs, signature_required}` to the UI.
 
-**Loopback, and only loopback, by default.** rmcp's DNS-rebinding guard rejects requests whose `Host` it doesn't recognise, and Lexsus accepts loopback hosts out of the box. Because a cloud-hosted provider connects from *its* infrastructure rather than your machine, reaching it requires an explicit HTTPS tunnel — and that tunnel's host must be opted in via `LEXSUS_MCP_ALLOWED_HOSTS` (comma-separated). Nothing beyond loopback is ever hardcoded.
+**Lifecycle is owned, not fire-and-forget.** A `mcp::Connector` holds the running server's shutdown signal, thread and bound port. Start blocks until the bind succeeds, so "port already in use" reaches the UI as `bind_error` instead of a stderr line and a stuck-offline status; port `0` asks the OS for a free port and the bound port is reported back. Stop is abrupt by design — it severs live SSE sessions and cancels in-flight `tools/call` (including one parked on an approval), because graceful shutdown would hang on rmcp's long-lived `legacy_session_mode` GET stream.
+
+**Loopback, and only loopback, by default.** rmcp's DNS-rebinding guard rejects requests whose `Host` it doesn't recognise, and Lexsus accepts loopback hosts out of the box. Because a cloud-hosted provider connects from *its* infrastructure rather than your machine, reaching it requires an explicit HTTPS tunnel — and that tunnel's host must be opted in, now from the dashboard's editable allowlist (`mcp_set_allowed_hosts`). The `LEXSUS_MCP_ALLOWED_HOSTS` environment variable remains as an additive headless/CI override. Nothing beyond loopback is ever hardcoded, and the env list can never remove loopback.
+
+**The tunnel is UI-managed.** The dashboard spawns `cloudflared`, `ngrok` or a custom command, scrapes the first public HTTPS URL out of its output, allowlists the discovered host, and restarts the connector to apply it (rmcp bakes the allowlist into the service at construction). Starting one always requires an explicit consent dialog, a danger badge shows while it is live, and it is killed on Stop, on app exit and on `Drop` — a tunnel can never outlive the window that opened it. The bearer token remains mandatory on every request, so a tunnel widens *reachability*, never *authority*.
 
 **Authenticated, loopback included.** The `Host` guard only holds while the endpoint really is loopback; the moment a tunnel host is allow-listed, the URL is the only thing between a stranger and the read surface. So every request must carry `Authorization: Bearer <token>`, with no bypass for loopback, and every response is signed. One axum middleware over the whole router (`auth.rs`, applied in `mcp.rs`) covers both paths and therefore all 58 tools by construction — `READ_ONLY` and `WRITE` partition `SPECS`, and both pass through it. The token is generated from the OS CSPRNG and kept in the OS keyring, falling back to a `0600` file where no keyring exists (headless Linux); the UI shows which store is live, reveals the token on request, and rotates it without a restart. Request *signatures* are verified strictly when present but never required, because no MCP client can produce one.
 

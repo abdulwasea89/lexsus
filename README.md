@@ -40,7 +40,7 @@ A local-first Tauri + Rust desktop app that turns an **MCP-capable web AI — Cl
 
 |     | Feature                                | What it means for you                                                                                                                                                                                                                                                                                                             |
 | --- | -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 🔌  | **Native MCP connector, not scraping** | Your web AI talks to Lexsus through its **own tool channel** — a desktop-local MCP server on `http://127.0.0.1:45147/mcp`. Native tool UI, native results, no browser extension, no DOM watching, no composer injection.                                                                                                          |
+| 🔌  | **Native MCP connector, not scraping** | Your web AI talks to Lexsus through its **own tool channel** — a desktop-local MCP server on loopback (default `http://127.0.0.1:45147/mcp`, port configurable in the dashboard). Native tool UI, native results, no browser extension, no DOM watching, no composer injection.                                                                                                          |
 | 🔀  | **Handoff, not copy-paste**            | One click packages the real state of your project — objective, decisions, failed attempts, constraints, changed files — into a prompt any web AI can continue from. Facts, not chat.                                                                                                                                              |
 | 🛠️  | **Real coding-agent tools**            | 58 tools executed locally by the Rust core, not simulated in the browser — file reading (chunked) and editing, file management, shell commands (foreground + background), search, full git workflow, project memory, web fetch/search, code intelligence, and agent-loop primitives. See [Tools at a Glance](#tools-at-a-glance). |
 | 👁️  | **Live activity trace**                | Every read, write, and command the web AI performs shows up in real time, cross-checked against the filesystem watcher — nothing is claimed without evidence.                                                                                                                                                                     |
@@ -89,12 +89,12 @@ pnpm install
 pnpm tauri dev
 ```
 
-When the app starts, the connector binds `http://127.0.0.1:45147/mcp` — the status bar shows `connector · ro` (read-only) and the **Web-AI connector** view shows the exact endpoint and bound workspace.
+When the app starts, the connector binds loopback (default `http://127.0.0.1:45147/mcp`) — the status bar shows `connector · ro` (read-only) and the **Dashboard** shows the exact endpoint, bound port, uptime and bound workspace. From there you can Start / Stop / Restart the connector, change its port, and manage the public tunnel.
 
 Connect a web AI:
 
-1. **Claude.ai** — Customize → Connectors → **Add custom connector**, and give it the endpoint. Claude.ai connects from Anthropic's cloud, so in development expose the loopback server through a short-lived HTTPS tunnel (see [docs/connector-native-proof-runbook.md](docs/connector-native-proof-runbook.md)); add that tunnel's host to the DNS-rebinding allowlist (see env vars below), and have the tunnel **inject the bearer header at its edge**, since custom connectors cannot send one.
-2. **A local MCP host** (Claude Code, Claude Desktop, the MCP Inspector) — point it straight at `http://127.0.0.1:45147/mcp` and pass the token as a header. No tunnel needed:
+1. **Claude.ai** — Customize → Connectors → **Add custom connector**, and give it the endpoint. Claude.ai connects from Anthropic's cloud, so expose the loopback server with the dashboard's **Public tunnel** card (Start on `cloudflared`, `ngrok`, or a custom command). The app scrapes the public URL, auto-allowlists the host and restarts the connector — no manual tunnel, no env var, no relaunch. Custom connectors still cannot send a header, so the tunnel must **inject the bearer header at its edge**.
+2. **A local MCP host** (Claude Code, Claude Desktop, the MCP Inspector) — point it straight at the loopback endpoint and pass the token as a header. No tunnel needed:
 
    ```bash
    claude mcp add --transport http lexsus http://127.0.0.1:45147/mcp \
@@ -108,7 +108,7 @@ The connector starts **read-only**. Flip **Allow writes & commands** in the Web-
 | Env var                                            | Purpose                                                                                                      |
 | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `LEXSUS_MCP_ALLOW_WRITE=1`                         | Seed the connector with writes & commands exposed on launch (still approval-gated).                          |
-| `LEXSUS_MCP_ALLOWED_HOSTS=your-tunnel.example.com` | Allowlist additional hosts (e.g. a dev tunnel) for DNS-rebinding protection. Comma-separated, additive only. |
+| `LEXSUS_MCP_ALLOWED_HOSTS=your-tunnel.example.com` | Additive headless/CI override on top of the dashboard's editable allowlist. Comma-separated; never removes loopback. |
 | `LEXSUS_MCP_AUTH_TOKEN=<hex>`                      | Pin the bearer token instead of using the keyring or file. Reported as the `env` backend in the UI.           |
 | `LEXSUS_MCP_SIGNATURE_TTL_SECS=300`                | How far a signed request's timestamp may be from now.                                                        |
 
@@ -153,7 +153,7 @@ Large files come back one chunk at a time as numbered lines, with a footer namin
 
 ## Security Model
 
-- **Loopback-only:** the MCP server binds `127.0.0.1:45147` (see `src-tauri/src/mcp.rs`). Remote hosts are rejected unless explicitly allowlisted via `LEXSUS_MCP_ALLOWED_HOSTS`.
+- **Loopback-only:** the MCP server binds `127.0.0.1` on a configurable port (default `45147`, see `src-tauri/src/mcp.rs`). Remote hosts are rejected unless explicitly allowlisted from the dashboard (or, additively, via `LEXSUS_MCP_ALLOWED_HOSTS`).
 - **Authenticated on every request, loopback included:** a bearer token (`Authorization: Bearer …`) is required with no bypass, so allowlisting a tunnel host does not hand the URL alone the read surface. The token is generated from the OS CSPRNG and kept in the OS keyring, falling back to a `0600` file where there is none; the UI shows which store is live, reveals the token on request, and rotates it without a restart.
 - **Signed responses:** every response carries `X-Lexsus-Signature`, an HMAC the caller can check to detect a tunnel or proxy that altered it. A request signature is verified strictly *when presented* but never required — no MCP client can compute one. This detects tampering; it is not confidentiality past TLS termination.
 - **Read-only first:** write/command tools stay hidden until you opt in, live, from the desktop.
@@ -172,9 +172,9 @@ What's next: hardening the approval/audit surface, completing compression (Layer
 
 | Symptom                           | Likely cause / fix                                                                                                                                         |
 | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Web AI can't reach the endpoint   | Confirm the app is running and bound to `http://127.0.0.1:45147/mcp`; local hosts need no tunnel, Claude.ai cloud needs the HTTPS tunnel from the runbook. |
+| Web AI can't reach the endpoint   | Confirm the connector is running in the dashboard (and note its bound port); local hosts need no tunnel, Claude.ai cloud needs the HTTPS tunnel started from the dashboard. |
 | `401 unauthorized` from the AI    | Every request needs `Authorization: Bearer <token>`. Reveal the token in **Web-AI connector → Connector authentication**; rotate it if it leaked — the old one stops working at once. |
-| Tunnel host rejected              | Add it to `LEXSUS_MCP_ALLOWED_HOSTS` and restart; the allowlist is additive to loopback.                                                                   |
+| Tunnel host rejected              | Start the tunnel from the dashboard so its host is auto-allowlisted, or edit the allowlist there and press **Apply hosts**. The allowlist is additive to loopback. |
 | Write tools not visible to the AI | Flip **Allow writes & commands** in the Web-AI connector view (or launch with `LEXSUS_MCP_ALLOW_WRITE=1`).                                                 |
 | Approval card never resolves      | Check the desktop app is focused — approvals block the tool call until you Allow/Deny.                                                                     |
 | `/compress` returns stub data     | Expected: the compression service is still a stub (see Status above).                                                                                      |

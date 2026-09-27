@@ -181,6 +181,19 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
             ON handoff_requests(session_id, id);
         "#,
     ),
+    (
+        "0007_activity_attribution",
+        r#"
+        -- Additive on an existing database: pre-existing rows keep NULL
+        -- tool/source and ok = 1 (the DEFAULT is applied to them by ALTER).
+        ALTER TABLE trace_steps ADD COLUMN tool   TEXT;
+        ALTER TABLE trace_steps ADD COLUMN source TEXT;              -- mcp | desktop | watcher
+        ALTER TABLE trace_steps ADD COLUMN ok     INTEGER NOT NULL DEFAULT 1;
+
+        CREATE INDEX IF NOT EXISTS idx_trace_steps_tool ON trace_steps(tool);
+        CREATE INDEX IF NOT EXISTS idx_trace_steps_ts   ON trace_steps(ts);
+        "#,
+    ),
 ];
 
 /// Open (or create) the database and apply any pending migrations.
@@ -258,11 +271,24 @@ pub fn record_trace_step(
     command: Option<&str>,
     detail: Option<&str>,
     confirmed: bool,
+    tool: &str,
+    source: Option<&str>,
+    ok: bool,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO trace_steps (session_id, kind, file, command, detail, confirmed)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        (session_id, kind, file, command, detail, confirmed as i64),
+        "INSERT INTO trace_steps (session_id, kind, file, command, detail, confirmed, tool, source, ok)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        (
+            session_id,
+            kind,
+            file,
+            command,
+            detail,
+            confirmed as i64,
+            tool,
+            source,
+            ok as i64,
+        ),
     )?;
     Ok(())
 }
@@ -358,6 +384,247 @@ pub fn trace_stats(conn: &Connection) -> rusqlite::Result<TraceStats> {
         errors,
         steps,
         last_step,
+    })
+}
+
+// --- activity dashboard reads ------------------------------------------------
+
+/// One recent trace step, read back so the activity feed survives a reload.
+/// The live `trace://step` event is a stream, not a record; this is the
+/// record, now carrying attribution (tool, source, outcome).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TraceRow {
+    pub ts: String,
+    pub kind: String,
+    pub tool: Option<String>,
+    pub source: Option<String>,
+    pub file: Option<String>,
+    pub command: Option<String>,
+    pub detail: Option<String>,
+    pub ok: bool,
+}
+
+/// One tool's aggregate usage: how often, how often it failed, when last.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ToolUsage {
+    pub tool: String,
+    pub calls: i64,
+    pub failures: i64,
+    pub last_ts: Option<String>,
+}
+
+/// One file's aggregate activity: reads, writes, when last touched.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FileTouch {
+    pub file: String,
+    pub reads: i64,
+    pub writes: i64,
+    pub last_ts: Option<String>,
+}
+
+/// One command's aggregate history: how many runs and how the last one ended.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CommandRun {
+    pub command: String,
+    pub runs: i64,
+    pub last_ok: bool,
+    pub last_ts: Option<String>,
+}
+
+/// A `kind` bucket for the dashboard's by-kind breakdown.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct KindCount {
+    pub kind: String,
+    pub count: i64,
+}
+
+/// The dashboard's headline numbers, all from the persisted trace + audit.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ActivityStats {
+    pub total: i64,
+    pub tool_calls: i64,
+    pub files_read: i64,
+    pub files_written: i64,
+    pub commands_run: i64,
+    pub failures: i64,
+    pub denied: i64,
+    pub files: i64,
+    pub commands: i64,
+    /// (oldest, newest) trace timestamps, when there is any activity.
+    pub span: Option<(String, String)>,
+    pub by_kind: Vec<KindCount>,
+}
+
+/// Newest-first trace steps with tool/source/outcome, for the recent feed.
+pub fn recent_trace(conn: &Connection, limit: usize) -> rusqlite::Result<Vec<TraceRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT ts, kind, tool, source, file, command, detail, ok
+         FROM trace_steps ORDER BY id DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit as i64], |row| {
+        Ok(TraceRow {
+            ts: row.get(0)?,
+            kind: row.get(1)?,
+            tool: row.get(2)?,
+            source: row.get(3)?,
+            file: row.get(4)?,
+            command: row.get(5)?,
+            detail: row.get(6)?,
+            ok: row.get::<_, i64>(7)? != 0,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Per-tool call counts, failures and last use — the dashboard's top-tools bar.
+pub fn tool_usage(conn: &Connection, limit: usize) -> rusqlite::Result<Vec<ToolUsage>> {
+    let mut stmt = conn.prepare(
+        "SELECT tool,
+                COUNT(*) AS calls,
+                SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS failures,
+                MAX(ts) AS last_ts
+         FROM trace_steps
+         WHERE tool IS NOT NULL
+         GROUP BY tool
+         ORDER BY calls DESC, tool ASC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit as i64], |row| {
+        Ok(ToolUsage {
+            tool: row.get(0)?,
+            calls: row.get(1)?,
+            failures: row.get(2)?,
+            last_ts: row.get(3)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Per-file reads/writes and last touch, newest first.
+pub fn file_touches(conn: &Connection, limit: usize) -> rusqlite::Result<Vec<FileTouch>> {
+    let mut stmt = conn.prepare(
+        "SELECT file,
+                SUM(CASE WHEN kind = 'reading' THEN 1 ELSE 0 END) AS reads,
+                SUM(CASE WHEN kind = 'editing' THEN 1 ELSE 0 END) AS writes,
+                MAX(ts) AS last_ts
+         FROM trace_steps
+         WHERE file IS NOT NULL
+         GROUP BY file
+         ORDER BY MAX(id) DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit as i64], |row| {
+        Ok(FileTouch {
+            file: row.get(0)?,
+            reads: row.get(1)?,
+            writes: row.get(2)?,
+            last_ts: row.get(3)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Command history (kind='running'), grouped and newest first, with the last
+/// run's outcome so the table can say "last one failed" without a second read.
+pub fn command_history(conn: &Connection, limit: usize) -> rusqlite::Result<Vec<CommandRun>> {
+    let mut stmt = conn.prepare(
+        "SELECT t1.command,
+                COUNT(*) AS runs,
+                (SELECT t2.ok FROM trace_steps t2
+                  WHERE t2.kind = 'running' AND t2.command = t1.command
+                  ORDER BY t2.id DESC LIMIT 1) AS last_ok,
+                MAX(t1.ts) AS last_ts
+         FROM trace_steps t1
+         WHERE t1.kind = 'running' AND t1.command IS NOT NULL
+         GROUP BY t1.command
+         ORDER BY MAX(t1.id) DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit as i64], |row| {
+        Ok(CommandRun {
+            command: row.get(0)?,
+            runs: row.get(1)?,
+            last_ok: row.get::<_, i64>(2)? != 0,
+            last_ts: row.get(3)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Headline dashboard numbers, derived from the persisted trace + audit.
+pub fn activity_stats(conn: &Connection) -> rusqlite::Result<ActivityStats> {
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM trace_steps", [], |r| r.get(0))?;
+    let tool_calls: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM trace_steps WHERE tool IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    let files_read: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM trace_steps WHERE kind = 'reading'",
+        [],
+        |r| r.get(0),
+    )?;
+    let files_written: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM trace_steps WHERE kind = 'editing'",
+        [],
+        |r| r.get(0),
+    )?;
+    let commands_run: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM trace_steps WHERE kind = 'running'",
+        [],
+        |r| r.get(0),
+    )?;
+    let failures: i64 =
+        conn.query_row("SELECT COUNT(*) FROM trace_steps WHERE ok = 0", [], |r| {
+            r.get(0)
+        })?;
+    let files: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT file) FROM trace_steps WHERE file IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    let commands: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT command) FROM trace_steps WHERE kind = 'running' AND command IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    let denied: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM audit_log WHERE allowed = 0",
+        [],
+        |r| r.get(0),
+    )?;
+    let span: (Option<String>, Option<String>) =
+        conn.query_row("SELECT MIN(ts), MAX(ts) FROM trace_steps", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+    let span = match span {
+        (Some(oldest), Some(newest)) => Some((oldest, newest)),
+        _ => None,
+    };
+    let mut stmt = conn.prepare(
+        "SELECT kind, COUNT(*) AS n FROM trace_steps
+         GROUP BY kind ORDER BY n DESC, kind ASC",
+    )?;
+    let by_kind = stmt
+        .query_map([], |row| {
+            Ok(KindCount {
+                kind: row.get(0)?,
+                count: row.get(1)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ActivityStats {
+        total,
+        tool_calls,
+        files_read,
+        files_written,
+        commands_run,
+        failures,
+        denied,
+        files,
+        commands,
+        span,
+        by_kind,
     })
 }
 
@@ -1002,6 +1269,19 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{table} does not exist after the upgrade: {e}"));
             assert_eq!(n, 0, "{table} came up non-empty");
         }
+
+        // 0007's attribution columns are present on a database that already
+        // had trace_steps rows, with the additive defaults intact.
+        let cols: Vec<String> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(trace_steps)")
+                .expect("trace_steps survived the upgrade");
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1)).unwrap();
+            rows.collect::<rusqlite::Result<_>>().unwrap()
+        };
+        for col in ["tool", "source", "ok"] {
+            assert!(cols.iter().any(|c| c == col), "0007 lost column {col}");
+        }
         let applied: i64 = conn
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();
@@ -1186,5 +1466,155 @@ mod tests {
         assert_eq!(got.constraints, vec!["original constraint".to_string()]);
         assert_eq!(got.changed_files, vec!["src/orig.rs".to_string()]);
         assert_eq!(got.progress_percent, 10);
+    }
+
+    /// The dashboard reads group, order and count the persisted trace the way
+    /// the UI renders it — and `ok = 0` rows are counted as failures, not
+    /// silently folded into success.
+    #[test]
+    fn activity_reads_group_order_and_count_failures() {
+        let conn = mem();
+
+        let _ = record_trace_step(
+            &conn,
+            None,
+            "reading",
+            Some("src/a.rs"),
+            None,
+            None,
+            false,
+            "read_file",
+            Some("mcp"),
+            true,
+        );
+        let _ = record_trace_step(
+            &conn,
+            None,
+            "reading",
+            Some("src/a.rs"),
+            None,
+            None,
+            false,
+            "read_file",
+            Some("desktop"),
+            true,
+        );
+        let _ = record_trace_step(
+            &conn,
+            None,
+            "editing",
+            Some("src/a.rs"),
+            None,
+            None,
+            false,
+            "edit_file",
+            Some("mcp"),
+            true,
+        );
+        let _ = record_trace_step(
+            &conn,
+            None,
+            "editing",
+            Some("src/b.rs"),
+            None,
+            None,
+            false,
+            "write_file",
+            Some("mcp"),
+            false,
+        );
+        let _ = record_trace_step(
+            &conn,
+            None,
+            "running",
+            None,
+            Some("cargo test"),
+            None,
+            false,
+            "run_command",
+            Some("mcp"),
+            true,
+        );
+        let _ = record_trace_step(
+            &conn,
+            None,
+            "running",
+            None,
+            Some("cargo test"),
+            None,
+            false,
+            "run_command",
+            Some("mcp"),
+            false,
+        );
+        let _ = record_trace_step(
+            &conn,
+            None,
+            "running",
+            None,
+            Some("ls"),
+            None,
+            false,
+            "run_command",
+            Some("desktop"),
+            true,
+        );
+
+        // Tool usage, ordered by call count descending.
+        let tools = tool_usage(&conn, 10).unwrap();
+        assert_eq!(tools.len(), 4);
+        assert_eq!(tools[0].tool, "run_command");
+        assert_eq!(tools[0].calls, 3);
+        assert_eq!(tools[0].failures, 1);
+        assert_eq!(tools[1].tool, "read_file");
+        assert_eq!(tools[1].calls, 2);
+        assert_eq!(tools[1].failures, 0);
+
+        // File touches: per-file reads/writes, newest touch first.
+        let files = file_touches(&conn, 10).unwrap();
+        assert_eq!(files.len(), 2);
+        let a = files.iter().find(|f| f.file == "src/a.rs").unwrap();
+        assert_eq!(a.reads, 2);
+        assert_eq!(a.writes, 1);
+        let b = files.iter().find(|f| f.file == "src/b.rs").unwrap();
+        assert_eq!(b.reads, 0);
+        assert_eq!(b.writes, 1);
+
+        // Command history: grouped, newest first, last outcome carried.
+        let cmds = command_history(&conn, 10).unwrap();
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds[0].command, "ls");
+        assert_eq!(cmds[0].runs, 1);
+        assert!(cmds[0].last_ok);
+        let cargo = cmds.iter().find(|c| c.command == "cargo test").unwrap();
+        assert_eq!(cargo.runs, 2);
+        assert!(!cargo.last_ok, "the last cargo test run failed");
+
+        // Headline stats over the same rows.
+        let stats = activity_stats(&conn).unwrap();
+        assert_eq!(stats.total, 7);
+        assert_eq!(stats.tool_calls, 7);
+        assert_eq!(stats.files_read, 2);
+        assert_eq!(stats.files_written, 2);
+        assert_eq!(stats.commands_run, 3);
+        assert_eq!(stats.failures, 2);
+        assert_eq!(stats.files, 2);
+        assert_eq!(stats.commands, 2);
+        assert!(stats.span.is_some());
+    }
+
+    /// 0007 adds its three columns, with the `ok` default that keeps
+    /// pre-existing rows counted as successes rather than NULL.
+    #[test]
+    fn migration_0007_columns_exist() {
+        let conn = mem();
+        let cols: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(trace_steps)").unwrap();
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1)).unwrap();
+            rows.collect::<rusqlite::Result<_>>().unwrap()
+        };
+        for col in ["tool", "source", "ok"] {
+            assert!(cols.iter().any(|c| c == col), "missing column {col}");
+        }
     }
 }

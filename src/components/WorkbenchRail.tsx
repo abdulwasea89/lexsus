@@ -5,14 +5,16 @@ import {
   FolderOpenIcon,
   GitBranchIcon,
   GlobeIcon,
+  LayoutDashboardIcon,
   MessageCircleIcon,
   MoonIcon,
   PanelLeftCloseIcon,
   PanelLeftIcon,
+  ShieldAlertIcon,
   SunIcon,
 } from "lucide-react";
 import { toggleTheme, useTheme } from "../hooks/useTheme";
-import type { McpStatus } from "../lib/types";
+import type { McpStatus, TunnelStatus } from "../lib/types";
 import { cn } from "../lib/utils";
 import {
   Tooltip,
@@ -20,7 +22,13 @@ import {
   TooltipTrigger,
 } from "./ui/tooltip";
 
-export type View = "trace" | "git" | "handoff" | "memory" | "bridge";
+export type View =
+  | "dashboard"
+  | "trace"
+  | "git"
+  | "handoff"
+  | "memory"
+  | "bridge";
 
 const RAIL_KEY = "lexsus.railOpen";
 
@@ -30,6 +38,12 @@ const NAV: {
   hint: string;
   icon: typeof ActivityIcon;
 }[] = [
+  {
+    view: "dashboard",
+    label: "Dashboard",
+    hint: "Connector lifecycle, public tunnel and activity at a glance.",
+    icon: LayoutDashboardIcon,
+  },
   {
     view: "trace",
     label: "Live activity trace",
@@ -66,6 +80,7 @@ interface WorkbenchRailProps {
   view: View;
   onViewChange: (view: View) => void;
   connector: McpStatus | null;
+  tunnel: TunnelStatus | null;
   onOpenProject: () => void;
 }
 
@@ -80,6 +95,7 @@ export default function WorkbenchRail({
   view,
   onViewChange,
   connector,
+  tunnel,
   onOpenProject,
 }: WorkbenchRailProps) {
   const [open, setOpen] = useState(
@@ -265,6 +281,35 @@ export default function WorkbenchRail({
           icon: FolderOpenIcon,
           onClick: onOpenProject,
         })}
+
+        {tunnel?.running && (
+          <Tooltip>
+            <TooltipTrigger delay={200} render={
+              <span
+                aria-label="Public tunnel live"
+                className="relative flex h-9 w-full items-center text-xs text-danger"
+              >
+                <span className={iconSlot}>
+                  <ShieldAlertIcon className="size-4" />
+                </span>
+                <span className={cn(reveal, "relative z-10 font-normal")}>
+                  <span className={revealInner}>Publicly reachable</span>
+                </span>
+              </span>
+            } />
+            <TooltipContent
+              side="right"
+              sideOffset={10}
+              className="max-w-52 flex-col items-start gap-0.5"
+            >
+              <span className="font-medium">Tunnel live</span>
+              <span className="text-background/70">
+                The connector is reachable from the internet. Stop it in the
+                dashboard.
+              </span>
+            </TooltipContent>
+          </Tooltip>
+        )}
 
         <Tooltip>
           <TooltipTrigger delay={200} render={

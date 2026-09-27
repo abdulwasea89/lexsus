@@ -6,12 +6,14 @@ import {
   mcpStatus,
   setProjectRoot,
   startWatch,
+  tunnelStatus,
 } from "./lib/bridge";
-import type { McpStatus } from "./lib/types";
+import type { McpStatus, TunnelStatus } from "./lib/types";
 import ApprovalBanner from "./components/ApprovalBanner";
 import ErrorBoundary from "./components/ErrorBoundary";
 import GrantsBar from "./components/GrantsBar";
 import BridgeView from "./views/BridgeView";
+import DashboardView from "./views/DashboardView";
 import FailoverBanner from "./components/FailoverBanner";
 import GitView from "./views/GitView";
 import HandoffView from "./views/HandoffView";
@@ -28,14 +30,23 @@ import { isOnboarded } from "./lib/onboarding";
 import { useApprovals } from "./hooks/useApprovals";
 import { useFailover } from "./hooks/useFailover";
 import { useQuestions } from "./hooks/useQuestions";
+import { useTauriEvent } from "./hooks/useTauriEvent";
 import { Alert, AlertDescription, AlertTitle } from "./components/ui/alert";
 import GettingStarted from "./components/GettingStarted";
 
 const RECENTS_KEY = "lexsus.recentProjects";
 const VIEW_KEY = "lexsus.view";
-const VIEWS: View[] = ["trace", "git", "handoff", "memory", "bridge"];
+const VIEWS: View[] = [
+  "dashboard",
+  "trace",
+  "git",
+  "handoff",
+  "memory",
+  "bridge",
+];
 
 const VIEW_LABELS: Record<View, string> = {
+  dashboard: "Dashboard",
   trace: "Live activity trace",
   git: "Git",
   handoff: "Handoff",
@@ -63,7 +74,7 @@ function saveRecent(path: string) {
 
 function loadView(): View {
   const v = localStorage.getItem(VIEW_KEY) as View | null;
-  return v && VIEWS.includes(v) ? v : "trace";
+  return v && VIEWS.includes(v) ? v : "dashboard";
 }
 
 /**
@@ -76,6 +87,7 @@ export default function App() {
   const [restored, setRestored] = useState(false);
   const [error, setError] = useState("");
   const [mcp, setMcp] = useState<McpStatus | null>(null);
+  const [tunnel, setTunnel] = useState<TunnelStatus | null>(null);
   const [recents, setRecents] = useState<string[]>([]);
   const [view, setView] = useState<View>(loadView);
   const [projectOpen, setProjectOpen] = useState(false);
@@ -111,9 +123,10 @@ export default function App() {
   useEffect(() => {
     void (async () => {
       try {
-        const [saved, connector] = await Promise.all([
+        const [saved, connector, tunnelState] = await Promise.all([
           getProjectRoot(),
           mcpStatus().catch(() => null),
+          tunnelStatus().catch(() => null),
         ]);
         if (saved) {
           setRootInput(saved);
@@ -126,6 +139,7 @@ export default function App() {
           setProjectOpen(true);
         }
         setMcp(connector);
+        setTunnel(tunnelState);
       } catch (e) {
         setError(String(e));
       } finally {
@@ -133,6 +147,13 @@ export default function App() {
       }
     })();
   }, []);
+
+  // Keep the rail/statusbar in step with lifecycle changes made anywhere (the
+  // dashboard, the bridge view, a tunnel discovering its URL).
+  useTauriEvent<McpStatus>("mcp://status", (payload) => setMcp(payload));
+  useTauriEvent<null>("tunnel://update", () => {
+    void tunnelStatus().then(setTunnel).catch(() => null);
+  });
 
   async function applyProject(path: string) {
     const token = ++switchToken.current;
@@ -188,6 +209,7 @@ export default function App() {
           view={view}
           onViewChange={setView}
           connector={mcp}
+          tunnel={tunnel}
           onOpenProject={() => setProjectOpen(true)}
         />
 
@@ -238,6 +260,7 @@ export default function App() {
               {view !== "trace" && (
                 <ErrorBoundary key={view} label={VIEW_LABELS[view]}>
                   <div className="h-full anim-fade-up">
+                    {view === "dashboard" && <DashboardView />}
                     {view === "git" && <GitView />}
                     {view === "handoff" && <HandoffView />}
                     {view === "memory" && <MemoryView />}
@@ -249,7 +272,12 @@ export default function App() {
           </div>
         )}
 
-        <Statusbar projectRoot={projectRoot} connector={mcp} status={status} />
+        <Statusbar
+          projectRoot={projectRoot}
+          connector={mcp}
+          tunnel={tunnel}
+          status={status}
+        />
       </main>
 
       <ProjectDialog
