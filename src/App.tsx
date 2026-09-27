@@ -136,15 +136,14 @@ export default function App() {
     } catch (e) {
       if (token !== switchToken.current) return;
       const msg = String(e);
-      // The most common case: a recent folder was moved or deleted. Drop it
-      // from recents and say so plainly instead of a cryptic OS error.
-      if (msg.includes("not a directory") || msg.includes("No such file")) {
+      // A folder that no longer resolves: drop it from recents and say so.
+      if (msg.includes("does not exist") || msg.includes("is not a folder")) {
         removeRecent(path);
         setRecents(loadRecents());
         setRootInput("");
         toast.add({
           title: "Folder not found",
-          description: `${path} is not a folder anymore — pick another project.`,
+          description: msg,
           type: "error",
         });
       } else {

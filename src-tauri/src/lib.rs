@@ -205,17 +205,23 @@ fn init_database(state: State<'_, AppState>, db_path: String) -> Result<Vec<Stri
 /// Set the project folder this app monitors (persisted).
 #[tauri::command]
 fn set_project_root(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    // Trim stray whitespace/newlines a picker or paste may have included;
-    // `is_dir` follows symlinks, so a symlinked folder still counts.
-    let p = std::path::PathBuf::from(path.trim());
-    if !p.is_dir() {
-        return Err(format!("not a directory: {}", p.display()));
+    // Trim stray whitespace/newlines a picker or paste may have included.
+    let requested = std::path::PathBuf::from(path.trim());
+    // Resolve to the real path (follows symlinks, normalises `.`/`..`) and
+    // fail with the OS's own reason when it cannot be resolved. Storing the
+    // canonical path means the watcher and every containment check operate on
+    // the real directory rather than a symlink or relative form.
+    let canonical = requested
+        .canonicalize()
+        .map_err(|e| format!("{} does not exist: {e}", requested.display()))?;
+    if !canonical.is_dir() {
+        return Err(format!("{} is not a folder", requested.display()));
     }
-    *state.project_root.lock().unwrap() = Some(p.clone());
+    *state.project_root.lock().unwrap() = Some(canonical.clone());
     let _ = db::set_setting(
         &state.conn.lock().unwrap(),
         "project_root",
-        &p.display().to_string(),
+        &canonical.display().to_string(),
     );
     Ok(())
 }
