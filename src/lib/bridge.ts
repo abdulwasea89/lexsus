@@ -7,6 +7,7 @@ import type {
   BridgeTool,
   CommandRun,
   CommitInfo,
+  DashboardActivity,
   FailoverLogEntry,
   FailoverStatus,
   FactsSnapshot,
@@ -244,6 +245,11 @@ export function activityCommands(limit?: number): Promise<CommandRun[]> {
 
 export function activityToolSurface(): Promise<ToolSurface> {
   return invoke("activity_tool_surface");
+}
+
+/** Stats + tools + files + commands + recent + audit in one IPC round-trip. */
+export function dashboardActivity(): Promise<DashboardActivity> {
+  return invoke("dashboard_activity");
 }
 
 export function setObjective(text: string): Promise<void> {

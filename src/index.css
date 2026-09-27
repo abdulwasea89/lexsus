@@ -38,18 +38,15 @@ body {
   font-weight: 600;
 }
 
-/* Translucent chrome — content blurs and tints underneath */
+/* Structural chrome. Solid rather than blurred: `backdrop-filter` is
+   expensive on Linux/software-rendered Tauri windows and made the whole
+   app feel laggy, so these stay opaque and rely on surface color + border. */
 .glass {
-  background: color-mix(in oklab, var(--surface) 78%, transparent);
-  backdrop-filter: blur(20px) saturate(160%);
-  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  background: var(--surface);
 }
 
-/* Heavier material for structural regions (rail, statusbar) */
 .glass-sidebar {
-  background: color-mix(in oklab, var(--surface) 88%, transparent);
-  backdrop-filter: blur(24px) saturate(140%);
-  -webkit-backdrop-filter: blur(24px) saturate(140%);
+  background: var(--surface);
 }
 
 /* Feedback on pointer-down, not release */

@@ -19,13 +19,8 @@ import {
   XIcon,
 } from "lucide-react";
 import {
-  activityCommands,
-  activityFiles,
-  activityStats,
   activityToolSurface,
-  activityToolUsage,
-  activityTrace,
-  bridgeAudit,
+  dashboardActivity,
   mcpRestart,
   mcpSetAllowWrite,
   mcpSetAllowedHosts,
@@ -201,21 +196,18 @@ export default function DashboardView({
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const refreshActivity = useCallback(async () => {
-    const [s, tu, f, c, r, au, t] = await Promise.all([
-      activityStats().catch(() => null),
-      activityToolUsage(20).catch(() => []),
-      activityFiles(50).catch(() => []),
-      activityCommands(50).catch(() => []),
-      activityTrace(200).catch(() => []),
-      bridgeAudit(50).catch(() => []),
+    const [snap, t] = await Promise.all([
+      dashboardActivity().catch(() => null),
       tunnelStatus().catch(() => null),
     ]);
-    setStats(s);
-    setTools(tu);
-    setFiles(f);
-    setCommands(c);
-    setRecent(r);
-    setAudit(au);
+    if (snap) {
+      setStats(snap.stats);
+      setTools(snap.tools);
+      setFiles(snap.files);
+      setCommands(snap.commands);
+      setRecent(snap.recent);
+      setAudit(snap.audit);
+    }
     if (t) setTunnel(t);
   }, []);
 
@@ -262,11 +254,11 @@ export default function DashboardView({
   });
   useTauriEvent<TraceStep>("trace://step", () => {
     if (refreshTimer.current) clearTimeout(refreshTimer.current);
-    refreshTimer.current = setTimeout(() => void refreshActivity(), 250);
+    refreshTimer.current = setTimeout(() => void refreshActivity(), 1_000);
   });
 
   useEffect(() => {
-    const id = setInterval(() => void refreshActivity(), 15_000);
+    const id = setInterval(() => void refreshActivity(), 30_000);
     return () => {
       clearInterval(id);
       if (refreshTimer.current) clearTimeout(refreshTimer.current);

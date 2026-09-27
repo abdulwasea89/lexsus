@@ -334,6 +334,16 @@ export interface CommandRun {
   last_ts: string | null;
 }
 
+/** One round-trip payload for the dashboard's whole activity half. */
+export interface DashboardActivity {
+  stats: ActivityStats;
+  tools: ToolUsage[];
+  files: FileTouch[];
+  commands: CommandRun[];
+  recent: TraceRow[];
+  audit: AuditEntry[];
+}
+
 // --- failover ----------------------------------------------------------------
 
 /** Failover state machines for both directions (local → web, web AI). */

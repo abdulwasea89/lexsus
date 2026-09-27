@@ -1333,6 +1333,34 @@ fn activity_tool_surface() -> ToolSurface {
     tool_surface()
 }
 
+/// Everything the dashboard's activity half needs, in one round-trip.
+///
+/// The live dashboard used to issue seven separate IPC calls on every
+/// refresh, each re-locking the shared connection. One command reads all of it
+/// under a single lock, which keeps the UI smooth when activity is streaming.
+#[derive(Clone, serde::Serialize)]
+struct DashboardActivity {
+    stats: db::ActivityStats,
+    tools: Vec<db::ToolUsage>,
+    files: Vec<db::FileTouch>,
+    commands: Vec<db::CommandRun>,
+    recent: Vec<db::TraceRow>,
+    audit: Vec<db::AuditEntry>,
+}
+
+#[tauri::command]
+fn dashboard_activity(state: State<'_, AppState>) -> Result<DashboardActivity, String> {
+    let conn = state.conn.lock().unwrap();
+    Ok(DashboardActivity {
+        stats: db::activity_stats(&conn).map_err(|e| e.to_string())?,
+        tools: db::tool_usage(&conn, 20).map_err(|e| e.to_string())?,
+        files: db::file_touches(&conn, 50).map_err(|e| e.to_string())?,
+        commands: db::command_history(&conn, 50).map_err(|e| e.to_string())?,
+        recent: db::recent_trace(&conn, 200).map_err(|e| e.to_string())?,
+        audit: db::last_audit(&conn, 50).map_err(|e| e.to_string())?,
+    })
+}
+
 /// Handoff card payload, built from persisted trace state + (optionally)
 /// the developer's own Claude Code transcript for real task context.
 #[derive(Clone, serde::Serialize)]
@@ -1807,6 +1835,7 @@ pub fn run() {
             activity_files,
             activity_commands,
             activity_tool_surface,
+            dashboard_activity,
             set_objective,
             build_handoff,
             failover_status,
