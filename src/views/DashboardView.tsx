@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   ActivityIcon,
+  BookOpenIcon,
+  BoxesIcon,
   CheckIcon,
   ChevronDownIcon,
   CircleAlertIcon,
@@ -10,6 +12,7 @@ import {
   RefreshCwIcon,
   ShieldAlertIcon,
   SquareIcon,
+  SquarePenIcon,
   SquareTerminalIcon,
   XIcon,
 } from "lucide-react";
@@ -143,6 +146,26 @@ function Section({
   );
 }
 
+function EmptyHint({
+  icon: Icon,
+  title,
+  desc,
+}: {
+  icon: typeof ActivityIcon;
+  title: string;
+  desc: string;
+}) {
+  return (
+    <div className="flex flex-col items-center gap-1.5 rounded-lg border border-dashed border-border/70 px-4 py-6 text-center">
+      <Icon className="size-5 text-muted-foreground/50" />
+      <p className="text-xs font-medium">{title}</p>
+      <p className="max-w-56 text-[11px] leading-relaxed text-muted-foreground">
+        {desc}
+      </p>
+    </div>
+  );
+}
+
 /** The control surface: connector lifecycle, tunnel, tool surface, activity. */
 export default function DashboardView() {
   const [mcp, setMcp] = useState<McpStatus | null>(null);
@@ -182,6 +205,15 @@ export default function DashboardView() {
     setRecent(r);
     if (t) setTunnel(t);
   }, []);
+
+  async function refreshAll() {
+    await Promise.all([
+      refreshActivity(),
+      activityToolSurface().then(setSurface).catch(() => null),
+      tunnelDetect().then(setDetections).catch(() => []),
+      mcpStatus().then(setMcp).catch(() => null),
+    ]);
+  }
 
   // Initial load: everything, plus the editable inputs seeded from live state.
   useEffect(() => {
@@ -401,34 +433,45 @@ export default function DashboardView() {
       icon={ActivityIcon}
       title="Dashboard"
       description="connector lifecycle · public tunnel · activity at a glance"
+      actions={
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={() => void refreshAll()}
+          title="Refresh activity"
+        >
+          <RefreshCwIcon className="size-3.5" /> Refresh
+        </Button>
+      }
     >
       <div className="flex flex-col gap-3">
         {/* Trust signals — privacy/security posture up front, never buried. */}
-        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border/60 bg-surface-2/50 px-3 py-2 text-[11px] text-muted-foreground">
-          <span className="inline-flex items-center gap-1.5">
+        <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+          <span className="inline-flex items-center gap-1.5 rounded-full border border-success/30 bg-success/10 px-2.5 py-1 text-success">
             <span className="size-1.5 rounded-full bg-success" />
             Loopback only
           </span>
-          <span className="text-muted-foreground/40">·</span>
-          <span className="inline-flex items-center gap-1.5">
+          <span className="inline-flex items-center gap-1.5 rounded-full border border-border/60 bg-surface-2/50 px-2.5 py-1 text-muted-foreground">
             <ShieldAlertIcon className="size-3" />
             Bearer token required
           </span>
-          <span className="text-muted-foreground/40">·</span>
-          <span className="inline-flex items-center gap-1.5">
-            {mcp?.allow_write ? (
-              <>
-                <span className="size-1.5 rounded-full bg-warning" />
-                Read/write enabled
-              </>
-            ) : (
-              <>
-                <span className="size-1.5 rounded-full bg-success" />
-                Read-only first
-              </>
+          <span
+            className={cn(
+              "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1",
+              mcp?.allow_write
+                ? "border-warning/30 bg-warning/10 text-warning"
+                : "border-success/30 bg-success/10 text-success",
             )}
+          >
+            <span
+              className={cn(
+                "size-1.5 rounded-full",
+                mcp?.allow_write ? "bg-warning" : "bg-success",
+              )}
+            />
+            {mcp?.allow_write ? "Read/write enabled" : "Read-only first"}
           </span>
-          <span className="ml-auto hidden font-mono text-muted-foreground sm:inline">
+          <span className="ml-auto hidden truncate font-mono text-muted-foreground sm:inline">
             {mcp?.workspace ? mcp.workspace.split(/[\\/]/).pop() : "no project bound"}
           </span>
         </div>
@@ -439,15 +482,25 @@ export default function DashboardView() {
             label="Tools exposed"
             value={surface?.total ?? "—"}
             sub={`${surface?.read_only ?? 0} read-only · ${surface?.write ?? 0} write`}
+            icon={BoxesIcon}
           />
-          <Stat label="Tool calls" value={stats?.tool_calls ?? "—"} />
-          <Stat label="Files read" value={stats?.files_read ?? "—"} />
-          <Stat label="Files written" value={stats?.files_written ?? "—"} />
-          <Stat label="Commands run" value={stats?.commands_run ?? "—"} />
+          <Stat label="Tool calls" value={stats?.tool_calls ?? "—"} icon={ActivityIcon} />
+          <Stat label="Files read" value={stats?.files_read ?? "—"} icon={BookOpenIcon} />
+          <Stat
+            label="Files written"
+            value={stats?.files_written ?? "—"}
+            icon={SquarePenIcon}
+          />
+          <Stat
+            label="Commands run"
+            value={stats?.commands_run ?? "—"}
+            icon={SquareTerminalIcon}
+          />
           <Stat
             label="Failures"
             value={stats?.failures ?? "—"}
             sub={`${stats?.denied ?? 0} denied`}
+            icon={CircleAlertIcon}
           />
         </div>
 
@@ -465,16 +518,28 @@ export default function DashboardView() {
             </CardHeader>
             <CardContent className="flex flex-col gap-3">
               {/* The one control that matters most: a single power switch. */}
-              <div className="flex items-center justify-between rounded-lg border border-border/60 bg-background/60 px-3 py-3">
+              <div
+                className={cn(
+                  "flex items-center justify-between rounded-xl border px-3 py-3 transition-colors duration-200",
+                  mcp?.listening
+                    ? "border-success/30 bg-success/5"
+                    : "border-border/60 bg-background/60",
+                )}
+              >
                 <div className="flex min-w-0 items-center gap-3">
                   <span
                     className={cn(
-                      "size-2.5 shrink-0 rounded-full",
-                      mcp?.listening
-                        ? "bg-success anim-pulse"
-                        : "bg-muted-foreground/40",
+                      "relative flex size-3 shrink-0 items-center justify-center rounded-full",
+                      mcp?.listening ? "bg-success/20" : "bg-muted-foreground/10",
                     )}
-                  />
+                  >
+                    <span
+                      className={cn(
+                        "size-1.5 rounded-full",
+                        mcp?.listening ? "bg-success anim-pulse" : "bg-muted-foreground/50",
+                      )}
+                    />
+                  </span>
                   <div className="flex min-w-0 flex-col">
                     <span className="text-sm font-semibold">
                       {mcp?.running ? "Running" : "Stopped"}
@@ -718,6 +783,11 @@ export default function DashboardView() {
         <Section
           title="Tool surface"
           description="Derived from the engine's SPECS — the catalogue cannot drift from what the connector actually exposes."
+          badge={
+            <Badge variant="outline" className="font-mono text-[10px]">
+              {surface?.total ?? 0} tools
+            </Badge>
+          }
         >
           <div className="grid gap-4 md:grid-cols-2">
             <div className="flex flex-col gap-1.5 md:col-span-2">
@@ -808,10 +878,19 @@ export default function DashboardView() {
                 <FileIcon className="size-4 text-muted-foreground" /> Files
               </>
             }
-            description={`${stats?.files ?? 0} distinct files · reads vs writes`}
+            description="reads vs writes per path"
+            badge={
+              <Badge variant="outline" className="font-mono text-[10px]">
+                {stats?.files ?? 0}
+              </Badge>
+            }
           >
               {files.length === 0 ? (
-                <p className="text-xs text-muted-foreground">No files yet.</p>
+                <EmptyHint
+                  icon={FileIcon}
+                  title="No files yet"
+                  desc="Files the AI reads or writes will show up here."
+                />
               ) : (
                 <ScrollArea className="h-56 min-h-0">
                   <Table>
@@ -854,12 +933,19 @@ export default function DashboardView() {
                 <SquareTerminalIcon className="size-4 text-muted-foreground" /> Commands
               </>
             }
-            description={`${stats?.commands ?? 0} distinct commands · last outcome`}
+            description="runs and last outcome"
+            badge={
+              <Badge variant="outline" className="font-mono text-[10px]">
+                {stats?.commands ?? 0}
+              </Badge>
+            }
           >
               {commands.length === 0 ? (
-                <p className="text-xs text-muted-foreground">
-                  No commands run yet.
-                </p>
+                <EmptyHint
+                  icon={SquareTerminalIcon}
+                  title="No commands yet"
+                  desc="Shell commands the AI runs will appear here."
+                />
               ) : (
                 <ScrollArea className="h-56 min-h-0">
                   <Table>
@@ -916,9 +1002,11 @@ export default function DashboardView() {
           </CardHeader>
           <CardContent>
             {recent.length === 0 ? (
-              <p className="text-xs text-muted-foreground">
-                No activity recorded yet.
-              </p>
+              <EmptyHint
+                icon={ActivityIcon}
+                title="No activity yet"
+                desc="Tool calls stream in here as the AI works."
+              />
             ) : (
               <ScrollArea className="h-56 min-h-0">
                 <Table>
