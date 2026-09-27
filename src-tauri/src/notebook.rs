@@ -99,11 +99,12 @@ fn index_of(cells: &[serde_json::Value], handle: &str) -> Option<usize> {
 }
 
 fn parse(raw: &str) -> Result<serde_json::Value, NotebookError> {
-    let doc: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
-        NotebookError::Invalid(format!("not valid JSON: {e}"))
-    })?;
+    let doc: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| NotebookError::Invalid(format!("not valid JSON: {e}")))?;
     if !doc.is_object() {
-        return Err(NotebookError::Invalid("notebook is not a JSON object".into()));
+        return Err(NotebookError::Invalid(
+            "notebook is not a JSON object".into(),
+        ));
     }
     if doc.get("cells").and_then(|c| c.as_array()).is_none() {
         return Err(NotebookError::Invalid(
@@ -176,7 +177,8 @@ pub fn edit(
     let cells = doc["cells"]
         .as_array_mut()
         .ok_or_else(|| NotebookError::Invalid("no `cells` array".into()))?;
-    let idx = index_of(cells, cell_id).ok_or_else(|| NotebookError::NoSuchCell(cell_id.to_string()))?;
+    let idx =
+        index_of(cells, cell_id).ok_or_else(|| NotebookError::NoSuchCell(cell_id.to_string()))?;
 
     // A new notebook-type cell type is validated here, not silently written.
     let resolved_type = match cell_type {
