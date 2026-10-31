@@ -184,15 +184,17 @@ What's next: hardening the approval/audit surface, completing compression (Layer
 ```
 ├── src/                    # React + TypeScript frontend (Tauri shell)
 ├── src-tauri/              # Rust core — git2, portable-pty, notify, rusqlite, native MCP server
+│   ├── .cargo/config.toml  # build-output footprint control (see the file header)
 │   └── src/
 │       ├── mcp.rs          # the connector: rmcp Streamable HTTP on loopback
-│       └── bridge.rs       # tool engine: SPECS registry, policy, approvals, audit
+│       └── bridge/         # tool engine
+│           ├── mod.rs      # Tool enum, results, approval policy, execute()
+│           ├── specs.rs    # the SPECS registry — single source of truth
+│           └── schema.rs   # parse_tool_call + the tools/list JSON Schemas
 ├── compression-service/    # Optional Python FastAPI context compression (Layer 3)
 ├── docs/                   # Architecture, connector protocol, tech stack, UI design, tool roadmap
 ├── requirements/           # Product requirements, MVP scope, trade-offs
 ├── ongoing/                # Active work logs and runbooks
-├── extension/              # Browser-extension prototype artifacts
-├── scripts/                # Dev utilities (spec sync checks, tunnel helpers)
 └── public/                 # Static web assets
 ```
 
@@ -205,7 +207,7 @@ Reading the docs in this order takes you from "what is this" to "how the wire wo
 | 1   | [docs/architecture.md](docs/architecture.md)                                     | The connector and the four layers                                           |
 | 2   | [docs/tech-stack.md](docs/tech-stack.md)                                         | Tauri + Rust systems stack, security rationale                              |
 | 3   | [docs/protocol-v2.md](docs/protocol-v2.md)                                       | Connector protocol, tool schemas, approvals, error codes, sequence diagrams |
-| 4   | [docs/ui-design.md](docs/ui-design.md)                                           | The control-center UI: activity trace, terminal, git panel                  |
+| 4   | [docs/ui-design.md](docs/ui-design.md)                                           | The dashboard: connector, tunnel, OAuth clients, tool surface, activity     |
 | 5   | [docs/tool-roadmap.md](docs/tool-roadmap.md)                                     | The tool surface, phase by phase: built vs planned, and the invariants      |
 | 6   | [docs/connector-native-proof-runbook.md](docs/connector-native-proof-runbook.md) | Exposing the connector and proving natively with Claude.ai                  |
 | 7   | [requirements/product-requirements.md](requirements/product-requirements.md)     | Product & MVP scope, success criteria                                       |

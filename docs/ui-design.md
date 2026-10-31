@@ -1,108 +1,106 @@
-# UI Design — The Desktop Control Center
+# UI Design — The Dashboard
 
-The desktop app is the **control center** — one place where you see everything happening to your work. It combines a live activity trace, a single command terminal (the web AI's), and a full git workflow, all correlated in a single timeline, with the connector's state and every approval gate in the same window.
+The desktop app is a **single dashboard**. One window answers the only three questions that matter while a web AI is acting as a coding agent on your machine: *is it connected, what is it doing to my files, and what do I approve?*
 
-## Control Center Layout
+There is no navigation rail and no view switcher. An earlier iteration had a rail with five views (activity trace, git, handoff, project memory, connector) plus a read-only terminal; commit `31758dc` folded that into one dashboard and the separate views were removed. The git, terminal, LSP, handoff and memory capabilities did not go with them — they remain MCP tools the web AI calls, and the `git_*` commands remain on the Tauri IPC surface. What changed is that the desktop app no longer duplicates surfaces the connector already owns.
+
+## Layout
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│  RAIL          │  MAIN PANEL                                      │
-│                │  ┌──────────────────────┬──────────────────────┐  │
-│  Activity      │  │  COMMAND TERMINAL    │  LIVE ACTIVITY TRACE │  │
-│  Git           │  │  $ npm test          │  ▾ Refactor auth     │  │
-│  Handoff       │  │  PASS auth.test.ts   │      Reading auth.ts │  │
-│  Memory        │  │                      │      Editing auth.ts │  │
-│  Connector     │  │                      │      ▾ npm test      │  │
-│                │  └──────────────────────┴──────────────────────┘  │
-│  ────────────  │  ┌─────────────────────────────────────────────┐  │
-│  Project &     │  │  APPROVAL BANNER (only when a call waits)   │  │
-│   connector    │  │  source · summary · Allow / Deny · grant    │  │
-│  Connector ·   │  └─────────────────────────────────────────────┘  │
-│   read-only    │                                                  │
-│                │  STATUS BAR: myapp · local working · web working │
-│                │              · connector · ro · terminal idle    │
-└────────────────┴──────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│ ● ● ●   AI Continuity Bridge                              ☾  ⤢  ✕   │  titlebar (frameless)
+├──────────────────────────────────────────────────────────────────────┤
+│  APPROVAL BANNER   — only while a call is waiting on you             │
+│  QUESTION BANNER   — ask_user / propose_plan cards                  │
+│  GRANTS BAR        — revocable grants + the pause kill switch       │
+│  FAILOVER BANNER   — stalled / interrupted / ws_drop alerts         │
+├──────────────────────────────────────────────────────────────────────┤
+│  Dashboard                                          [Refresh]       │
+│  ┌────┐┌────┐┌────┐┌────┐┌────┐┌────┐                             │
+│  │Tools││Calls││Read││Write││Cmds││Fail│  KPI strip                 │
+│  └────┘└────┘└────┘└────┘└────┘└────┘                             │
+│                                                                      │
+│  ┌──────────────────────────────────────────────┐                    │
+│  │  MCP connector              [power] [ro/rw] │                    │
+│  │  http://127.0.0.1:45147/mcp          [copy]  │                    │
+│  │  port · allowed hosts · read-only switch     │                    │
+│  └──────────────────────────────────────────────┘                    │
+│  ┌──────────────────────────────────────────────┐                    │
+│  │  Public tunnel                     [start]   │                    │
+│  └──────────────────────────────────────────────┘                    │
+│                                                                      │
+│  ▾ OAuth clients ────────────────────────────────────────  collapsed │
+│  ▾ Tool surface ─────────────────────────────────────────  collapsed │
+│  ▾ Activity by kind ────────────────────────────────────  collapsed │
+│  ▾ Files ───────────────────────────────────────────────  collapsed │
+│  ▾ Commands ────────────────────────────────────────────  collapsed │
+│  ▸ Audit trail ──────────────────────────────────────────  collapsed │
+│  ┌──────────────────────────────────────────────┐                    │
+│  │  Recent activity                              │  always visible  │
+│  └──────────────────────────────────────────────┘                    │
+├──────────────────────────────────────────────────────────────────────┤
+│  myapp · local working · web working · connector · rw · online      │  statusbar
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Rail:** the app's navigation — Live activity trace, Git, Handoff, Project memory, Web-AI connector — plus **Project & connector** (folder picker + endpoint) at the bottom. Collapsible to icons only.
-- **Live Activity Trace:** real-time tree of every web-AI action.
-- **Command Terminal:** the single terminal in the app — a read-only live view of every command the web AI runs.
-- **Approval Banner:** the gate. It appears above the panes only when a call is waiting on you.
-- **Status Bar:** project, failover states, connector state, terminal state.
+## The four banners
 
-## Project & Connector
+They sit above the dashboard and are the only things that can interrupt it. Each appears only when it has something to say, so a quiet session shows none of them.
 
-The rail's **Project & connector** entry opens one dialog that does two related things, because they are one decision:
+- **Approval banner** — the gate. Appears when a tool call is blocked on a decision. Shows the resolved absolute path for anything destructive, and offers "don't ask again for edits under *X/*" which mints a source-scoped session grant.
+- **Question banner** — the `ask_user` and `propose_plan` tools render as cards: option buttons plus a free-text field.
+- **Grants bar** — every live grant as a revocable chip, plus **Revoke all & pause**, the kill switch.
+- **Failover banner** — the local/web activity monitors in `failover.rs` detected a stall, an interruption, or a dropped web socket. Dismissible per agent.
 
-- **Bind the workspace** — pick the folder the web AI works on. This is the connector's entire blast radius: every tool path is resolved against it (`resolve_path`), and nothing outside it is reachable.
-- **Point a connector at it** — the dialog shows the live endpoint and whether the server is **Listening** or **Offline**, with the copy-paste instructions for adding a remote-MCP connector (Claude.ai → Customize → Connectors → *Add custom connector*). There is nothing to pair and no code to type: the address is the whole configuration.
+## Connector card
 
-The same state is mirrored in the **Web-AI connector** view, which is also the diagnostics surface (tool sandbox + audit trail). Its connector block shows:
+The card is the app's power switch and its only configuration surface.
 
 | Row | Shows |
 |---|---|
-| **Endpoint** | `http://127.0.0.1:45147/mcp` — the live MCP endpoint, from `mcp_status` |
-| **Workspace** | the bound project root, or `no project bound` |
-| **Allow writes & commands** | the `mcp_allow_write` switch — off means the read-only six-tool surface; on exposes the nine write/command tools. Flipped live via `mcp_set_allow_write`: no rebuild, no reconnect, and every write still needs the desktop's approval |
+| **Power** | start / stop the loopback MCP server, live (`mcp_start` / `mcp_stop`) |
+| **Endpoint** | `http://127.0.0.1:45147/mcp` with a copy button, and the Claude.ai steps for adding a custom connector |
+| **Port / allowed hosts** | editable; changing either marks the server as needing `mcp_restart` to apply |
+| **Read-only** | the `mcp_allow_write` switch. Off exposes the read-only surface; on exposes the write and command tools. Flipped live — no rebuild, no reconnect — and every write still needs the desktop's approval |
 
-## Live Activity Trace
+## Collapsible sections
 
-As the agent (local or web AI) works, every observed action becomes a node in a live step tree.
+Each is a card whose body is closed by default, so the dashboard opens at KPI-strip height regardless of how much history has accumulated.
 
-```
-▾ Session: Refactor auth (web AI)
-        Reading auth.ts
-        Reading db/schema.sql
-    ✏   Editing auth.ts           [3 lines changed]
-    ▾     Running: npm test
-        ❌ 2 failing — auth.test.ts
-    ✏   Editing auth.test.ts
-    ▾     Running: npm test
-        ✅ All passing
-```
+- **OAuth clients** — create, reveal-once, rotate and delete OAuth 2.1 clients with PKCE for the connector.
+- **Tool surface** — the 58 registered tools broken down by manifest group, read from `activity_tool_surface` (`SPECS` in `bridge/specs.rs`). This is the app's answer to "what can this thing actually do to my machine".
+- **Activity by kind** — tool calls bucketed by kind.
+- **Files** — reads vs writes per path.
+- **Commands** — runs and their last outcome.
+- **Audit trail** — every approval decision, allowed or denied, with its arguments and result summary.
+- **Recent activity** — the always-visible tail of the same data.
 
-Each line is derived from two correlated signals:
+All seven read from one `dashboard_activity` round-trip rather than seven separate commands, and refresh on a 30-second interval plus a 1-second debounce on `trace://step` bursts.
 
-1. **Bridge tool-call records** — what the web AI read, wrote, or ran
-2. **Independent filesystem watcher** — confirming a file's mtime actually changed
+## Project & connector dialog
 
-Cross-referencing both avoids showing "wrote a file" when the agent merely printed a code block without saving.
+Opened from the dashboard header. One dialog, because binding a workspace and pointing a connector at it are one decision:
 
-## Headroom — Collapsing Process, Maximizing Outcome
+- **Bind the workspace** — pick the folder the web AI works on. This is the connector's entire blast radius: every tool path resolves against it via `resolve_path`, and nothing outside it is reachable.
+- **Point a connector at it** — the dialog shows the live endpoint and whether the server is **Listening** or **Offline**. There is nothing to pair and no code to type; the address is the whole configuration.
 
-The core UX problem: a long session generates far more step-detail than a user wants visible at once, but the summary/outcome should always stay prominent.
+## Signals and correlation
 
-### Headroom Pattern
+Activity is derived from two independent sources and cross-referenced:
 
-- **Default collapsed state** — only the current/most recent 2–3 steps are expanded; older steps auto-collapse into a single summarized line ("12 earlier steps — 6 files touched, 1 error resolved").
-- **Reserved space for outcome** — the process trace occupies a shrinking, scrollable region at the top; the live "what's happening now" line and eventual handoff summary always keep guaranteed space at the bottom.
-- **Auto-promotion on interruption** — the same step data collapses directly into the handoff card ("64% progress, 8 files changed, 3 errors remaining") — nothing is re-derived.
-- **Expand-on-demand** — clicking any collapsed group re-expands its steps, useful for debugging without cluttering normal operation.
+1. **Bridge tool-call records** — what the web AI read, wrote, or ran.
+2. **A filesystem watcher** — confirming a file's mtime actually changed.
 
-## Git Panel (full git workflow from the app)
+Correlating both avoids showing "wrote a file" when the agent merely printed a code block without saving.
 
-- **Status:** working-tree changes, staged vs unstaged.
-- **Diff:** see exactly what changed in each file (inline, colored).
-- **Stage/Unstage:** stage files or hunks with a click.
-- **Branch:** view branches, switch branches, see current branch.
-- **History:** browse commit history, view past commits/diffs.
-- **Commit from the app:** write a commit message, preview staged changes, click **Commit** (via `git2`); optional push.
+The connector is pull-based: the app never reaches back into the chat window. The handoff is built from SQLite state and copied to the clipboard by the user.
 
-## Command Terminal (the web AI's)
+## Onboarding
 
-The app has exactly **one terminal** — the read-only live view of the commands the web AI runs on the project:
+First run only, gated on the `lexsus.onboarded` key: a typewriter intro followed by a seven-slide tour. Dismissal is permanent.
 
-- Every approved `run_command` streams in as it executes: a `$ command` header, the live output, and a final exit/timed-out/truncated status.
-- It is a **monitor, not a session**: there is no embedded shell or Claude Code pane, and no keyboard input. The user's control point is the **approval cards** (Allow/Deny) — they see each command the moment it starts and decide before it touches the machine.
-- The user works in their own terminal (e.g. Claude Code) as usual; the app only watches what the *web AI* does.
-- Everything shown is correlated into the unified timeline with the activity trace.
+## What is deliberately absent
 
-## Web AI Activity View
-
-When a web AI is acting as a coding agent (attached through the MCP connector), the control center shows what it is doing *with your machine* — like ChatGPT's `> thinking` view, but grounded to real operations:
-
-- "ChatGPT read auth.ts"
-- "ChatGPT wrote auth.ts"
-- "ChatGPT ran npm test → 2 failing"
-
-These appear in the activity trace, the real output appears in the terminal pane, and the resulting changes appear in the git panel — where you can commit them from the app. The connector is pull-based, so the app never tries to reach back into the chat: the handoff is surfaced here (and copied to the clipboard from the Handoff view) instead of being injected into a conversation.
+- **No embedded terminal.** The user runs their own agent in their own terminal. The app's control point is the approval cards, not a shell it hosts.
+- **No git panel.** `git_*` stays reachable over MCP; a second UI for it duplicated the connector's surface without adding reach.
+- **No polling spinner theater.** One batched command, one interval, one event stream.

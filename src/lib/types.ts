@@ -378,3 +378,14 @@ export interface FailoverWebEvent {
   trigger: string;
   handoff: Handoff | null;
 }
+
+// --- OAuth client management --------------------------------------------------
+
+/** An OAuth client for hosted connector authentication. */
+export interface OAuthClientInfo {
+  client_id: string;
+  client_secret: string | null;
+  redirect_uris: string[];
+  client_name: string | null;
+  created_at: number;
+}

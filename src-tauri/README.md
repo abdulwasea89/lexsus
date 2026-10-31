@@ -12,12 +12,15 @@ cargo clippy --lib --all-targets -- -D warnings
 ```
 
 Run the desktop app from the repo root with `pnpm tauri dev`.
+For unsigned installer builds and platform acceptance checks, see
+[`docs/desktop-foundation.md`](../docs/desktop-foundation.md).
 
 ## Modules
 
 - `lib.rs` — app state, Tauri command surface, and bootstrap (owns the
   `mcp_allow_write` / `mcp_listening` flags and spawns the connector).
-- `bridge.rs` — the tool engine and policy: tool specs + JSON schemas, parse,
+- `bridge/` — the tool engine and policy: `specs.rs` owns the registry,
+  `schema.rs` owns parsing and schemas, and `mod.rs` owns execution and policy:
   approval classes (`Auto` / `SensitivePathOnly` / `Always` / `Destructive`),
   sensitive paths, source-scoped session grants, kill switch, audit.
 - `mcp.rs` — the single remote transport: a desktop-local MCP server (Streamable

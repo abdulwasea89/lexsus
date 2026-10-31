@@ -553,7 +553,7 @@ fn uri_to_path(uri: &str) -> String {
 
 /// A location from a server, relative to the workspace when possible.
 fn location_from(v: &serde_json::Value, root: &Path) -> Option<Location> {
-    let uri = v.get("uri")?.as_str()?;
+    let uri = v.get("uri").or_else(|| v.get("targetUri"))?.as_str()?;
     // `targetUri`/`targetRange` is the LocationLink shape; `uri`/`range` the
     // Location shape. Accept both — servers differ on which they return.
     let range = v.get("range").or_else(|| v.get("targetRange"))?;

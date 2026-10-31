@@ -24,6 +24,7 @@ import { useFailover } from "./hooks/useFailover";
 import { useQuestions } from "./hooks/useQuestions";
 import { useTauriEvent } from "./hooks/useTauriEvent";
 import { toast } from "./components/ui/toast";
+import { Button } from "./components/ui/button";
 
 const RECENTS_KEY = "lexsus.recentProjects";
 
@@ -32,9 +33,7 @@ function loadRecents(): string[] {
     const raw = localStorage.getItem(RECENTS_KEY);
     if (!raw) return [];
     const arr = JSON.parse(raw);
-    return Array.isArray(arr)
-      ? arr.filter((p): p is string => typeof p === "string")
-      : [];
+    return Array.isArray(arr) ? arr.filter((p): p is string => typeof p === "string") : [];
   } catch {
     return [];
   }
@@ -42,12 +41,20 @@ function loadRecents(): string[] {
 
 function saveRecent(path: string) {
   const next = [path, ...loadRecents().filter((p) => p !== path)].slice(0, 8);
-  localStorage.setItem(RECENTS_KEY, JSON.stringify(next));
+  try {
+    localStorage.setItem(RECENTS_KEY, JSON.stringify(next));
+  } catch {
+    // Optional recent-project history must not prevent opening a workspace.
+  }
 }
 
 function removeRecent(path: string) {
   const next = loadRecents().filter((p) => p !== path);
-  localStorage.setItem(RECENTS_KEY, JSON.stringify(next));
+  try {
+    localStorage.setItem(RECENTS_KEY, JSON.stringify(next));
+  } catch {
+    // The backend remains the authority for the selected workspace.
+  }
 }
 
 /**
@@ -57,6 +64,8 @@ function removeRecent(path: string) {
 export default function App() {
   const [projectRoot, setRootInput] = useState("");
   const [restored, setRestored] = useState(false);
+  const [restoreFailed, setRestoreFailed] = useState(false);
+  const [restoreAttempt, setRestoreAttempt] = useState(0);
   const [mcp, setMcp] = useState<McpStatus | null>(null);
   const [tunnel, setTunnel] = useState<TunnelStatus | null>(null);
   const [recents, setRecents] = useState<string[]>([]);
@@ -87,39 +96,51 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    let disposed = false;
     void (async () => {
-      const [saved, connector, tunnelState] = await Promise.all([
-        getProjectRoot().catch(() => null),
-        mcpStatus().catch(() => null),
-        tunnelStatus().catch(() => null),
-      ]);
-      setMcp(connector);
-      setTunnel(tunnelState);
-      if (saved) {
-        setRootInput(saved);
-        saveRecent(saved);
-        setRecents(loadRecents());
-        try {
-          await startWatch();
-        } catch {
-          // The saved folder no longer exists (deleted or renamed). Don't
-          // error — clear it and hand back to the project picker.
-          setRootInput("");
+      try {
+        const [saved, connector, tunnelState] = await Promise.all([
+          getProjectRoot(),
+          mcpStatus().catch(() => null),
+          tunnelStatus().catch(() => null),
+        ]);
+        if (disposed) return;
+        setMcp(connector);
+        setTunnel(tunnelState);
+        if (saved) {
+          setRootInput(saved);
+          saveRecent(saved);
+          setRecents(loadRecents());
+          try {
+            await startWatch();
+          } catch {
+            if (disposed) return;
+            // The saved folder no longer exists (deleted or renamed). Don't
+            // error — clear it and hand back to the project picker.
+            setRootInput("");
+            setProjectOpen(true);
+          }
+        } else if (isOnboarded()) {
+          // First-run users meet the onboarding stage first; the project
+          // dialog opens when they finish it.
           setProjectOpen(true);
         }
-      } else if (isOnboarded()) {
-        // First-run users meet the onboarding stage first; the project
-        // dialog opens when they finish it.
-        setProjectOpen(true);
+        if (!disposed) setRestored(true);
+      } catch {
+        if (!disposed) setRestoreFailed(true);
       }
-      setRestored(true);
     })();
-  }, []);
+    return () => {
+      disposed = true;
+    };
+  }, [restoreAttempt]);
 
   // Keep the statusbar in step with lifecycle changes made in the dashboard.
   useTauriEvent<McpStatus>("mcp://status", (payload) => setMcp(payload));
   useTauriEvent<null>("tunnel://update", () => {
-    void tunnelStatus().then(setTunnel).catch(() => null);
+    void tunnelStatus()
+      .then(setTunnel)
+      .catch(() => null);
   });
 
   async function applyProject(path: string) {
@@ -159,13 +180,11 @@ export default function App() {
   async function onBrowse() {
     try {
       const path = await pickProjectFolder();
-      console.log("[project] picked folder:", path);
       if (typeof path === "string" && path) {
         setRootInput(path);
         await applyProject(path);
       }
     } catch (e) {
-      console.error("[project] pick failed:", e);
       toast.add({
         title: "Could not browse",
         description: String(e),
@@ -200,8 +219,30 @@ export default function App() {
           dismiss={dismiss}
         />
 
-        {!restored ? (
-          <div className="flex flex-1 items-center justify-center p-8 text-sm text-muted-foreground">
+        {restoreFailed ? (
+          <div
+            role="alert"
+            className="flex flex-1 flex-col items-center justify-center gap-3 p-8 text-center"
+          >
+            <h1 className="font-semibold">Could not restore your workspace</h1>
+            <p className="max-w-sm text-sm text-muted-foreground">
+              Lexsus could not read the saved project from the desktop service. Retry, or restart
+              the application if the problem continues.
+            </p>
+            <Button
+              onClick={() => {
+                setRestoreFailed(false);
+                setRestoreAttempt((attempt) => attempt + 1);
+              }}
+            >
+              Retry
+            </Button>
+          </div>
+        ) : !restored ? (
+          <div
+            role="status"
+            className="flex flex-1 items-center justify-center p-8 text-sm text-muted-foreground"
+          >
             <span className="animate-pulse">restoring session…</span>
           </div>
         ) : (
@@ -214,12 +255,7 @@ export default function App() {
           </ErrorBoundary>
         )}
 
-        <Statusbar
-          projectRoot={projectRoot}
-          connector={mcp}
-          tunnel={tunnel}
-          status={status}
-        />
+        <Statusbar projectRoot={projectRoot} connector={mcp} tunnel={tunnel} status={status} />
       </main>
 
       <ProjectDialog
@@ -232,7 +268,7 @@ export default function App() {
         onBrowse={() => void onBrowse()}
       />
 
-      {showOnboarding && <Onboarding onDone={finishOnboarding} />}
+      {showOnboarding && !restoreFailed && <Onboarding onDone={finishOnboarding} />}
     </div>
   );
 }

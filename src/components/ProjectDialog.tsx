@@ -1,4 +1,4 @@
-import { Chip } from "@heroui/react";
+import { Badge } from "@/components/ui/badge";
 import { FolderIcon, FolderOpenIcon } from "lucide-react";
 import { Button } from "./ui/button";
 import {
@@ -99,13 +99,16 @@ export default function ProjectDialog({
           <div className="flex flex-col gap-2">
             <p className="app-eyebrow text-muted-foreground">Connector</p>
             <div className="flex items-center justify-between gap-2">
-              <Chip
-                color={connector?.listening ? "success" : "default"}
-                variant="soft"
-                size="sm"
+              <Badge
+                variant="default"
+                className={
+                  connector?.listening
+                    ? "border-success/30 bg-success/10 text-success"
+                    : "border-border bg-muted/40 text-muted-foreground"
+                }
               >
                 {connector?.listening ? "Listening" : "Offline"}
-              </Chip>
+              </Badge>
               {connector ? (
                 <code
                   className="truncate rounded-md border border-border bg-muted/40 px-2.5 py-1 font-mono text-xs"

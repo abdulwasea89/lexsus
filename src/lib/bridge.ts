@@ -1,37 +1,27 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
-  ActivityStats,
-  ArchiveReport,
   AuditEntry,
   BranchInfo,
   BridgeTool,
-  CommandRun,
   CommitInfo,
   DashboardActivity,
-  FailoverLogEntry,
   FailoverStatus,
   FactsSnapshot,
   FileDiff,
-  FileTouch,
-  GitFileStatus,
   GrantState,
   Handoff,
   McpStatus,
+  OAuthClientInfo,
   SessionEvent,
   SessionSummary,
   ToolResult,
   ToolSurface,
-  ToolUsage,
   TraceRow,
   TunnelDetection,
   TunnelStatus,
 } from "./types";
 
 /** Thin typed wrapper around the Rust core's Tauri commands. */
-
-export function initDatabase(dbPath: string): Promise<string[]> {
-  return invoke("init_database", { dbPath });
-}
 
 export function setProjectRoot(path: string): Promise<void> {
   return invoke("set_project_root", { path });
@@ -47,14 +37,6 @@ export function pickProjectFolder(): Promise<string | null> {
 }
 
 // --- git ---------------------------------------------------------------------
-
-export function gitStatus(): Promise<GitFileStatus[]> {
-  return invoke("git_status");
-}
-
-export function gitBranch(): Promise<string | null> {
-  return invoke("git_branch");
-}
 
 export function gitCommit(message: string): Promise<string> {
   return invoke("git_commit", { message });
@@ -227,22 +209,6 @@ export function activityTrace(limit?: number): Promise<TraceRow[]> {
   return invoke("activity_trace", { limit: limit ?? null });
 }
 
-export function activityStats(): Promise<ActivityStats> {
-  return invoke("activity_stats");
-}
-
-export function activityToolUsage(limit?: number): Promise<ToolUsage[]> {
-  return invoke("activity_tool_usage", { limit: limit ?? null });
-}
-
-export function activityFiles(limit?: number): Promise<FileTouch[]> {
-  return invoke("activity_files", { limit: limit ?? null });
-}
-
-export function activityCommands(limit?: number): Promise<CommandRun[]> {
-  return invoke("activity_commands", { limit: limit ?? null });
-}
-
 export function activityToolSurface(): Promise<ToolSurface> {
   return invoke("activity_tool_surface");
 }
@@ -270,15 +236,7 @@ export function failoverReset(agent: "local" | "web"): Promise<void> {
   return invoke("failover_reset", { agent });
 }
 
-export function failoverLog(limit?: number): Promise<FailoverLogEntry[]> {
-  return invoke("failover_log", { limit });
-}
-
 // --- session archive + project memory (F2/F3) --------------------------------
-
-export function sessionsArchive(): Promise<ArchiveReport> {
-  return invoke("sessions_archive");
-}
 
 export function sessionsList(limit?: number): Promise<SessionSummary[]> {
   return invoke("sessions_list", { limit });
@@ -293,4 +251,25 @@ export function sessionEventsGet(
 
 export function factsExtract(): Promise<FactsSnapshot> {
   return invoke("facts_extract");
+}
+
+// --- OAuth client management --------------------------------------------------
+
+export function oauthClientCreate(
+  clientName: string | undefined,
+  redirectUris: string[],
+): Promise<OAuthClientInfo> {
+  return invoke("oauth_client_create", { clientName: clientName ?? null, redirectUris });
+}
+
+export function oauthClientList(): Promise<OAuthClientInfo[]> {
+  return invoke("oauth_client_list");
+}
+
+export function oauthClientDelete(clientId: string): Promise<boolean> {
+  return invoke("oauth_client_delete", { clientId });
+}
+
+export function oauthClientRotateSecret(clientId: string): Promise<string> {
+  return invoke("oauth_client_rotate_secret", { clientId });
 }

@@ -89,7 +89,6 @@ const READ_ONLY: &[&str] = &[
     "lsp_references",
     "lsp_symbols",
     "ask_user",
-    "propose_plan",
     "monitor",
     "notify",
     "read_media",
@@ -130,6 +129,7 @@ const WRITE: &[&str] = &[
     "remember_constraint",
     "remember_attempt",
     "request_handoff",
+    "propose_plan",
     // Phase 7–10 writes. A notebook edit rewrites a document; a worktree is
     // created and removed through git; an artifact is a written file; and a
     // delegated task is gated because it can do any of the above.
@@ -849,6 +849,7 @@ impl Connector {
         app: AppHandle<R>,
         allow_write: Arc<AtomicBool>,
         auth: Arc<Auth>,
+        oauth: Arc<oauth::OAuthServer>,
         port: u16,
         allowed_hosts: Vec<String>,
     ) -> Result<u16, String> {
@@ -880,6 +881,7 @@ impl Connector {
                         allow_write,
                         listening,
                         auth,
+                        oauth,
                         port,
                         allowed_hosts,
                         startup_tx,
@@ -958,6 +960,7 @@ async fn serve<R: Runtime>(
     allow_write: Arc<AtomicBool>,
     listening: Arc<AtomicBool>,
     auth: Arc<Auth>,
+    oauth: Arc<oauth::OAuthServer>,
     port: u16,
     allowed_hosts: Vec<String>,
     startup: std::sync::mpsc::Sender<Result<u16, String>>,
@@ -983,8 +986,8 @@ async fn serve<R: Runtime>(
         }
     };
     let bound = listener.local_addr().map(|a| a.port()).unwrap_or(port);
-    let _ = startup.send(Ok(bound));
     listening.store(true, Ordering::SeqCst);
+    let _ = startup.send(Ok(bound));
     eprintln!(
         "[mcp] listening on http://{MCP_HOST}:{bound}{MCP_PATH} (auth: {})",
         auth.backend().as_str()
@@ -993,7 +996,6 @@ async fn serve<R: Runtime>(
     // treat the bare origin as the resource URL and POST `initialize` to `/`.
     // The OAuth discovery + authorize + token routes are public; `/mcp` and
     // `/` sit behind the auth middleware (which now also accepts OAuth tokens).
-    let oauth = oauth::OAuthServer::new();
     let oauth_router = oauth::router(oauth.clone());
     let mcp_router = axum::Router::new()
         .nest_service(MCP_PATH, service.clone())
@@ -1244,6 +1246,7 @@ mod tests {
                 app.clone(),
                 allow_write.clone(),
                 auth.clone(),
+                oauth::OAuthServer::for_tests(),
                 // Port 0 lets the OS pick, so this cannot collide with a real
                 // running app on 45147.
                 0,
@@ -1264,7 +1267,14 @@ mod tests {
 
         // Rebinding the same port is the real proof of release.
         let again = connector
-            .start(app, allow_write, auth, port, Vec::new())
+            .start(
+                app,
+                allow_write,
+                auth,
+                oauth::OAuthServer::for_tests(),
+                port,
+                Vec::new(),
+            )
             .expect("rebind on the port just released");
         assert_eq!(again, port);
         connector.stop().expect("second stop");
@@ -1284,7 +1294,14 @@ mod tests {
         let connector = Connector::new();
         let (app, auth, allow_write) = connector_fixture();
         let error = connector
-            .start(app, allow_write, auth, port, Vec::new())
+            .start(
+                app,
+                allow_write,
+                auth,
+                oauth::OAuthServer::for_tests(),
+                port,
+                Vec::new(),
+            )
             .expect_err("binding a held port must fail");
         assert!(
             error.contains(&port.to_string()),
@@ -1305,12 +1322,20 @@ mod tests {
                 app.clone(),
                 allow_write.clone(),
                 auth.clone(),
+                oauth::OAuthServer::for_tests(),
                 0,
                 Vec::new(),
             )
             .expect("first bind");
         let error = connector
-            .start(app, allow_write, auth, 0, Vec::new())
+            .start(
+                app,
+                allow_write,
+                auth,
+                oauth::OAuthServer::for_tests(),
+                0,
+                Vec::new(),
+            )
             .expect_err("already running");
         assert!(error.contains("already running"), "unexpected: {error}");
         connector.stop().expect("stop");
@@ -1707,7 +1732,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_without_a_token_is_refused() {
         let auth = Auth::for_tests();
-        let response = with_auth(echo_router(), auth, oauth::OAuthServer::new())
+        let response = with_auth(echo_router(), auth, oauth::OAuthServer::for_tests())
             .oneshot(post(SAMPLE))
             .await
             .unwrap();
@@ -1724,7 +1749,7 @@ mod tests {
         let auth = Auth::for_tests();
         let mut request = post(SAMPLE);
         bearer(&mut request, "not-the-token");
-        let response = with_auth(echo_router(), auth, oauth::OAuthServer::new())
+        let response = with_auth(echo_router(), auth, oauth::OAuthServer::for_tests())
             .oneshot(request)
             .await
             .unwrap();
@@ -1738,7 +1763,7 @@ mod tests {
         let auth = Auth::for_tests();
         let mut request = post(SAMPLE);
         bearer(&mut request, &auth.reveal());
-        let response = with_auth(echo_router(), auth, oauth::OAuthServer::new())
+        let response = with_auth(echo_router(), auth, oauth::OAuthServer::for_tests())
             .oneshot(request)
             .await
             .unwrap();
@@ -1760,7 +1785,7 @@ mod tests {
         let auth = Auth::for_tests();
         let mut request = post(SAMPLE);
         bearer(&mut request, &auth.reveal());
-        let response = with_auth(echo_router(), auth.clone(), oauth::OAuthServer::new())
+        let response = with_auth(echo_router(), auth.clone(), oauth::OAuthServer::for_tests())
             .oneshot(request)
             .await
             .unwrap();
@@ -1822,7 +1847,7 @@ mod tests {
         request
             .headers_mut()
             .insert(auth::SIGNATURE_HEADER, HeaderValue::from_static("00"));
-        let response = with_auth(echo_router(), auth, oauth::OAuthServer::new())
+        let response = with_auth(echo_router(), auth, oauth::OAuthServer::for_tests())
             .oneshot(request)
             .await
             .unwrap();
@@ -1837,7 +1862,7 @@ mod tests {
     #[tokio::test]
     async fn a_signed_request_is_accepted_once() {
         let auth = Auth::for_tests();
-        let app = with_auth(echo_router(), auth.clone(), oauth::OAuthServer::new());
+        let app = with_auth(echo_router(), auth.clone(), oauth::OAuthServer::for_tests());
         let (timestamp, nonce, signature) = auth.sign_request(SAMPLE.as_bytes()).unwrap();
 
         let build = || {
@@ -1877,7 +1902,7 @@ mod tests {
             .uri("/")
             .body(Body::from(SAMPLE.to_string()))
             .unwrap();
-        let response = with_auth(echo_router(), auth, oauth::OAuthServer::new())
+        let response = with_auth(echo_router(), auth, oauth::OAuthServer::for_tests())
             .oneshot(unauthenticated)
             .await
             .unwrap();

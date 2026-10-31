@@ -1,5 +1,4 @@
 @import "tailwindcss";
-@import "@heroui/react/styles";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/geist";
@@ -274,9 +273,9 @@ body {
 /*
  * Two themes. Light is the print-like default look: off-white surfaces
  * with near-black borders. Dark is the refined palette the app shipped
- * with. Values live on :root (light) and .dark; main.tsx applies the
- * persisted preference at boot, and useTheme's toggle flips both these
- * tokens and HeroUI's dark styles.
+ * with. Values live on :root (light) and .dark; useTheme's toggle flips
+ * the `.dark` class, which both re-points these tokens and flips the
+ * `dark:` variant declared above.
  */
 :root {
   /* surfaces — warm, near-white paper hierarchy */
@@ -400,11 +399,6 @@ body {
   --sidebar-accent-foreground: var(--accent-foreground);
   --sidebar-border: var(--border);
   --sidebar-ring: var(--ring);
-}
-
-.dark {
-  /* tokens live on :root and .dark above; this block stays for HeroUI's
-     own `.dark` selectors. */
 }
 
 @layer base {

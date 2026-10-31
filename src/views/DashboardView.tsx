@@ -10,12 +10,14 @@ import {
   FileIcon,
   FolderOpenIcon,
   GlobeIcon,
+  KeyIcon,
   Loader2Icon,
   RefreshCwIcon,
   ShieldAlertIcon,
   SquareIcon,
   SquarePenIcon,
   SquareTerminalIcon,
+  Trash2Icon,
   XIcon,
 } from "lucide-react";
 import {
@@ -32,6 +34,10 @@ import {
   tunnelStart,
   tunnelStatus,
   tunnelStop,
+  oauthClientCreate,
+  oauthClientList,
+  oauthClientDelete,
+  oauthClientRotateSecret,
 } from "../lib/bridge";
 import type {
   ActivityStats,
@@ -45,17 +51,12 @@ import type {
   TraceStep,
   TunnelDetection,
   TunnelStatus,
+  OAuthClientInfo,
 } from "../lib/types";
 import { cn } from "../lib/utils";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "../components/ui/card";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
 import {
   Dialog,
   DialogContent,
@@ -109,13 +110,7 @@ interface SectionProps {
  * header, keeping the primary controls (connector, tunnel) visible without
  * burying the reference data.
  */
-function Section({
-  title,
-  description,
-  badge,
-  defaultOpen = false,
-  children,
-}: SectionProps) {
+function Section({ title, description, badge, defaultOpen = false, children }: SectionProps) {
   const [open, setOpen] = useState(defaultOpen);
   return (
     <Card>
@@ -130,9 +125,7 @@ function Section({
             {title}
             {badge}
           </span>
-          {description && (
-            <span className="text-sm text-muted-foreground">{description}</span>
-          )}
+          {description && <span className="text-sm text-muted-foreground">{description}</span>}
         </span>
         <ChevronDownIcon
           className={cn(
@@ -159,19 +152,13 @@ function EmptyHint({
     <div className="flex flex-col items-center gap-1.5 rounded-lg border border-dashed border-border/70 px-4 py-6 text-center">
       <Icon className="size-5 text-muted-foreground/50" />
       <p className="text-xs font-medium">{title}</p>
-      <p className="max-w-56 text-[11px] leading-relaxed text-muted-foreground">
-        {desc}
-      </p>
+      <p className="max-w-56 text-[11px] leading-relaxed text-muted-foreground">{desc}</p>
     </div>
   );
 }
 
 /** The control surface: connector lifecycle, tunnel, tool surface, activity. */
-export default function DashboardView({
-  onOpenProject,
-}: {
-  onOpenProject: () => void;
-}) {
+export default function DashboardView({ onOpenProject }: { onOpenProject: () => void }) {
   const [mcp, setMcp] = useState<McpStatus | null>(null);
   const [tunnel, setTunnel] = useState<TunnelStatus | null>(null);
   const [detections, setDetections] = useState<TunnelDetection[]>([]);
@@ -183,12 +170,18 @@ export default function DashboardView({
   const [recent, setRecent] = useState<TraceRow[]>([]);
   const [audit, setAudit] = useState<AuditEntry[]>([]);
 
+  // OAuth client management
+  const [oauthClients, setOauthClients] = useState<OAuthClientInfo[]>([]);
+  const [showOauthCreate, setShowOauthCreate] = useState(false);
+  const [newClientName, setNewClientName] = useState("");
+  const [newRedirectUris, setNewRedirectUris] = useState("");
+  const [newClientSecret, setNewClientSecret] = useState<string | null>(null);
+  const [rotatingSecret, setRotatingSecret] = useState<string | null>(null);
+
   const [portInput, setPortInput] = useState("");
   const [hostsInput, setHostsInput] = useState("");
   const [customCommand, setCustomCommand] = useState("");
-  const [consent, setConsent] = useState<
-    { provider: string; command?: string } | null
-  >(null);
+  const [consent, setConsent] = useState<{ provider: string; command?: string } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   // Debounce the live trace stream: a burst of tool steps is one refresh, not
@@ -216,9 +209,16 @@ export default function DashboardView({
     try {
       await Promise.all([
         refreshActivity(),
-        activityToolSurface().then(setSurface).catch(() => null),
-        tunnelDetect().then(setDetections).catch(() => []),
-        mcpStatus().then(setMcp).catch(() => null),
+        activityToolSurface()
+          .then(setSurface)
+          .catch(() => null),
+        tunnelDetect()
+          .then(setDetections)
+          .catch(() => []),
+        mcpStatus()
+          .then(setMcp)
+          .catch(() => null),
+        loadOauthClients(),
       ]);
     } finally {
       setRefreshing(false);
@@ -242,15 +242,19 @@ export default function DashboardView({
         setPortInput(String(m.port));
         setHostsInput(m.configured_hosts.join("\n"));
       }
-      await refreshActivity();
+      await Promise.all([refreshActivity(), loadOauthClients()]);
     })();
   }, [refreshActivity]);
 
   // Live updates from the backend, with a modest poll as the fallback.
   useTauriEvent<McpStatus>("mcp://status", (payload) => setMcp(payload));
   useTauriEvent<null>("tunnel://update", () => {
-    void tunnelStatus().then(setTunnel).catch(() => null);
-    void tunnelDetect().then(setDetections).catch(() => []);
+    void tunnelStatus()
+      .then(setTunnel)
+      .catch(() => null);
+    void tunnelDetect()
+      .then(setDetections)
+      .catch(() => []);
   });
   useTauriEvent<TraceStep>("trace://step", () => {
     if (refreshTimer.current) clearTimeout(refreshTimer.current);
@@ -376,8 +380,7 @@ export default function DashboardView({
       setTunnel(t);
       toast.add({
         title: "Tunnel starting",
-        description:
-          "the public host is allowlisted and the connector restarts when it appears",
+        description: "the public host is allowlisted and the connector restarts when it appears",
         type: "info",
       });
     } catch (e) {
@@ -403,6 +406,84 @@ export default function DashboardView({
     }
   }
 
+  // --- OAuth client management ----------------------------------------------
+
+  async function loadOauthClients() {
+    try {
+      const clients = await oauthClientList();
+      setOauthClients(clients);
+    } catch (e) {
+      fail("Failed to load OAuth clients", e);
+    }
+  }
+
+  async function createOauthClient() {
+    if (!newRedirectUris.trim()) {
+      toast.add({
+        title: "Invalid input",
+        description: "At least one redirect URI is required",
+        type: "error",
+      });
+      return;
+    }
+    setBusy("oauth-create");
+    try {
+      const redirectUris = newRedirectUris
+        .split(/[\n,]/)
+        .map((u) => u.trim())
+        .filter(Boolean);
+      const client = await oauthClientCreate(newClientName || undefined, redirectUris);
+      setOauthClients((prev) => [...prev, client]);
+      setShowOauthCreate(false);
+      setNewClientName("");
+      setNewRedirectUris("");
+      setNewClientSecret(client.client_secret);
+      toast.add({
+        title: "OAuth client created",
+        description: "Copy the secret now — it won't be shown again",
+        type: "success",
+      });
+    } catch (e) {
+      fail("Failed to create OAuth client", e);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function deleteOauthClient(clientId: string) {
+    if (!confirm("Delete this OAuth client? This cannot be undone.")) return;
+    setBusy("oauth-delete");
+    try {
+      await oauthClientDelete(clientId);
+      setOauthClients((prev) => prev.filter((c) => c.client_id !== clientId));
+      toast.add({ title: "OAuth client deleted", type: "success" });
+    } catch (e) {
+      fail("Failed to delete OAuth client", e);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function rotateOauthSecret(clientId: string) {
+    setRotatingSecret(clientId);
+    try {
+      const newSecret = await oauthClientRotateSecret(clientId);
+      setOauthClients((prev) =>
+        prev.map((c) => (c.client_id === clientId ? { ...c, client_secret: newSecret } : c)),
+      );
+      setNewClientSecret(newSecret); // Reuse the same state to show the new secret
+      toast.add({
+        title: "Secret rotated",
+        description: "Copy the new secret now — it won't be shown again",
+        type: "success",
+      });
+    } catch (e) {
+      fail("Failed to rotate secret", e);
+    } finally {
+      setRotatingSecret(null);
+    }
+  }
+
   const stateBadge = mcp?.listening ? (
     <Badge variant="default" className="border-success/30 bg-success/10 text-success">
       Listening
@@ -415,21 +496,10 @@ export default function DashboardView({
     <Badge variant="outline">Offline</Badge>
   );
 
-  const maxGroup = (surface?.groups ?? []).reduce(
-    (n, g) => Math.max(n, g.count),
-    0,
-  ) || 1;
-  const maxApproval = (surface?.approvals ?? []).reduce(
-    (n, a) => Math.max(n, a.count),
-    0,
-  ) || 1;
-  const maxKind = (stats?.by_kind ?? []).reduce(
-    (n, k) => Math.max(n, k.count),
-    0,
-  ) || 1;
-  const readOnlyPct = surface
-    ? Math.round((surface.read_only / surface.total) * 100)
-    : 0;
+  const maxGroup = (surface?.groups ?? []).reduce((n, g) => Math.max(n, g.count), 0) || 1;
+  const maxApproval = (surface?.approvals ?? []).reduce((n, a) => Math.max(n, a.count), 0) || 1;
+  const maxKind = (stats?.by_kind ?? []).reduce((n, k) => Math.max(n, k.count), 0) || 1;
+  const readOnlyPct = surface ? Math.round((surface.read_only / surface.total) * 100) : 0;
 
   // Form friction: Apply is only useful when the field actually differs from
   // the live value — a disabled Apply is a clearer "already saved" than a
@@ -456,9 +526,7 @@ export default function DashboardView({
           onClick={() => void refreshAll()}
           title="Refresh activity"
         >
-          <RefreshCwIcon
-            className={cn("size-3.5", refreshing && "animate-spin")}
-          />
+          <RefreshCwIcon className={cn("size-3.5", refreshing && "animate-spin")} />
           {refreshing ? "Refreshing…" : "Refresh"}
         </Button>
       }
@@ -512,16 +580,8 @@ export default function DashboardView({
             />
             <Stat label="Tool calls" value={stats.tool_calls} icon={ActivityIcon} />
             <Stat label="Files read" value={stats.files_read} icon={BookOpenIcon} />
-            <Stat
-              label="Files written"
-              value={stats.files_written}
-              icon={SquarePenIcon}
-            />
-            <Stat
-              label="Commands run"
-              value={stats.commands_run}
-              icon={SquareTerminalIcon}
-            />
+            <Stat label="Files written" value={stats.files_written} icon={SquarePenIcon} />
+            <Stat label="Commands run" value={stats.commands_run} icon={SquareTerminalIcon} />
             <Stat
               label="Failures"
               value={stats.failures}
@@ -612,10 +672,7 @@ export default function DashboardView({
               <div className="flex items-center justify-between gap-2 rounded-md border border-border/60 bg-background/60 px-3 py-2">
                 <span className="shrink-0 text-[11px] text-muted-foreground">Endpoint</span>
                 <div className="flex min-w-0 items-center gap-2">
-                  <code
-                    className="truncate font-mono text-xs"
-                    title={mcp?.endpoint}
-                  >
+                  <code className="truncate font-mono text-xs" title={mcp?.endpoint}>
                     {mcp?.endpoint ?? "—"}
                   </code>
                   {mcp?.endpoint && (
@@ -680,10 +737,7 @@ export default function DashboardView({
                       {mcp?.workspace ? "Change" : "Select"}
                     </Button>
                   </div>
-                  <span
-                    className="truncate font-mono text-xs"
-                    title={mcp?.workspace ?? ""}
-                  >
+                  <span className="truncate font-mono text-xs" title={mcp?.workspace ?? ""}>
                     {mcp?.workspace ?? "no project bound"}
                   </span>
                 </div>
@@ -721,8 +775,8 @@ export default function DashboardView({
                 )}
               </CardTitle>
               <CardDescription>
-                Makes the local endpoint reachable from the internet. Never
-                automatic — it requires explicit consent.
+                Makes the local endpoint reachable from the internet. Never automatic — it requires
+                explicit consent.
               </CardDescription>
             </CardHeader>
             <CardContent className="flex flex-col gap-3">
@@ -752,8 +806,7 @@ export default function DashboardView({
 
               <div className="flex flex-col gap-1">
                 <span className="text-[11px] text-muted-foreground">
-                  Custom command (<code className="font-mono">{"{port}"}</code> is
-                  replaced)
+                  Custom command (<code className="font-mono">{"{port}"}</code> is replaced)
                 </span>
                 <Input
                   value={customCommand}
@@ -765,10 +818,7 @@ export default function DashboardView({
 
               {tunnel?.url && (
                 <div className="flex items-center justify-between gap-2 rounded-md border border-border/60 bg-background/60 px-2.5 py-2">
-                  <code
-                    className="min-w-0 flex-1 truncate font-mono text-xs"
-                    title={tunnel.url}
-                  >
+                  <code className="min-w-0 flex-1 truncate font-mono text-xs" title={tunnel.url}>
                     {tunnel.url}
                   </code>
                   <Button
@@ -828,6 +878,91 @@ export default function DashboardView({
           </Card>
         </div>
 
+        {/* OAuth client management */}
+        <Section
+          title="OAuth clients"
+          description="Register clients for hosted connectors (ChatGPT, Claude.ai) to authenticate via your built-in OAuth server."
+          badge={
+            <Badge variant="outline" className="font-mono text-[10px]">
+              {oauthClients.length} client{oauthClients.length !== 1 ? "s" : ""}
+            </Badge>
+          }
+        >
+          <div className="flex flex-col gap-3">
+            {oauthClients.length === 0 ? (
+              <div className="flex flex-col items-center gap-3 py-6 text-center">
+                <KeyIcon className="size-8 text-muted-foreground/30" />
+                <p className="text-sm font-medium">No OAuth clients yet</p>
+                <p className="max-w-64 text-[11px] leading-relaxed text-muted-foreground">
+                  Create a client to get a Client ID and Secret. Use them in ChatGPT's "User-Defined
+                  OAuth Client" settings along with the redirect URI shown below.
+                </p>
+                <Button size="sm" onClick={() => setShowOauthCreate(true)}>
+                  <KeyIcon className="size-3.5" /> Create client
+                </Button>
+              </div>
+            ) : (
+              <>
+                <div className="space-y-2">
+                  {oauthClients.map((client) => (
+                    <Card key={client.client_id} className="p-3">
+                      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                        <div className="flex min-w-0 flex-col gap-1">
+                          <div className="flex items-center gap-2">
+                            <span className="font-mono text-xs font-medium">
+                              {client.client_name ?? "Unnamed client"}
+                            </span>
+                            <Badge variant="secondary" className="font-mono text-[10px]">
+                              {client.client_id}
+                            </Badge>
+                          </div>
+                          <div className="flex flex-wrap gap-1.5 text-[11px] text-muted-foreground">
+                            <span className="font-mono truncate max-w-[300px]">
+                              Created: {new Date(client.created_at * 1000).toLocaleString()}
+                            </span>
+                            {client.redirect_uris.map((uri, i) => (
+                              <span key={i} className="font-mono truncate max-w-[300px]">
+                                Redirect: {uri}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <Button
+                            size="icon-sm"
+                            variant="ghost"
+                            title="Show/rotate secret"
+                            onClick={() => rotateOauthSecret(client.client_id)}
+                            disabled={
+                              busy === "oauth-delete" || rotatingSecret === client.client_id
+                            }
+                          >
+                            <KeyIcon className="size-3.5" />
+                          </Button>
+                          <Button
+                            size="icon-sm"
+                            variant="ghost"
+                            title="Delete client"
+                            onClick={() => deleteOauthClient(client.client_id)}
+                            disabled={
+                              busy === "oauth-delete" || rotatingSecret === client.client_id
+                            }
+                          >
+                            <Trash2Icon className="size-3.5" />
+                          </Button>
+                        </div>
+                      </div>
+                    </Card>
+                  ))}
+                </div>
+                <Button size="sm" variant="outline" onClick={() => setShowOauthCreate(true)}>
+                  <KeyIcon className="size-3.5" /> Add another client
+                </Button>
+              </>
+            )}
+          </div>
+        </Section>
+
         {/* Tool surface */}
         <Section
           title="Tool surface"
@@ -841,28 +976,18 @@ export default function DashboardView({
           <div className="grid gap-4 md:grid-cols-2">
             <div className="flex flex-col gap-1.5 md:col-span-2">
               <div className="flex items-center justify-between text-xs">
-                <span className="text-muted-foreground">
-                  Read-only vs write surface
-                </span>
+                <span className="text-muted-foreground">Read-only vs write surface</span>
                 <span className="font-mono text-muted-foreground">
                   {surface?.read_only ?? 0} read-only · {surface?.write ?? 0} write
                 </span>
               </div>
               <div className="flex h-2 w-full overflow-hidden rounded-full bg-muted">
-                <div
-                  className="h-full bg-success"
-                  style={{ width: `${readOnlyPct}%` }}
-                />
-                <div
-                  className="h-full bg-warning"
-                  style={{ width: `${100 - readOnlyPct}%` }}
-                />
+                <div className="h-full bg-success" style={{ width: `${readOnlyPct}%` }} />
+                <div className="h-full bg-warning" style={{ width: `${100 - readOnlyPct}%` }} />
               </div>
             </div>
             <div className="flex flex-col gap-2">
-              <span className="text-[11px] font-medium text-muted-foreground">
-                Groups
-              </span>
+              <span className="text-[11px] font-medium text-muted-foreground">Groups</span>
               {(surface?.groups ?? []).map((g) => (
                 <div key={g.name} className="flex flex-col gap-0.5">
                   <Progress value={Math.round((g.count / maxGroup) * 100)}>
@@ -875,9 +1000,7 @@ export default function DashboardView({
               ))}
             </div>
             <div className="flex flex-col gap-2">
-              <span className="text-[11px] font-medium text-muted-foreground">
-                Approval levels
-              </span>
+              <span className="text-[11px] font-medium text-muted-foreground">Approval levels</span>
               {(surface?.approvals ?? []).map((a) => (
                 <div key={a.name} className="flex flex-col gap-0.5">
                   <Progress value={Math.round((a.count / maxApproval) * 100)}>
@@ -893,18 +1016,11 @@ export default function DashboardView({
                   Top tools by calls
                 </span>
                 {tools.length === 0 ? (
-                  <p className="text-xs text-muted-foreground">
-                    No tool calls recorded yet.
-                  </p>
+                  <p className="text-xs text-muted-foreground">No tool calls recorded yet.</p>
                 ) : (
                   tools.slice(0, 8).map((t) => (
-                    <div
-                      key={t.tool}
-                      className="flex items-center gap-2 text-xs"
-                    >
-                      <code className="min-w-0 flex-1 truncate font-mono">
-                        {t.tool}
-                      </code>
+                    <div key={t.tool} className="flex items-center gap-2 text-xs">
+                      <code className="min-w-0 flex-1 truncate font-mono">{t.tool}</code>
                       <span className="shrink-0 font-mono text-muted-foreground">
                         {t.calls}
                         {t.failures > 0 && (
@@ -940,9 +1056,7 @@ export default function DashboardView({
               {(stats?.by_kind ?? []).map((k) => (
                 <div key={k.kind} className="flex flex-col gap-0.5">
                   <Progress value={Math.round((k.count / maxKind) * 100)}>
-                    <ProgressLabel className="text-xs capitalize">
-                      {k.kind}
-                    </ProgressLabel>
+                    <ProgressLabel className="text-xs capitalize">{k.kind}</ProgressLabel>
                     <span className="ml-auto text-xs text-muted-foreground tabular-nums">
                       {k.count}
                     </span>
@@ -968,46 +1082,42 @@ export default function DashboardView({
               </Badge>
             }
           >
-              {files.length === 0 ? (
-                <EmptyHint
-                  icon={FileIcon}
-                  title="No files yet"
-                  desc="Files the AI reads or writes will show up here."
-                />
-              ) : (
-                <ScrollArea className="h-56 min-h-0">
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>Path</TableHead>
-                        <TableHead className="text-right">Reads</TableHead>
-                        <TableHead className="text-right">Writes</TableHead>
-                        <TableHead className="text-right">Last</TableHead>
+            {files.length === 0 ? (
+              <EmptyHint
+                icon={FileIcon}
+                title="No files yet"
+                desc="Files the AI reads or writes will show up here."
+              />
+            ) : (
+              <ScrollArea className="h-56 min-h-0">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Path</TableHead>
+                      <TableHead className="text-right">Reads</TableHead>
+                      <TableHead className="text-right">Writes</TableHead>
+                      <TableHead className="text-right">Last</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {files.map((f) => (
+                      <TableRow key={f.file}>
+                        <TableCell className="max-w-0 font-mono text-xs">
+                          <span className="block truncate" title={f.file}>
+                            {f.file}
+                          </span>
+                        </TableCell>
+                        <TableCell className="text-right font-mono text-xs">{f.reads}</TableCell>
+                        <TableCell className="text-right font-mono text-xs">{f.writes}</TableCell>
+                        <TableCell className="text-right font-mono text-xs text-muted-foreground">
+                          {fmtTs(f.last_ts)}
+                        </TableCell>
                       </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {files.map((f) => (
-                        <TableRow key={f.file}>
-                          <TableCell className="max-w-0 font-mono text-xs">
-                            <span className="block truncate" title={f.file}>
-                              {f.file}
-                            </span>
-                          </TableCell>
-                          <TableCell className="text-right font-mono text-xs">
-                            {f.reads}
-                          </TableCell>
-                          <TableCell className="text-right font-mono text-xs">
-                            {f.writes}
-                          </TableCell>
-                          <TableCell className="text-right font-mono text-xs text-muted-foreground">
-                            {fmtTs(f.last_ts)}
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </ScrollArea>
-              )}
+                    ))}
+                  </TableBody>
+                </Table>
+              </ScrollArea>
+            )}
           </Section>
 
           <Section
@@ -1023,54 +1133,52 @@ export default function DashboardView({
               </Badge>
             }
           >
-              {commands.length === 0 ? (
-                <EmptyHint
-                  icon={SquareTerminalIcon}
-                  title="No commands yet"
-                  desc="Shell commands the AI runs will appear here."
-                />
-              ) : (
-                <ScrollArea className="h-56 min-h-0">
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>Command</TableHead>
-                        <TableHead className="text-right">Runs</TableHead>
-                        <TableHead className="text-right">Last</TableHead>
+            {commands.length === 0 ? (
+              <EmptyHint
+                icon={SquareTerminalIcon}
+                title="No commands yet"
+                desc="Shell commands the AI runs will appear here."
+              />
+            ) : (
+              <ScrollArea className="h-56 min-h-0">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Command</TableHead>
+                      <TableHead className="text-right">Runs</TableHead>
+                      <TableHead className="text-right">Last</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {commands.map((c) => (
+                      <TableRow key={c.command}>
+                        <TableCell className="max-w-0 font-mono text-xs">
+                          <span className="block truncate" title={c.command}>
+                            {c.command}
+                          </span>
+                        </TableCell>
+                        <TableCell className="text-right font-mono text-xs">{c.runs}</TableCell>
+                        <TableCell className="text-right">
+                          <span
+                            className={cn(
+                              "inline-flex items-center gap-1 font-mono text-xs",
+                              c.last_ok ? "text-success" : "text-danger",
+                            )}
+                          >
+                            {c.last_ok ? (
+                              <CheckIcon className="size-3" />
+                            ) : (
+                              <XIcon className="size-3" />
+                            )}
+                            {fmtTs(c.last_ts)}
+                          </span>
+                        </TableCell>
                       </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {commands.map((c) => (
-                        <TableRow key={c.command}>
-                          <TableCell className="max-w-0 font-mono text-xs">
-                            <span className="block truncate" title={c.command}>
-                              {c.command}
-                            </span>
-                          </TableCell>
-                          <TableCell className="text-right font-mono text-xs">
-                            {c.runs}
-                          </TableCell>
-                          <TableCell className="text-right">
-                            <span
-                              className={cn(
-                                "inline-flex items-center gap-1 font-mono text-xs",
-                                c.last_ok ? "text-success" : "text-danger",
-                              )}
-                            >
-                              {c.last_ok ? (
-                                <CheckIcon className="size-3" />
-                              ) : (
-                                <XIcon className="size-3" />
-                              )}
-                              {fmtTs(c.last_ts)}
-                            </span>
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </ScrollArea>
-              )}
+                    ))}
+                  </TableBody>
+                </Table>
+              </ScrollArea>
+            )}
           </Section>
         </div>
 
@@ -1134,12 +1242,7 @@ export default function DashboardView({
                         </span>
                       </TableCell>
                       <TableCell className="text-right">
-                        <span
-                          className={cn(
-                            "text-xs",
-                            a.ok ? "text-success" : "text-danger",
-                          )}
-                        >
+                        <span className={cn("text-xs", a.ok ? "text-success" : "text-danger")}>
                           {a.ok ? "ok" : "failed"}
                         </span>
                       </TableCell>
@@ -1156,8 +1259,7 @@ export default function DashboardView({
           <CardHeader>
             <CardTitle>Recent activity</CardTitle>
             <CardDescription>
-              Persisted trace, newest first — survives a reload, not just the
-              live stream.
+              Persisted trace, newest first — survives a reload, not just the live stream.
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -1186,10 +1288,7 @@ export default function DashboardView({
                           {fmtTs(r.ts)}
                         </TableCell>
                         <TableCell>
-                          <Badge
-                            variant="outline"
-                            className="font-mono text-[10px]"
-                          >
+                          <Badge variant="outline" className="font-mono text-[10px]">
                             {r.source ?? "—"}
                           </Badge>
                         </TableCell>
@@ -1213,11 +1312,7 @@ export default function DashboardView({
                               r.ok ? "text-success" : "text-danger",
                             )}
                           >
-                            {r.ok ? (
-                              <CheckIcon className="size-3" />
-                            ) : (
-                              <XIcon className="size-3" />
-                            )}
+                            {r.ok ? <CheckIcon className="size-3" /> : <XIcon className="size-3" />}
                             {r.ok ? "ok" : "failed"}
                           </span>
                         </TableCell>
@@ -1230,6 +1325,126 @@ export default function DashboardView({
           </CardContent>
         </Card>
       </div>
+
+      {/* OAuth client create dialog */}
+      <Dialog
+        open={showOauthCreate}
+        onOpenChange={(open) => {
+          if (!open) {
+            setShowOauthCreate(false);
+            setNewClientName("");
+            setNewRedirectUris("");
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <KeyIcon className="size-4" />
+              Create OAuth client
+            </DialogTitle>
+            <DialogDescription>
+              Register a client for hosted connectors (ChatGPT, Claude.ai) to use your built-in
+              OAuth server.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-3 py-2">
+            <div className="flex flex-col gap-1.5">
+              <label htmlFor="oauth-client-name" className="text-sm font-medium">
+                Client name (optional)
+              </label>
+              <Input
+                id="oauth-client-name"
+                value={newClientName}
+                onChange={(e) => setNewClientName(e.currentTarget.value)}
+                placeholder="e.g., ChatGPT Custom Connector"
+                className="text-xs"
+              />
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <label htmlFor="oauth-redirect-uris" className="text-sm font-medium">
+                Redirect URIs (one per line)
+              </label>
+              <Textarea
+                id="oauth-redirect-uris"
+                value={newRedirectUris}
+                onChange={(e) => setNewRedirectUris(e.currentTarget.value)}
+                placeholder={[
+                  "https://chatgpt.com/connector/oauth/_eP95XBmoipB",
+                  "https://claude.ai/oauth/callback",
+                ].join("\n")}
+                className="min-h-20 font-mono text-xs"
+                rows={4}
+              />
+              <p className="text-[11px] text-muted-foreground">
+                For ChatGPT, use the callback URL from the connector setup screen.
+              </p>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowOauthCreate(false)}>
+              Cancel
+            </Button>
+            <Button
+              onClick={() => void createOauthClient()}
+              disabled={busy === "oauth-create" || !newRedirectUris.trim()}
+            >
+              {busy === "oauth-create" ? (
+                <>
+                  <Loader2Icon className="size-3.5 animate-spin" /> Creating…
+                </>
+              ) : (
+                <>
+                  <KeyIcon className="size-3.5" /> Create client
+                </>
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* OAuth secret reveal dialog */}
+      {newClientSecret && (
+        <Dialog
+          open={!!newClientSecret}
+          onOpenChange={(open) => {
+            if (!open) setNewClientSecret(null);
+          }}
+        >
+          <DialogContent className="sm:max-w-lg">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <KeyIcon className="size-4 text-warning" />
+                Client secret created
+              </DialogTitle>
+              <DialogDescription>
+                This is the only time the secret will be shown. Copy it now and store it securely.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="flex flex-col gap-3 py-2">
+              <div className="flex items-center gap-2 rounded-md border border-border/60 bg-background/60 px-3 py-2">
+                <code className="flex-1 font-mono text-xs break-all">{newClientSecret}</code>
+                <Button
+                  size="icon-sm"
+                  variant="ghost"
+                  aria-label="Copy client secret"
+                  onClick={() => copy(newClientSecret!, "client secret copied")}
+                >
+                  <CopyIcon className="size-3.5" />
+                </Button>
+              </div>
+              <p className="text-[11px] text-muted-foreground">
+                Use this Client ID and Secret in your hosted connector's OAuth settings.
+              </p>
+            </div>
+            <DialogFooter>
+              <Button variant="default" onClick={() => setNewClientSecret(null)}>
+                I've copied it
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
 
       {/* Tunnel consent: the one action that can expose the machine. */}
       <Dialog
@@ -1252,13 +1467,12 @@ export default function DashboardView({
           </DialogHeader>
           <div className="flex flex-col gap-2 text-xs leading-relaxed text-muted-foreground">
             <p>
-              A tunnel makes a local tool server reachable from the internet.
-              The bearer token is the only thing between that URL and your
-              project's read surface.
+              A tunnel makes a local tool server reachable from the internet. The bearer token is
+              the only thing between that URL and your project's read surface.
             </p>
             <p>
-              Responses are signed, but traffic is only as confidential as the
-              tunnel's TLS. Stop the tunnel — or quit the app — to close it.
+              Responses are signed, but traffic is only as confidential as the tunnel's TLS. Stop
+              the tunnel — or quit the app — to close it.
             </p>
           </div>
           <DialogFooter>

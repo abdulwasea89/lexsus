@@ -1,4 +1,4 @@
-import { Component, type ErrorInfo, type ReactNode } from "react";
+import { Component, type ReactNode } from "react";
 import { CircleAlertIcon } from "lucide-react";
 import { Button } from "./ui/button";
 
@@ -18,18 +18,16 @@ interface ErrorBoundaryState {
  * mounts fresh; keying the boundary by active view makes switching tabs
  * recover automatically.
  */
-export default class ErrorBoundary extends Component<
-  ErrorBoundaryProps,
-  ErrorBoundaryState
-> {
+export default class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
   state: ErrorBoundaryState = { error: null };
 
   static getDerivedStateFromError(error: Error): ErrorBoundaryState {
     return { error };
   }
 
-  componentDidCatch(error: Error, info: ErrorInfo) {
-    console.error("View crashed:", error, info);
+  componentDidCatch() {
+    // Render errors can contain paths or tool content. Keep routine logs redacted.
+    console.error("Lexsus render failed; recovery is available in the window.");
   }
 
   reset = () => this.setState({ error: null });
@@ -41,9 +39,7 @@ export default class ErrorBoundary extends Component<
     return (
       <div className="flex h-full min-h-0 flex-col items-center justify-center gap-2 rounded-lg border border-border bg-surface p-8 text-center">
         <CircleAlertIcon className="size-8 text-danger" />
-        <p className="text-sm font-medium">
-          {this.props.label ?? "This view"} crashed
-        </p>
+        <p className="text-sm font-medium">{this.props.label ?? "This view"} crashed</p>
         <p className="max-w-80 font-mono text-[11px] leading-relaxed text-muted-foreground">
           {error.message}
         </p>

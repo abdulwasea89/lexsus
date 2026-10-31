@@ -16,6 +16,22 @@ export default defineConfig(async () => ({
     },
   },
 
+  build: {
+    // The app is a single screen, so without this Vite emits one chunk
+    // containing React, every Base UI primitive and all app code. Splitting
+    // the two vendor groups out means a change to a view only invalidates the
+    // app chunk, and the vendor chunks stay byte-identical between builds so
+    // the webview can keep serving them from cache across app restarts.
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          react: ["react", "react-dom"],
+          "base-ui": ["@base-ui/react"],
+        },
+      },
+    },
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   clearScreen: false,
   server: {

@@ -7,7 +7,11 @@ edition = "2021"
 
 [lib]
 name = "ai_continuity_bridge_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# Desktop-only: the bin links the rlib, nothing else is needed. `staticlib`
+# and `cdylib` exist purely for Tauri's mobile targets and add ~3 GB of
+# artifacts per build. Re-add "cdylib" (and "staticlib") before shipping to
+# iOS or Android.
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -46,6 +50,7 @@ sha2 = "0.10"
 subtle = "2.6"
 zeroize = "1.9"
 keyring = "3"
+base64 = "0.22"
 
 # The tool engine's single remote transport: rmcp serves a Streamable-HTTP MCP
 # endpoint over loopback (axum drives its tower Service). Every call funnels

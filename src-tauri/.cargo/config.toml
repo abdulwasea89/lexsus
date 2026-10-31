@@ -1,0 +1,28 @@
+# Build-output footprint control.
+#
+# The dependency tree vendors OpenSSL, libgit2 and SQLite, compiled from C.
+# With cargo's default (`debug = 2` everywhere) that tree produced ~25 GB in
+# `target/debug` — 15 GB of it in `deps/`, mostly duplicated debug info for
+# crates this workspace never debugs. `src-tauri/target` is gitignored, so this
+# cost was invisible until the disk filled.
+#
+# Debug info for our own crates is kept (line tables are enough to step through
+# `bridge.rs`); dependency debug info is dropped entirely. Neither affects
+# release output.
+
+[profile.dev]
+# Line tables + no type info: `addr2line` still resolves function and file for
+# a backtrace, at a fraction of the size.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# The big lever. Applies to every dependency crate, in every profile below too.
+debug = 0
+
+[profile.release]
+# `1` = line tables only. Tauri's own default. Without this a release binary
+# carries full type info for all 300+ crates.
+debug = 1
+# Strip debuginfo from the shipped binary. Tauri's default, restated so the
+# bundler's output is not a surprise if the profile is ever overridden.
+strip = "debuginfo"

@@ -1,7 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import { I18nProvider } from "@heroui/react";
 import App from "./App";
+import ErrorBoundary from "./components/ErrorBoundary";
 import { Toaster } from "./components/ui/toast";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { applyTheme, loadTheme } from "./hooks/useTheme";
@@ -12,12 +12,12 @@ applyTheme(loadTheme());
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
-    <I18nProvider locale="en">
+    <ErrorBoundary label="Lexsus">
       <TooltipProvider>
         <Toaster>
           <App />
         </Toaster>
       </TooltipProvider>
-    </I18nProvider>
+    </ErrorBoundary>
   </React.StrictMode>,
 );

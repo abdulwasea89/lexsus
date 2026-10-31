@@ -80,6 +80,10 @@ pub(crate) struct AppState {
     /// The public tunnel, if the user started one. Killed on stop and on exit:
     /// a tunnel must never outlive the window that opened it.
     pub(crate) tunnel: tunnel::Tunnel,
+    /// Persistent OAuth server for connector authentication. Initialized once
+    /// at startup and shared across connector restarts so registered clients
+    /// survive restarts.
+    pub(crate) oauth_server: Mutex<Arc<oauth::OAuthServer>>,
     /// The port the connector is configured for. Persisted, so a restart comes
     /// back on the same endpoint rather than a new one.
     pub(crate) mcp_port: std::sync::atomic::AtomicU16,
@@ -157,6 +161,7 @@ pub(crate) fn test_state(root: &std::path::Path) -> AppState {
         mcp_allow_write: Arc::new(AtomicBool::new(false)),
         connector: mcp::Connector::new(),
         tunnel: tunnel::Tunnel::new(),
+        oauth_server: Mutex::new(oauth::OAuthServer::new(&root.parent().unwrap_or(root))),
         mcp_port: std::sync::atomic::AtomicU16::new(mcp::DEFAULT_PORT),
         mcp_configured_hosts: Mutex::new(Vec::new()),
         mcp_bind_error: Mutex::new(None),
@@ -876,10 +881,12 @@ fn start_connector<R: tauri::Runtime>(
 ) -> Result<u16, String> {
     let port = state.mcp_port.load(std::sync::atomic::Ordering::SeqCst);
     let hosts = state.mcp_configured_hosts.lock().unwrap().clone();
+    let oauth = state.oauth_server.lock().unwrap().clone();
     match state.connector.start(
         app.clone(),
         state.mcp_allow_write.clone(),
         auth.clone(),
+        oauth,
         port,
         hosts,
     ) {
@@ -1215,6 +1222,45 @@ fn tunnel_stop(state: State<'_, AppState>, app: tauri::AppHandle) -> tunnel::Tun
         }
     }
     status
+}
+
+// --- OAuth client management --------------------------------------------------
+
+/// Register a new OAuth client for use with hosted connectors (ChatGPT, Claude.ai, etc.).
+#[tauri::command]
+fn oauth_client_create(
+    state: State<'_, AppState>,
+    client_name: Option<String>,
+    redirect_uris: Vec<String>,
+) -> Result<oauth::OAuthClientInfo, String> {
+    let oauth = state.oauth_server.lock().unwrap();
+    oauth
+        .register_client(client_name, redirect_uris)
+        .map(oauth::OAuthClientInfo::from)
+}
+
+/// List all registered OAuth clients.
+#[tauri::command]
+fn oauth_client_list(state: State<'_, AppState>) -> Vec<oauth::OAuthClientInfo> {
+    let oauth = state.oauth_server.lock().unwrap();
+    oauth.list_clients()
+}
+
+/// Delete an OAuth client.
+#[tauri::command]
+fn oauth_client_delete(state: State<'_, AppState>, client_id: String) -> Result<bool, String> {
+    let oauth = state.oauth_server.lock().unwrap();
+    Ok(oauth.delete_client(&client_id))
+}
+
+/// Rotate an OAuth client's secret.
+#[tauri::command]
+fn oauth_client_rotate_secret(
+    state: State<'_, AppState>,
+    client_id: String,
+) -> Result<String, String> {
+    let oauth = state.oauth_server.lock().unwrap();
+    oauth.rotate_client_secret(&client_id)
 }
 
 // --- activity ----------------------------------------------------------------
@@ -1728,6 +1774,7 @@ pub fn run() {
             mcp_allow_write: Arc::new(AtomicBool::new(mcp_allow_write_seed())),
             connector: mcp::Connector::new(),
             tunnel: tunnel::Tunnel::new(),
+            oauth_server: Mutex::new(oauth::OAuthServer::new(&std::env::temp_dir())),
             mcp_port: AtomicU16::new(mcp::DEFAULT_PORT),
             mcp_configured_hosts: Mutex::new(Vec::new()),
             mcp_bind_error: Mutex::new(None),
@@ -1754,7 +1801,9 @@ pub fn run() {
             // The old extension's persisted pairing code is obsolete — drop it
             // so no stale credential lingers in the DB.
             let _ = db::delete_setting(&conn, "pair_code");
+            let oauth_server = oauth::OAuthServer::new(&dir);
             let state = app.state::<AppState>();
+            *state.oauth_server.lock().unwrap() = oauth_server;
             *state.conn.lock().unwrap() = conn;
             *state.project_root.lock().unwrap() = root.map(PathBuf::from);
             // Persisted connector config: the port and the editable allowlist
@@ -1831,6 +1880,10 @@ pub fn run() {
             tunnel_start,
             tunnel_stop,
             tunnel_status,
+            oauth_client_create,
+            oauth_client_list,
+            oauth_client_delete,
+            oauth_client_rotate_secret,
             activity_trace,
             activity_stats,
             activity_tool_usage,

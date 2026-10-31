@@ -10,19 +10,25 @@
 //! Tokens and codes are opaque random values held in memory. They do not need
 //! to survive a restart: a reconnected client simply re-authenticates. The
 //! static token from [`crate::auth::Auth`] keeps working alongside them.
+//!
+//! OAuth clients are registered and persisted to disk, surviving restarts.
 
 use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const ACCESS_TOKEN_TTL: Duration = Duration::from_secs(3600);
 const CODE_TTL: Duration = Duration::from_secs(300);
 const TOKEN_BYTES: usize = 32;
+const CLIENT_FILE: &str = "oauth-clients.json";
 
 /// A not-yet-exchanged authorization code, plus everything the exchange must
 /// prove it was issued for.
@@ -34,19 +40,71 @@ struct Pending {
     expires: Instant,
 }
 
+/// A registered OAuth client.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OAuthClient {
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub redirect_uris: Vec<String>,
+    pub client_name: Option<String>,
+    pub created_at: u64,
+}
+
+/// OAuth client info returned to the UI (secret omitted unless newly created).
+#[derive(Clone, Debug, Serialize)]
+pub struct OAuthClientInfo {
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub redirect_uris: Vec<String>,
+    pub client_name: Option<String>,
+    pub created_at: u64,
+}
+
+impl From<OAuthClient> for OAuthClientInfo {
+    fn from(client: OAuthClient) -> Self {
+        Self {
+            client_id: client.client_id,
+            client_secret: client.client_secret,
+            redirect_uris: client.redirect_uris,
+            client_name: client.client_name,
+            created_at: client.created_at,
+        }
+    }
+}
+
 /// Shared OAuth state. Both this and [`crate::auth::Auth`] are held in memory
 /// and cloned into the axum router, so a connector restart simply starts over.
 pub struct OAuthServer {
     codes: Mutex<HashMap<String, Pending>>,
     tokens: Mutex<HashMap<String, Instant>>,
+    clients: Mutex<HashMap<String, OAuthClient>>,
+    client_file: PathBuf,
 }
 
 impl OAuthServer {
-    pub fn new() -> Arc<Self> {
+    /// Create a new OAuth server, loading persisted clients from disk.
+    pub fn new(data_dir: &std::path::Path) -> Arc<Self> {
+        let client_file = data_dir.join(CLIENT_FILE);
+        let clients = load_clients(&client_file).unwrap_or_default();
+
         Arc::new(Self {
             codes: Mutex::new(HashMap::new()),
             tokens: Mutex::new(HashMap::new()),
+            clients: Mutex::new(
+                clients
+                    .into_iter()
+                    .map(|c| (c.client_id.clone(), c))
+                    .collect(),
+            ),
+            client_file,
         })
+    }
+
+    /// Isolated token/transport fixture; never loads real persisted clients.
+    /// The directory is deliberately not created: these tests do not persist.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Arc<Self> {
+        Self::new(&std::env::temp_dir().join(format!("lexsus-oauth-test-{}", random_hex())))
     }
 
     /// Whether `token` is a live access token we issued.
@@ -55,6 +113,116 @@ impl OAuthServer {
         let now = Instant::now();
         tokens.retain(|_, exp| *exp > now);
         tokens.contains_key(token)
+    }
+
+    /// Register a new OAuth client. Returns the client with its secret (only shown once).
+    pub fn register_client(
+        &self,
+        client_name: Option<String>,
+        redirect_uris: Vec<String>,
+    ) -> Result<OAuthClient, String> {
+        if redirect_uris.is_empty() {
+            return Err("at least one redirect URI is required".to_string());
+        }
+        for uri in &redirect_uris {
+            if !uri.starts_with("http://") && !uri.starts_with("https://") {
+                return Err(format!("invalid redirect URI (must be http/https): {uri}"));
+            }
+        }
+
+        let client_id = format!("lexsus_{}", random_hex());
+        let client_secret = Some(random_hex());
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let client = OAuthClient {
+            client_id: client_id.clone(),
+            client_secret: client_secret.clone(),
+            redirect_uris,
+            client_name,
+            created_at: now,
+        };
+
+        {
+            let mut clients = self.clients.lock().unwrap();
+            clients.insert(client_id.clone(), client.clone());
+        }
+        self.persist_clients()?;
+
+        Ok(client)
+    }
+
+    /// List all registered clients (without secrets).
+    pub fn list_clients(&self) -> Vec<OAuthClientInfo> {
+        let clients = self.clients.lock().unwrap();
+        clients
+            .values()
+            .cloned()
+            .map(OAuthClientInfo::from)
+            .collect()
+    }
+
+    /// Get a client by ID (with secret for internal use).
+    fn get_client(&self, client_id: &str) -> Option<OAuthClient> {
+        self.clients.lock().unwrap().get(client_id).cloned()
+    }
+
+    /// Delete a client.
+    pub fn delete_client(&self, client_id: &str) -> bool {
+        let removed = self.clients.lock().unwrap().remove(client_id).is_some();
+        if removed {
+            let _ = self.persist_clients();
+        }
+        removed
+    }
+
+    /// Rotate a client's secret.
+    pub fn rotate_client_secret(&self, client_id: &str) -> Result<String, String> {
+        let mut clients = self.clients.lock().unwrap();
+        let client = clients.get_mut(client_id).ok_or("client not found")?;
+        let new_secret = random_hex();
+        client.client_secret = Some(new_secret.clone());
+        drop(clients);
+        self.persist_clients()?;
+        Ok(new_secret)
+    }
+
+    /// Validate client credentials for token endpoint.
+    fn validate_client(&self, client_id: &str, client_secret: Option<&str>) -> bool {
+        let Some(client) = self.get_client(client_id) else {
+            return false;
+        };
+        match (&client.client_secret, client_secret) {
+            (Some(stored), Some(provided)) => stored == provided,
+            (None, None) => true, // public client (PKCE required)
+            _ => false,
+        }
+    }
+
+    /// Validate redirect URI for a client. Normalizes both URIs for comparison
+    /// (trailing slashes, case-insensitive scheme/host) per OAuth 2.0 best practices.
+    fn validate_redirect_uri(&self, client_id: &str, redirect_uri: &str) -> bool {
+        self.get_client(client_id)
+            .map(|c| {
+                c.redirect_uris.iter().any(|u| {
+                    Self::normalize_redirect_uri(u) == Self::normalize_redirect_uri(redirect_uri)
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    fn normalize_redirect_uri(uri: &str) -> String {
+        let uri = uri.trim_end_matches('/').to_ascii_lowercase();
+        // Also normalize scheme+host (lowercase), keep path case-sensitive
+        if let Some((scheme_host, rest)) = uri.split_once("://") {
+            if let Some((host, path)) = rest.split_once('/') {
+                return format!("{}://{}/{}", scheme_host, host, path);
+            }
+            return format!("{}://{}", scheme_host, rest);
+        }
+        uri
     }
 
     fn issue_code(&self, pending: Pending) -> String {
@@ -72,7 +240,7 @@ impl OAuthServer {
         token
     }
 
-    /// Exchange a one-time code for an access token, verifying PKCE.
+    /// Exchange a one-time code for an access token, verifying PKCE and client.
     fn exchange(
         &self,
         code: &str,
@@ -93,6 +261,23 @@ impl OAuthServer {
         }
         Some(self.issue_token())
     }
+
+    fn persist_clients(&self) -> Result<(), String> {
+        let clients: Vec<OAuthClient> = self.clients.lock().unwrap().values().cloned().collect();
+        let json = serde_json::to_string_pretty(&clients).map_err(|e| e.to_string())?;
+        std::fs::write(&self.client_file, json).map_err(|e| e.to_string())
+    }
+}
+
+fn load_clients(path: &PathBuf) -> Result<Vec<OAuthClient>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let json = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    if json.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(&json).map_err(|e| e.to_string())
 }
 
 /// The public OAuth routes, mounted *outside* the connector's auth middleware.
@@ -115,7 +300,7 @@ pub fn router(oauth: Arc<OAuthServer>) -> axum::Router {
 // --- handlers ----------------------------------------------------------------
 
 /// RFC 8414 authorization-server metadata.
-async fn oauth_metadata(headers: HeaderMap) -> Response {
+async fn oauth_metadata(State(_oauth): State<Arc<OAuthServer>>, headers: HeaderMap) -> Response {
     let base = base_url(&headers);
     json_response(
         StatusCode::OK,
@@ -126,7 +311,7 @@ async fn oauth_metadata(headers: HeaderMap) -> Response {
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code"],
             "code_challenge_methods_supported": ["S256"],
-            "token_endpoint_auth_methods_supported": ["none"],
+            "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
             "scopes_supported": ["mcp"],
         }),
     )
@@ -149,7 +334,11 @@ async fn resource_metadata(headers: HeaderMap) -> Response {
 /// The consent step. Renders a tiny page with an Allow button; approving
 /// redirects the browser to `/authorize/approve` with the original parameters
 /// intact.
-async fn authorize(headers: HeaderMap, Query(params): Query<HashMap<String, String>>) -> Response {
+async fn authorize(
+    State(oauth): State<Arc<OAuthServer>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
     let response_type = params
         .get("response_type")
         .map(String::as_str)
@@ -160,6 +349,28 @@ async fn authorize(headers: HeaderMap, Query(params): Query<HashMap<String, Stri
             serde_json::json!({ "error": "invalid_request", "error_description": "response_type must be 'code'" }),
         );
     }
+    let client_id = params.get("client_id").cloned().unwrap_or_default();
+    let redirect_uri = params.get("redirect_uri").cloned().unwrap_or_default();
+
+    if client_id.is_empty() {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({ "error": "invalid_request", "error_description": "client_id is required" }),
+        );
+    }
+    if redirect_uri.is_empty() {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({ "error": "invalid_request", "error_description": "redirect_uri is required" }),
+        );
+    }
+    if !oauth.validate_redirect_uri(&client_id, &redirect_uri) {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({ "error": "invalid_request", "error_description": "redirect_uri not registered for this client" }),
+        );
+    }
+
     let approve = format!(
         "{}/authorize/approve?{}",
         base_url(&headers),
@@ -182,6 +393,12 @@ async fn approve(
         .cloned()
         .unwrap_or_default();
 
+    if client_id.is_empty() || redirect_uri.is_empty() {
+        return redirect_error(&redirect_uri, state.as_deref(), "invalid_request");
+    }
+    if !oauth.validate_redirect_uri(&client_id, &redirect_uri) {
+        return redirect_error(&redirect_uri, state.as_deref(), "invalid_request");
+    }
     if method != "S256" {
         return redirect_error(&redirect_uri, state.as_deref(), "invalid_request");
     }
@@ -205,7 +422,11 @@ async fn approve(
 }
 
 /// Token endpoint: authorization-code + PKCE exchange.
-async fn token(State(oauth): State<Arc<OAuthServer>>, body: String) -> Response {
+async fn token(
+    State(oauth): State<Arc<OAuthServer>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
     let form = parse_form(body.as_bytes());
     let grant = form.get("grant_type").map(String::as_str).unwrap_or("");
     if grant != "authorization_code" {
@@ -217,8 +438,20 @@ async fn token(State(oauth): State<Arc<OAuthServer>>, body: String) -> Response 
 
     let code = form.get("code").cloned().unwrap_or_default();
     let verifier = form.get("code_verifier").cloned().unwrap_or_default();
-    let client_id = form.get("client_id").cloned().unwrap_or_default();
     let redirect_uri = form.get("redirect_uri").cloned().unwrap_or_default();
+
+    // Extract client credentials from Authorization header (client_secret_basic) or form (client_secret_post)
+    let (client_id, client_secret) = extract_client_credentials(&headers, &form);
+
+    if client_id.is_empty() {
+        return token_error("invalid_client", "client authentication required");
+    }
+    if !oauth.validate_client(&client_id, client_secret.as_deref()) {
+        return token_error("invalid_client", "invalid client credentials");
+    }
+    if !oauth.validate_redirect_uri(&client_id, &redirect_uri) {
+        return token_error("invalid_grant", "redirect_uri mismatch");
+    }
 
     match oauth.exchange(&code, &verifier, &client_id, &redirect_uri) {
         Some(access_token) => {
@@ -242,6 +475,32 @@ async fn token(State(oauth): State<Arc<OAuthServer>>, body: String) -> Response 
             "code, verifier, or redirect_uri did not match",
         ),
     }
+}
+
+fn extract_client_credentials(
+    headers: &HeaderMap,
+    form: &HashMap<String, String>,
+) -> (String, Option<String>) {
+    // Try Authorization header first (client_secret_basic)
+    if let Some(auth) = headers.get(header::AUTHORIZATION) {
+        if let Ok(auth_str) = auth.to_str() {
+            if let Some((scheme, creds)) = auth_str.split_once(' ') {
+                if scheme.eq_ignore_ascii_case("basic") {
+                    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(creds) {
+                        if let Ok(decoded_str) = String::from_utf8(decoded) {
+                            if let Some((id, secret)) = decoded_str.split_once(':') {
+                                return (id.to_string(), Some(secret.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Fall back to form parameters (client_secret_post)
+    let client_id = form.get("client_id").cloned().unwrap_or_default();
+    let client_secret = form.get("client_secret").cloned();
+    (client_id, client_secret)
 }
 
 // --- helpers ----------------------------------------------------------------
@@ -421,7 +680,7 @@ mod tests {
 
     #[test]
     fn a_code_exchanges_once_with_the_right_verifier() {
-        let oauth = OAuthServer::new();
+        let oauth = OAuthServer::for_tests();
         let challenge = base64url(&Sha256::digest(b"verifier"));
 
         // A wrong verifier does not mint a token.
